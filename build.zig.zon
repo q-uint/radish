@@ -1,0 +1,17 @@
+.{
+    .name = .radish,
+    .version = "0.0.0",
+    .fingerprint = 0xe7430030f6b86a37,
+    .minimum_zig_version = "0.17.0-dev.1454+5faa79730",
+    .dependencies = .{
+        .zg = .{
+            .url = "https://codeberg.org/quint/zg-0.17.0-dev/archive/2076cab456fa4a6da31caec52d025eba6a8e7fed.tar.gz",
+            .hash = "zg-0.16.2-oGqU3FqftgJahbkg5J1iDsZUuEQDQMD8qD7OnEhkXjaN",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
