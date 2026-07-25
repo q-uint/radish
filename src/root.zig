@@ -19,14 +19,5 @@ pub const SecretKey = signature.SecretKey;
 
 test {
     std.testing.refAllDecls(@This());
-    _ = base58;
-    _ = canonical;
-    _ = doc;
-    _ = git;
-    _ = git2;
-    _ = node_id;
-    _ = rid;
-    _ = signature;
-    _ = sigrefs;
-    _ = unicode;
 }
+
