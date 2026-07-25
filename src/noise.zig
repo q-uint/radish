@@ -1,4 +1,6 @@
-//! Noise_XK_Edwards25519_ChaChaPoly_SHA256 handshake, as used by radicle-node.
+//! Noise_XL_Edwards25519_ChaChaPoly_SHA256 handshake, as used by radicle-node.
+//! (radicle names the pattern NOISE_XK, but cyphernet's Display yields "XL";
+//! see PROTOCOL_NAME below.) Verified byte-for-byte against a live node.
 //!
 //! This matches cyphernet's `noise-framework` (Cyphernet-DAO/rust-cyphernet)
 //! with radicle's `p2p-ed25519` feature, which diverges from the vanilla Noise
@@ -25,7 +27,10 @@ const HASHLEN = 32;
 const KEYLEN = 32;
 const TAGLEN = ChaChaPoly.tag_length; // 16
 
-pub const PROTOCOL_NAME = "Noise_XK_Edwards25519_ChaChaPoly_SHA256";
+// cyphernet's HandshakePattern Displays as {initiator}{responder}. Radicle's
+// NOISE_XK = InitiatorPattern::Xmitted ("X") + OneWayPattern::Known ("L"), so
+// the protocol name string is "XL", not "XK" - despite the `NOISE_XK` name.
+pub const PROTOCOL_NAME = "Noise_XL_Edwards25519_ChaChaPoly_SHA256";
 
 const CipherState = struct {
     k: [KEYLEN]u8 = @splat(0),
@@ -42,9 +47,13 @@ const CipherState = struct {
         return out;
     }
 
-    // Empty plaintext -> empty output (no tag), per cyphernet.
+    // Empty plaintext -> empty output (no tag). cyphernet still advances the
+    // nonce on an empty payload when the key is set (encrypt_with_ad: n += 1).
     fn encrypt(self: *CipherState, out: []u8, ad: []const u8, pt: []const u8) usize {
-        if (pt.len == 0) return 0;
+        if (pt.len == 0) {
+            self.n += 1;
+            return 0;
+        }
         var tag: [TAGLEN]u8 = undefined;
         ChaChaPoly.encrypt(out[0..pt.len], &tag, pt, ad, self.nonce(), self.k);
         @memcpy(out[pt.len..][0..TAGLEN], &tag);
@@ -52,9 +61,12 @@ const CipherState = struct {
         return pt.len + TAGLEN;
     }
 
-    // Empty ciphertext -> empty plaintext. Otherwise last TAGLEN bytes are the tag.
+    // Empty ciphertext -> empty plaintext; nonce still advances (see encrypt).
     fn decrypt(self: *CipherState, out: []u8, ad: []const u8, ct: []const u8) ![]u8 {
-        if (ct.len == 0) return out[0..0];
+        if (ct.len == 0) {
+            self.n += 1;
+            return out[0..0];
+        }
         const body = ct[0 .. ct.len - TAGLEN];
         const tag: [TAGLEN]u8 = ct[ct.len - TAGLEN ..][0..TAGLEN].*;
         try ChaChaPoly.decrypt(out[0..body.len], body, tag, ad, self.nonce(), self.k);
@@ -72,7 +84,9 @@ pub const SymmetricState = struct {
         // Protocol name is 39 bytes (> 32), so h = SHA256(name).
         var h: [HASHLEN]u8 = undefined;
         Sha256.hash(PROTOCOL_NAME, &h, .{});
-        return .{ .h = h, .ck = h };
+        var self: SymmetricState = .{ .h = h, .ck = h };
+        self.mixHash(&.{}); // empty prologue (cyphernet initialize: mix_hash(prologue))
+        return self;
     }
 
     pub fn mixHash(self: *SymmetricState, data: []const u8) void {
@@ -158,8 +172,8 @@ pub const KeyPair = struct {
     }
 };
 
-/// Initiator half of a Noise_XK handshake. The responder's static public key
-/// (`rs`, the node's X25519-converted NID) must be known in advance.
+/// Initiator half of the handshake. The responder's static public key
+/// (`rs`, the node's raw Ed25519 NID) must be known in advance.
 pub const Initiator = struct {
     sym: SymmetricState,
     s: KeyPair, // our static key
@@ -201,12 +215,16 @@ pub const Initiator = struct {
         return n1 + n2;
     }
 
-    /// Derives the transport cipher states. Initiator sends with the first key.
+    /// Derives the transport cipher states.
+    ///
+    /// cyphernet assigns sending=c1, receiving=c2 for BOTH roles (no standard
+    /// initiator/responder swap). So to interoperate we must send with the key
+    /// the responder receives on (c2) and receive on the key it sends with (c1).
     pub fn split(self: *Initiator) Transport {
         const out = hkdf2(self.sym.ck, &.{});
         return .{
-            .send = .{ .k = out[0], .n = 0 },
-            .recv = .{ .k = out[1], .n = 0 },
+            .send = .{ .k = out[1], .n = 0 },
+            .recv = .{ .k = out[0], .n = 0 },
         };
     }
 };
@@ -252,11 +270,12 @@ pub const Responder = struct {
     }
 
     /// Mirror of Initiator.split: responder receives with the first key.
+    // Matches cyphernet: responder sends with c1, receives with c2.
     pub fn split(self: *Responder) Transport {
         const out = hkdf2(self.sym.ck, &.{});
         return .{
-            .send = .{ .k = out[1], .n = 0 },
-            .recv = .{ .k = out[0], .n = 0 },
+            .send = .{ .k = out[0], .n = 0 },
+            .recv = .{ .k = out[1], .n = 0 },
         };
     }
 };
@@ -275,6 +294,15 @@ fn dh(seed: [32]u8, public: [32]u8) [32]u8 {
 }
 
 const testing = std.testing;
+
+test "dh is symmetric (radicle-crypto ecdh property)" {
+    // dh(a_seed, B_pub) == dh(b_seed, A_pub), the invariant XK relies on.
+    const a = try KeyPair.generateDeterministic(@splat(11));
+    const b = try KeyPair.generateDeterministic(@splat(22));
+    const ab = dh(a.secret_key, b.public_key);
+    const ba = dh(b.secret_key, a.public_key);
+    try testing.expectEqualSlices(u8, &ab, &ba);
+}
 
 test "XK handshake: initiator and responder agree, transport works" {
     const i_s = try KeyPair.generateDeterministic(@splat(1));

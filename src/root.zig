@@ -3,11 +3,13 @@ const std = @import("std");
 
 pub const base58 = @import("base58.zig");
 pub const canonical = @import("canonical.zig");
+pub const codec = @import("codec.zig");
 pub const doc = @import("doc.zig");
 pub const git = @import("git.zig");
 pub const git2 = @import("git2.zig");
 pub const noise = @import("noise.zig");
 pub const node_id = @import("node_id.zig");
+pub const protocol = @import("protocol.zig");
 pub const rid = @import("rid.zig");
 pub const signature = @import("signature.zig");
 pub const sigrefs = @import("sigrefs.zig");
