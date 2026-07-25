@@ -25,8 +25,8 @@ pub const RepoId = struct {
     }
 
     /// Derives the RID from the canonical identity-document bytes.
-    pub fn fromDoc(doc: []const u8) RepoId {
-        return .{ .oid = git.hashBlob(doc) };
+    pub fn fromDoc(doc: []const u8) git.Error!RepoId {
+        return .{ .oid = try git.hashBlob(doc) };
     }
 
     /// Parses `rad:z...` (the `rad:` prefix is optional, matching Heartwood's
@@ -106,7 +106,7 @@ test "fromDoc matches git hash-object" {
     // (Placeholder doc bytes: exercises the derivation pipeline, not the real
     // canonical-JSON doc schema, which is a later slice.)
     const doc = "{\"payload\":{},\"delegates\":[],\"threshold\":1}";
-    const rid = RepoId.fromDoc(doc);
+    const rid = try RepoId.fromDoc(doc);
 
     const expected_oid = [_]u8{
         0xcf, 0x48, 0x6b, 0xca, 0xca, 0x81, 0x3b, 0x85, 0x09, 0x53,

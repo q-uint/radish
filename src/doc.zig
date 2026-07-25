@@ -75,7 +75,7 @@ pub const Doc = struct {
     pub fn repoId(self: Doc, allocator: std.mem.Allocator) !rid.RepoId {
         const bytes = try self.encode(allocator);
         defer allocator.free(bytes);
-        return rid.RepoId.fromDoc(bytes);
+        return try rid.RepoId.fromDoc(bytes);
     }
 
     /// Structural verification: delegates non-empty, unique, <= MAX_DELEGATES;
@@ -131,7 +131,7 @@ test "doc bytes hash to expected git oid" {
     const bytes = try HEARTWOOD_DOC.encode(testing.allocator);
     defer testing.allocator.free(bytes);
     // printf '%s' <bytes> | git hash-object --stdin
-    const oid = git.hashBlob(bytes);
+    const oid = try git.hashBlob(bytes);
     var hex: [40]u8 = undefined;
     _ = std.fmt.bufPrint(&hex, "{x}", .{oid}) catch unreachable;
     try testing.expectEqualStrings("d96f425412c9f8ad5d9a9a05c9831d0728e2338d", &hex);

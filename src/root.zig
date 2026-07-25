@@ -5,6 +5,7 @@ pub const base58 = @import("base58.zig");
 pub const canonical = @import("canonical.zig");
 pub const doc = @import("doc.zig");
 pub const git = @import("git.zig");
+pub const git2 = @import("git2.zig");
 pub const node_id = @import("node_id.zig");
 pub const rid = @import("rid.zig");
 pub const signature = @import("signature.zig");
@@ -22,6 +23,7 @@ test {
     _ = canonical;
     _ = doc;
     _ = git;
+    _ = git2;
     _ = node_id;
     _ = rid;
     _ = signature;

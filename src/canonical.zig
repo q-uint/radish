@@ -183,7 +183,7 @@ test "heartwood: realistic doc with unicode payload" {
     const git = @import("git.zig");
     const bytes = try encode(testing.allocator, doc);
     defer testing.allocator.free(bytes);
-    const oid = git.hashBlob(bytes);
+    const oid = try git.hashBlob(bytes);
     var hex: [40]u8 = undefined;
     _ = std.fmt.bufPrint(&hex, "{x}", .{oid}) catch unreachable;
     try testing.expectEqualStrings("4aad12ef5b9691de8eb7c05e1f264a30838eb4ac", &hex);
@@ -205,7 +205,7 @@ test "canonical doc bytes hash to expected git oid" {
     defer testing.allocator.free(bytes);
     try testing.expectEqualStrings("{\"delegates\":[],\"payload\":{},\"threshold\":1}", bytes);
 
-    const oid = git.hashBlob(bytes);
+    const oid = try git.hashBlob(bytes);
     var hex: [40]u8 = undefined;
     _ = std.fmt.bufPrint(&hex, "{x}", .{oid}) catch unreachable;
     try testing.expectEqualStrings("ae590f21977f49291526fc97460553ea72439da1", &hex);

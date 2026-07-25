@@ -18,7 +18,11 @@
       in
       {
         devShells.default = pkgs.mkShell {
-          packages = [ zig ];
+          packages = [ zig pkgs.libgit2 ];
+          # build.zig reads these to locate the system libgit2 (optional; without
+          # Nix it falls back to default system include/library paths).
+          LIBGIT2_INCLUDE = "${pkgs.libgit2.dev}/include";
+          LIBGIT2_LIB = "${pkgs.libgit2.lib}/lib";
         };
 
         packages.default = pkgs.stdenv.mkDerivation {
@@ -26,6 +30,9 @@
           version = "0.0.0";
           src = ./.;
           nativeBuildInputs = [ zig ];
+          buildInputs = [ pkgs.libgit2 ];
+          LIBGIT2_INCLUDE = "${pkgs.libgit2.dev}/include";
+          LIBGIT2_LIB = "${pkgs.libgit2.lib}/lib";
           XDG_CACHE_HOME = "$TMPDIR/zig-cache";
           buildPhase = ''
             zig build -Doptimize=ReleaseSafe --prefix $out
