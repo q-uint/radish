@@ -101,6 +101,61 @@ pub const Doc = struct {
     }
 };
 
+pub const ParseError = error{ MissingProjectPayload, Json } || std.mem.Allocator.Error;
+
+/// A parsed Doc that owns its backing memory. Call `deinit` when done.
+pub const Parsed = struct {
+    arena: *std.heap.ArenaAllocator,
+    doc: Doc,
+
+    pub fn deinit(self: Parsed) void {
+        const allocator = self.arena.child_allocator;
+        self.arena.deinit();
+        allocator.destroy(self.arena);
+    }
+};
+
+// JSON shape of the identity doc (only the fields we model). version and
+// visibility are ignored on read; unknown payload types are ignored.
+const RawProject = struct {
+    name: []const u8,
+    description: []const u8,
+    defaultBranch: []const u8,
+};
+const RawPayload = struct {
+    @"xyz.radicle.project": ?RawProject = null,
+};
+const RawDoc = struct {
+    payload: RawPayload,
+    delegates: []const []const u8,
+    threshold: i64 = 1,
+};
+
+/// Parses canonical identity-document bytes into a `Doc`.
+pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) ParseError!Parsed {
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    const raw = std.json.parseFromSliceLeaky(RawDoc, a, bytes, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return error.Json;
+    const proj = raw.payload.@"xyz.radicle.project" orelse return error.MissingProjectPayload;
+
+    return .{ .arena = arena, .doc = .{
+        .project = .{
+            .name = proj.name,
+            .description = proj.description,
+            .default_branch = proj.defaultBranch,
+        },
+        .delegates = raw.delegates,
+        .threshold = raw.threshold,
+    } };
+}
+
 const testing = std.testing;
 
 // Golden vector: Doc::initial for the heartwood project, produced by Radicle
@@ -119,10 +174,8 @@ test "encode matches heartwood canonical bytes" {
     const bytes = try HEARTWOOD_DOC.encode(testing.allocator);
     defer testing.allocator.free(bytes);
     try testing.expectEqualStrings(
-        "{\"delegates\":[\"did:key:z6MknSLrJoTcukLrE435hVNQT4JUhbvWLX4kUzqkEStBU8Vi\"]," ++
-            "\"payload\":{\"xyz.radicle.project\":{\"defaultBranch\":\"master\"," ++
-            "\"description\":\"Radicle Heartwood Protocol & Stack\",\"name\":\"heartwood\"}}," ++
-            "\"threshold\":1}",
+        \\{"delegates":["did:key:z6MknSLrJoTcukLrE435hVNQT4JUhbvWLX4kUzqkEStBU8Vi"],"payload":{"xyz.radicle.project":{"defaultBranch":"master","description":"Radicle Heartwood Protocol & Stack","name":"heartwood"}},"threshold":1}
+    ,
         bytes,
     );
 }
@@ -180,4 +233,27 @@ test "verify rejects threshold exceeding delegate count" {
 
 test "verify rejects threshold over max" {
     try testing.expectError(error.ThresholdTooLarge, docWith(&.{A}, 256).verify());
+}
+
+test "parse round-trips heartwood canonical bytes" {
+    const original = try HEARTWOOD_DOC.encode(testing.allocator);
+    defer testing.allocator.free(original);
+
+    const parsed = try parse(testing.allocator, original);
+    defer parsed.deinit();
+
+    try testing.expectEqualStrings("heartwood", parsed.doc.project.name);
+    try testing.expectEqual(@as(usize, 1), parsed.doc.delegates.len);
+    try testing.expectEqual(@as(i64, 1), parsed.doc.threshold);
+
+    const reencoded = try parsed.doc.encode(testing.allocator);
+    defer testing.allocator.free(reencoded);
+    try testing.expectEqualStrings(original, reencoded);
+}
+
+test "parse rejects a doc without the project payload" {
+    const bytes =
+        \\{"delegates":["did:key:z6MkA"],"payload":{},"threshold":1}
+    ;
+    try testing.expectError(error.MissingProjectPayload, parse(testing.allocator, bytes));
 }

@@ -18,7 +18,9 @@
       in
       {
         devShells.default = pkgs.mkShell {
-          packages = [ zig pkgs.libgit2 ];
+          # radicle-node provides `rad`, `radicle-node`, `git-remote-rad` for
+          # integration tests against the real reference implementation.
+          packages = [ zig pkgs.libgit2 pkgs.radicle-node ];
           # build.zig reads these to locate the system libgit2 (optional; without
           # Nix it falls back to default system include/library paths).
           LIBGIT2_INCLUDE = "${pkgs.libgit2.dev}/include";

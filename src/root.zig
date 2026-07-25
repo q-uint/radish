@@ -10,6 +10,7 @@ pub const node_id = @import("node_id.zig");
 pub const rid = @import("rid.zig");
 pub const signature = @import("signature.zig");
 pub const sigrefs = @import("sigrefs.zig");
+pub const storage = @import("storage.zig");
 pub const unicode = @import("unicode.zig");
 pub const Doc = doc.Doc;
 pub const NodeId = node_id.NodeId;
@@ -20,4 +21,3 @@ pub const SecretKey = signature.SecretKey;
 test {
     std.testing.refAllDecls(@This());
 }
-
