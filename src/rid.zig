@@ -80,7 +80,7 @@ test "round trip" {
 
 test "heartwood vector parse round trip" {
     // Source: heartwood examples (e.g. crates/radicle-cli/examples/rad-node.md).
-    // https://github.com/radicle-dev/heartwood
+    // https://codeberg.org/radicle/heartwood
     const input = "rad:z42hL2jL4XNk6K8oHQaSWfMgCL7ji";
     const rid = try RepoId.parse(testing.allocator, input);
     const s = try rid.encode(testing.allocator);

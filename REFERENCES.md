@@ -4,8 +4,8 @@
 
 - [Radicle Protocol Guide](https://docs.radicle.xyz/guides/protocol) - canonical spec: Node IDs, RIDs, identity document, `refs/rad/*`, gossip.
 - [Radicle Protocol Overview - Heartwood Release (HackMD)](https://hackmd.io/@radicle/rJ2UH54P6) - narrative architecture overview.
-- [radicle-dev/heartwood](https://github.com/radicle-dev/heartwood) - reference implementation (Rust). Ground truth for byte layouts and test vectors. See `radicle/src/crypto.rs`, `radicle/src/identity/`, `radicle-node`.
-- [heartwood/HACKING.md](https://github.com/radicle-dev/heartwood/blob/master/HACKING.md) - build/architecture notes.
+- [radicle/heartwood](https://codeberg.org/radicle/heartwood) - reference implementation (Rust). Ground truth for byte layouts and test vectors. See `radicle/src/crypto.rs`, `radicle/src/identity/`, `radicle-node`.
+- [heartwood/HACKING.md](https://codeberg.org/radicle/heartwood/blob/master/HACKING.md) - build/architecture notes.
 
 Key facts:
 - Node ID == Peer ID == Public Key: an Ed25519 key rendered as `did:key:z6Mk...`.

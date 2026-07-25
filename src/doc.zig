@@ -28,17 +28,30 @@ pub const Project = struct {
     }
 };
 
-/// The initial identity document for a project repository: version 1 (public,
-/// both omitted from output), a single delegate, threshold 1.
+pub const MAX_DELEGATES = 255;
+
+/// Structural validity per heartwood Delegates::new / Threshold::new.
+/// Note: this checks structure only, not signatures.
+pub const VerifyError = error{
+    NoDelegates,
+    TooManyDelegates,
+    DuplicateDelegate,
+    ThresholdZero,
+    ThresholdTooLarge,
+    ThresholdExceedsDelegates,
+};
+
+/// An identity document for a project repository. version 1 and public
+/// visibility are the defaults and are omitted from the canonical output.
 pub const Doc = struct {
     project: Project,
-    delegate: []const u8,
+    delegates: []const []const u8,
     threshold: i64 = 1,
 
     /// Builds the canonical Value tree. Borrows the Doc's slices.
     pub fn value(self: Doc, arena: std.mem.Allocator) std.mem.Allocator.Error!canonical.Value {
-        const delegates = try arena.alloc(canonical.Value, 1);
-        delegates[0] = .{ .string = self.delegate };
+        const delegates = try arena.alloc(canonical.Value, self.delegates.len);
+        for (self.delegates, 0..) |d, i| delegates[i] = .{ .string = d };
 
         const project_entries = try arena.alloc(canonical.Value.Entry, 1);
         project_entries[0] = .{ .key = PROJECT_PAYLOAD, .value = try self.project.value(arena) };
@@ -64,6 +77,28 @@ pub const Doc = struct {
         defer allocator.free(bytes);
         return rid.RepoId.fromDoc(bytes);
     }
+
+    /// Structural verification: delegates non-empty, unique, <= MAX_DELEGATES;
+    /// threshold in 1..=min(MAX_DELEGATES, delegate_count).
+    /// Mirrors heartwood Delegates::new + Threshold::new (unique-delegate count).
+    pub fn verify(self: Doc) VerifyError!void {
+        const unique = try self.uniqueDelegateCount();
+        if (unique == 0) return error.NoDelegates;
+
+        if (self.threshold < 1) return error.ThresholdZero;
+        if (self.threshold > MAX_DELEGATES) return error.ThresholdTooLarge;
+        if (self.threshold > @as(i64, @intCast(unique))) return error.ThresholdExceedsDelegates;
+    }
+
+    fn uniqueDelegateCount(self: Doc) VerifyError!usize {
+        if (self.delegates.len > MAX_DELEGATES) return error.TooManyDelegates;
+        for (self.delegates, 0..) |d, i| {
+            for (self.delegates[0..i]) |prev| {
+                if (std.mem.eql(u8, d, prev)) return error.DuplicateDelegate;
+            }
+        }
+        return self.delegates.len;
+    }
 };
 
 const testing = std.testing;
@@ -77,7 +112,7 @@ const HEARTWOOD_DOC = Doc{
         .description = "Radicle Heartwood Protocol & Stack",
         .default_branch = "master",
     },
-    .delegate = "did:key:z6MknSLrJoTcukLrE435hVNQT4JUhbvWLX4kUzqkEStBU8Vi",
+    .delegates = &.{"did:key:z6MknSLrJoTcukLrE435hVNQT4JUhbvWLX4kUzqkEStBU8Vi"},
 };
 
 test "encode matches heartwood canonical bytes" {
@@ -108,4 +143,41 @@ test "repoId round trips through rad: string" {
     defer testing.allocator.free(s);
     const back = try rid.RepoId.parse(testing.allocator, s);
     try testing.expectEqualSlices(u8, &repo.oid, &back.oid);
+}
+
+const A = "did:key:z6MkA";
+const B = "did:key:z6MkB";
+const C = "did:key:z6MkC";
+
+fn docWith(delegates: []const []const u8, threshold: i64) Doc {
+    return .{ .project = HEARTWOOD_DOC.project, .delegates = delegates, .threshold = threshold };
+}
+
+test "verify accepts the initial doc" {
+    try HEARTWOOD_DOC.verify();
+}
+
+test "verify accepts multi-delegate with valid threshold" {
+    try docWith(&.{ A, B, C }, 2).verify();
+    try docWith(&.{ A, B, C }, 3).verify();
+}
+
+test "verify rejects empty delegates" {
+    try testing.expectError(error.NoDelegates, docWith(&.{}, 1).verify());
+}
+
+test "verify rejects duplicate delegate" {
+    try testing.expectError(error.DuplicateDelegate, docWith(&.{ A, B, A }, 1).verify());
+}
+
+test "verify rejects zero threshold" {
+    try testing.expectError(error.ThresholdZero, docWith(&.{A}, 0).verify());
+}
+
+test "verify rejects threshold exceeding delegate count" {
+    try testing.expectError(error.ThresholdExceedsDelegates, docWith(&.{ A, B }, 3).verify());
+}
+
+test "verify rejects threshold over max" {
+    try testing.expectError(error.ThresholdTooLarge, docWith(&.{A}, 256).verify());
 }

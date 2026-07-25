@@ -7,10 +7,14 @@ pub const doc = @import("doc.zig");
 pub const git = @import("git.zig");
 pub const node_id = @import("node_id.zig");
 pub const rid = @import("rid.zig");
+pub const signature = @import("signature.zig");
+pub const sigrefs = @import("sigrefs.zig");
 pub const unicode = @import("unicode.zig");
 pub const Doc = doc.Doc;
 pub const NodeId = node_id.NodeId;
 pub const RepoId = rid.RepoId;
+pub const Signature = signature.Signature;
+pub const SecretKey = signature.SecretKey;
 
 test {
     std.testing.refAllDecls(@This());
@@ -20,5 +24,7 @@ test {
     _ = git;
     _ = node_id;
     _ = rid;
+    _ = signature;
+    _ = sigrefs;
     _ = unicode;
 }

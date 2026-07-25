@@ -79,7 +79,7 @@ test "round trip" {
 
 test "heartwood vectors decode" {
     // Source: heartwood crates/radicle/src/identity/did.rs test_did_vectors.
-    // https://github.com/radicle-dev/heartwood/blob/master/crates/radicle/src/identity/did.rs
+    // https://codeberg.org/radicle/heartwood/blob/master/crates/radicle/src/identity/did.rs
     const vectors = [_][]const u8{
         "z6MkiTBz1ymuepAQ4HEHYSF1H8quG5GLVVQR3djdX3mDooWp",
         "z6MkjchhfUsD6mmvni8mCdXHw216Xrm9bQe2mBH1P5RDjVJG",
