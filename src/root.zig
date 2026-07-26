@@ -2,9 +2,11 @@
 const std = @import("std");
 
 pub const base58 = @import("base58.zig");
+pub const announce = @import("announce.zig");
 pub const canonical = @import("canonical.zig");
 pub const codec = @import("codec.zig");
 pub const doc = @import("doc.zig");
+pub const fetch = @import("fetch.zig");
 pub const git = @import("git.zig");
 pub const git2 = @import("git2.zig");
 pub const noise = @import("noise.zig");

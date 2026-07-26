@@ -25,6 +25,10 @@ pub const Reader = struct {
         return std.mem.readInt(u16, (try self.take(2))[0..2], .big);
     }
 
+    pub fn readU64(self: *Reader) Error!u64 {
+        return std.mem.readInt(u64, (try self.take(8))[0..8], .big);
+    }
+
     /// Reads a QUIC varint: top 2 bits of the first byte select 1/2/4/8-byte
     /// length; the value is the remaining bits, big-endian.
     pub fn varint(self: *Reader) Error!u64 {
@@ -51,6 +55,12 @@ pub const Writer = struct {
     pub fn writeU16(self: Writer, v: u16) !void {
         var b: [2]u8 = undefined;
         std.mem.writeInt(u16, &b, v, .big);
+        try self.out.appendSlice(self.allocator, &b);
+    }
+
+    pub fn writeU64(self: Writer, v: u64) !void {
+        var b: [8]u8 = undefined;
+        std.mem.writeInt(u64, &b, v, .big);
         try self.out.appendSlice(self.allocator, &b);
     }
 

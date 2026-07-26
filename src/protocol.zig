@@ -20,15 +20,110 @@ pub const MessageType = enum(u16) {
     _,
 };
 
-/// Stream ids: the low 3 bits are the stream type/initiator. The gossip and
-/// control streams are always open. (radicle-protocol wire/frame.rs StreamId)
-pub const StreamType = enum(u64) {
-    control = 0b000,
-    gossip = 0b010,
+/// Stream kind, in bits [2:1] of a stream id. (wire/frame.rs StreamType)
+pub const StreamType = enum(u2) {
+    control = 0b00,
+    gossip = 0b01,
+    git = 0b10,
+};
+
+pub const Link = enum(u1) { outbound = 0, inbound = 1 };
+
+/// A multiplexed stream id: varint `(n << 3) | (type << 1) | link`. We are
+/// always the initiator (outbound), so link = 0. (wire/frame.rs StreamId)
+pub const StreamId = struct {
+    value: u64,
+
+    pub fn base(kind: StreamType, link: Link) StreamId {
+        return .{ .value = (@as(u64, @backingInt(kind)) << 1) | @backingInt(link) };
+    }
+
+    /// The nth stream of this type/initiator (adds n << 3).
+    pub fn nth(self: StreamId, n: u64) StreamId {
+        return .{ .value = self.value + (n << 3) };
+    }
+
+    pub const control_out = StreamId{ .value = 0b000 };
+    pub const gossip_out = StreamId{ .value = 0b010 };
+    pub const git_out = StreamId{ .value = 0b100 };
 };
 
 pub const Ping = struct { ponglen: u16 = 0, zeroes: u16 = 0 };
 pub const Pong = struct { zeroes: u16 };
+
+/// Smallest gossip bloom-filter (radicle service/filter.rs FILTER_SIZE_S).
+pub const FILTER_SIZE_S = 1024;
+
+/// Max repos in an InventoryAnnouncement (radicle service/message.rs).
+pub const INVENTORY_LIMIT = 2973;
+
+/// Encodes a Subscribe frame requesting all gossip: the "match everything"
+/// filter (1 KiB of 0xff) over the full time range.
+/// Source: radicle-protocol service/message.rs Subscribe, filter.rs default().
+pub fn encodeSubscribeAllFrame(allocator: std.mem.Allocator) ![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(allocator);
+    const mw = codec.Writer{ .out = &msg, .allocator = allocator };
+    try mw.writeU16(@backingInt(MessageType.subscribe));
+    try mw.writeU16(FILTER_SIZE_S); // filter: u16-len-prefixed bytes
+    const all_ones: [FILTER_SIZE_S]u8 = @splat(0xff);
+    try mw.bytes(&all_ones);
+    try mw.writeU64(0); // since = Timestamp::MIN
+    try mw.writeU64(std.math.maxInt(u64)); // until = Timestamp::MAX
+
+    return wrapGossip(allocator, msg.items);
+}
+
+/// Wraps a varint-payload frame: version ++ stream ++ varint(len) ++ body.
+/// Used for gossip and git streams (both length-prefix their payload).
+fn wrapFrame(allocator: std.mem.Allocator, stream: StreamId, body: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const w = codec.Writer{ .out = &out, .allocator = allocator };
+    try w.bytes(&VERSION_STRING);
+    try w.varint(stream.value);
+    try w.varint(body.len);
+    try w.bytes(body);
+    return out.toOwnedSlice(allocator);
+}
+
+fn wrapGossip(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    return wrapFrame(allocator, StreamId.gossip_out, body);
+}
+
+/// Control message types (wire/frame.rs ControlType).
+pub const ControlType = enum(u8) { open = 0, close = 1, eof = 2 };
+
+/// Encodes a control frame: version ++ control-stream ++ type ++ stream-id.
+/// Control frames do NOT length-prefix their body. Caller owns the result.
+pub fn encodeControlFrame(allocator: std.mem.Allocator, ctrl: ControlType, target: StreamId) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const w = codec.Writer{ .out = &out, .allocator = allocator };
+    try w.bytes(&VERSION_STRING);
+    try w.varint(StreamId.control_out.value);
+    try w.writeU8(@backingInt(ctrl));
+    try w.varint(target.value);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Encodes a git frame carrying raw git-protocol bytes on `stream`.
+/// Caller owns the result.
+pub fn encodeGitFrame(allocator: std.mem.Allocator, stream: StreamId, data: []const u8) ![]u8 {
+    return wrapFrame(allocator, stream, data);
+}
+
+/// Builds the git intro pkt-line: `git-upload-pack /<bare-rid>\0\0version=2\0`,
+/// 4-hex length prefix counting itself and the NULs. `rid` is the bare base58
+/// id (no `rad:`, no `.git`) - verified against a real radicle-node fetch.
+/// `version=2` is required or the responder rejects the request.
+pub fn gitUploadPackLine(allocator: std.mem.Allocator, rid: []const u8) ![]u8 {
+    const bare = if (std.mem.startsWith(u8, rid, "rad:")) rid["rad:".len..] else rid;
+    const payload = try std.fmt.allocPrint(allocator, "git-upload-pack /{s}\x00\x00version=2\x00", .{bare});
+    defer allocator.free(payload);
+    const total = payload.len + 4;
+    return std.fmt.allocPrint(allocator, "{x:0>4}{s}", .{ total, payload });
+}
 
 /// Encodes a gossip `Ping` as a full frame. Caller owns the result.
 pub fn encodePingFrame(allocator: std.mem.Allocator, ping: Ping) ![]u8 {
@@ -42,20 +137,32 @@ pub fn encodePingFrame(allocator: std.mem.Allocator, ping: Ping) ![]u8 {
     var i: u16 = 0;
     while (i < ping.zeroes) : (i += 1) try mw.writeU8(0);
 
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    const w = codec.Writer{ .out = &out, .allocator = allocator };
-    try w.bytes(&VERSION_STRING);
-    try w.varint(@backingInt(StreamType.gossip));
-    try w.varint(msg.items.len); // gossip payload is varint-length-prefixed
-    try w.bytes(msg.items);
-    return out.toOwnedSlice(allocator);
+    return wrapGossip(allocator, msg.items);
 }
+
+/// A node announcing itself: identity + advertised alias. Fields borrow the
+/// decode scratch buffer; copy them out to retain past the next frame.
+pub const NodeAnnounced = struct {
+    node: [32]u8,
+    alias: []const u8,
+    agent: []const u8,
+    timestamp: u64,
+};
+
+/// A node announcing which repos it holds. `inventory` is a slice of raw
+/// 20-byte git oids borrowing the decode scratch buffer.
+pub const InventoryAnnounced = struct {
+    node: [32]u8,
+    inventory: []const [20]u8,
+    timestamp: u64,
+};
 
 /// A parsed gossip message (only the variants we handle).
 pub const Message = union(enum) {
     ping: Ping,
     pong: Pong,
+    node_announced: NodeAnnounced,
+    inventory_announced: InventoryAnnounced,
     other: MessageType,
 };
 
@@ -91,8 +198,9 @@ fn readZeroBytes(r: *codec.Reader) !u16 {
 }
 
 /// Reads exactly one frame from an Io.Reader stream and returns its gossip
-/// message. `scratch` must be large enough for the payload.
-pub fn decodeFrameStreaming(r: *std.Io.Reader, scratch: []u8) !Message {
+/// message. `scratch` must be large enough for the payload; `oid_buf` receives
+/// decoded inventory oids (copied out of the length-prefixed wire form).
+pub fn decodeFrameStreaming(r: *std.Io.Reader, scratch: []u8, oid_buf: [][20]u8) !Message {
     const version = try r.takeArray(4);
     if (!std.mem.eql(u8, version, &VERSION_STRING)) return error.BadVersion;
     _ = try readStreamVarint(r); // stream id
@@ -105,8 +213,100 @@ pub fn decodeFrameStreaming(r: *std.Io.Reader, scratch: []u8) !Message {
     return switch (type_id) {
         .ping => .{ .ping = .{ .ponglen = try mr.readU16(), .zeroes = try readZeroBytes(&mr) } },
         .pong => .{ .pong = .{ .zeroes = try readZeroBytes(&mr) } },
+        .node_announcement => .{ .node_announced = try parseNodeAnnounced(&mr) },
+        .inventory_announcement => .{ .inventory_announced = try parseInventoryAnnounced(&mr, oid_buf) },
         else => .{ .other = type_id },
     };
+}
+
+/// A raw frame off the wire, tagged by stream kind. `payload` (gossip/git)
+/// borrows `scratch`; control frames carry the target stream instead.
+pub const RawFrame = union(enum) {
+    control: struct { ctrl: ControlType, target: u64 },
+    gossip: []const u8,
+    git: []const u8,
+    unknown: struct { stream: u64, payload: []const u8 },
+};
+
+/// Reads one frame, dispatching on the stream id's type bits. Control bodies
+/// are not length-prefixed; gossip/git bodies are varint-length-prefixed.
+pub fn readRawFrame(r: *std.Io.Reader, scratch: []u8) !RawFrame {
+    const version = try r.takeArray(4);
+    if (!std.mem.eql(u8, version, &VERSION_STRING)) return error.BadVersion;
+    const stream = try readStreamVarint(r);
+    const kind: u2 = @intCast((stream >> 1) & 0b11);
+    switch (kind) {
+        @backingInt(StreamType.control) => {
+            const ctrl: ControlType = @fromBackingInt(@intCast(try r.takeByte()));
+            const target = try readStreamVarint(r);
+            return .{ .control = .{ .ctrl = ctrl, .target = target } };
+        },
+        @backingInt(StreamType.gossip), @backingInt(StreamType.git) => {
+            const len = try readStreamVarint(r);
+            const payload = scratch[0..@intCast(len)];
+            try r.readSliceAll(payload);
+            return if (kind == @backingInt(StreamType.git))
+                .{ .git = payload }
+            else
+                .{ .gossip = payload };
+        },
+        else => {
+            const len = try readStreamVarint(r);
+            const payload = scratch[0..@intCast(len)];
+            try r.readSliceAll(payload);
+            return .{ .unknown = .{ .stream = stream, .payload = payload } };
+        },
+    }
+}
+
+// Announcement wrapper: node(32) ++ signature(64) ++ message. We don't verify
+// the relayed signature here (the origin node signed it, not our peer).
+fn parseNodeAnnounced(r: *codec.Reader) !NodeAnnounced {
+    const node = (try r.take(32))[0..32].*;
+    _ = try r.take(64); // signature
+    _ = try r.readU8(); // version
+    _ = try r.readU64(); // features
+    const timestamp = try r.readU64();
+    const alias_len = try r.readU8();
+    const alias = try r.take(alias_len);
+    const naddrs = try r.readU16();
+    var i: u16 = 0;
+    while (i < naddrs) : (i += 1) try skipAddress(r);
+    _ = try r.readU64(); // nonce
+    const agent_len = try r.readU8();
+    const agent = try r.take(agent_len);
+    return .{ .node = node, .alias = alias, .agent = agent, .timestamp = timestamp };
+}
+
+fn parseInventoryAnnounced(r: *codec.Reader, oid_buf: [][20]u8) !InventoryAnnounced {
+    const node = (try r.take(32))[0..32].*;
+    _ = try r.take(64); // signature
+    // inventory: u16 count ++ [RepoId]. Each RepoId (git::Oid) is itself
+    // u16-length-prefixed bytes, so oids are NOT contiguous - copy each out.
+    const count = try r.readU16();
+    if (count > oid_buf.len) return error.TooManyOids;
+    var i: u16 = 0;
+    while (i < count) : (i += 1) {
+        const oid_len = try r.readU16();
+        if (oid_len != 20) return error.UnexpectedOidLength;
+        @memcpy(&oid_buf[i], try r.take(20));
+    }
+    const timestamp = try r.readU64();
+    return .{ .node = node, .inventory = oid_buf[0..count], .timestamp = timestamp };
+}
+
+// Address wire form (radicle-protocol wire/message.rs Address): u8 kind ++
+// host ++ u16 port. We skip past addresses we don't consume.
+fn skipAddress(r: *codec.Reader) !void {
+    const kind = try r.readU8();
+    switch (kind) {
+        1 => _ = try r.take(4), // ipv4 octets
+        2 => _ = try r.take(16), // ipv6 octets
+        3 => _ = try r.take(try r.readU8()), // dns: u8-len-prefixed string
+        4 => _ = try r.take(32), // onion v3 raw bytes
+        else => return error.UnsupportedAddress,
+    }
+    _ = try r.readU16(); // port
 }
 
 fn readStreamVarint(r: *std.Io.Reader) !u64 {
@@ -132,12 +332,93 @@ test "encode ping frame layout" {
     }, frame);
 }
 
+test "encode subscribe-all frame layout" {
+    const frame = try encodeSubscribeAllFrame(testing.allocator);
+    defer testing.allocator.free(frame);
+
+    // Header: version(rad,1) ++ stream(0x02) ++ len(varint).
+    // Message: type(00 08) ++ filter-len(04 00) ++ 1024*0xff ++ since(8) ++ until(8).
+    const body_len = 2 + 2 + FILTER_SIZE_S + 8 + 8;
+    try testing.expectEqualSlices(u8, &VERSION_STRING, frame[0..4]);
+    try testing.expectEqual(@as(u8, 0x02), frame[4]);
+
+    var r = codec.Reader{ .buf = frame[5..] };
+    try testing.expectEqual(@as(u64, body_len), try r.varint());
+    try testing.expectEqual(@backingInt(MessageType.subscribe), try r.readU16());
+    try testing.expectEqual(@as(u16, FILTER_SIZE_S), try r.readU16());
+    const filter = try r.take(FILTER_SIZE_S);
+    try testing.expect(std.mem.allEqual(u8, filter, 0xff));
+    try testing.expectEqual(@as(u64, 0), try r.readU64());
+    try testing.expectEqual(std.math.maxInt(u64), try r.readU64());
+}
+
+test "stream ids match the frame.rs table" {
+    try testing.expectEqual(@as(u64, 0b000), StreamId.control_out.value);
+    try testing.expectEqual(@as(u64, 0b010), StreamId.gossip_out.value);
+    try testing.expectEqual(@as(u64, 0b100), StreamId.git_out.value);
+    try testing.expectEqual(@as(u64, 0b100), StreamId.base(.git, .outbound).value);
+    try testing.expectEqual(@as(u64, 0b101), StreamId.base(.git, .inbound).value);
+    // nth preserves type+initiator, adding n<<3.
+    try testing.expectEqual(@as(u64, 0b100 + 8), StreamId.git_out.nth(1).value);
+}
+
+test "control open frame layout" {
+    const frame = try encodeControlFrame(testing.allocator, .open, StreamId.git_out);
+    defer testing.allocator.free(frame);
+    // version(rad,1) ++ control-stream(0x00) ++ type(open=0x00) ++ target(0x04)
+    try testing.expectEqualSlices(u8, &[_]u8{ 'r', 'a', 'd', 1, 0x00, 0x00, 0x04 }, frame);
+}
+
+test "git-upload-pack pkt-line matches a captured radicle-node fetch" {
+    // Golden bytes captured off the wire from a real radicle-node 1.9.1 fetch:
+    // bare base58 id (no rad:, no .git), empty host, then version=2.
+    const line = try gitUploadPackLine(testing.allocator, "rad:z3WukSjzicL8WaZHFALbBwb2r8W52");
+    defer testing.allocator.free(line);
+    const expected = "003egit-upload-pack /z3WukSjzicL8WaZHFALbBwb2r8W52\x00\x00version=2\x00";
+    try testing.expectEqualSlices(u8, expected, line);
+}
+
+test "decode inventory announcement: each oid is u16-length-prefixed" {
+    const node: [32]u8 = @splat(0xAB);
+    const sig: [64]u8 = @splat(0xCD);
+    var oid: [20]u8 = undefined;
+    for (&oid, 0..) |*b, i| b.* = @intCast(i);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    const w = codec.Writer{ .out = &buf, .allocator = testing.allocator };
+    try w.bytes(&VERSION_STRING);
+    try w.varint(StreamId.gossip_out.value);
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    const bw = codec.Writer{ .out = &body, .allocator = testing.allocator };
+    try bw.writeU16(@backingInt(MessageType.inventory_announcement));
+    try bw.bytes(&node);
+    try bw.bytes(&sig);
+    try bw.writeU16(1); // inventory count
+    try bw.writeU16(20); // oid length prefix (git::Oid uses &[u8] encode)
+    try bw.bytes(&oid);
+    try bw.writeU64(0x1122334455667788); // timestamp
+    try w.varint(body.items.len);
+    try w.bytes(body.items);
+
+    var stream_reader = std.Io.Reader.fixed(buf.items);
+    var scratch: [1024]u8 = undefined;
+    var oids: [8][20]u8 = undefined;
+    const msg = try decodeFrameStreaming(&stream_reader, &scratch, &oids);
+    const inv = msg.inventory_announced;
+    try testing.expectEqual(@as(usize, 1), inv.inventory.len);
+    try testing.expectEqualSlices(u8, &oid, &inv.inventory[0]);
+    try testing.expectEqual(@as(u64, 0x1122334455667788), inv.timestamp);
+    try testing.expectEqualSlices(u8, &node, &inv.node);
+}
+
 test "decode pong frame" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
     const w = codec.Writer{ .out = &buf, .allocator = testing.allocator };
     try w.bytes(&VERSION_STRING);
-    try w.varint(@backingInt(StreamType.gossip));
+    try w.varint(StreamId.gossip_out.value);
     try w.varint(7); // type(2) + zeroeslen(2) + 3 zero bytes
     try w.writeU16(@backingInt(MessageType.pong));
     try w.writeU16(3);
