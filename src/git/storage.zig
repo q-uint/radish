@@ -3,7 +3,7 @@
 //! Source: heartwood crates/radicle/src/identity/doc.rs (Doc::load_at).
 const std = @import("std");
 const git2 = @import("git2.zig");
-const doc = @import("doc.zig");
+const doc = @import("../identity/doc.zig");
 
 const c = git2.c;
 

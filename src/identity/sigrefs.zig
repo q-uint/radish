@@ -7,9 +7,9 @@
 //! excluding the sigrefs branch itself and zero oids.
 //! Source: radicle/src/storage/refs.rs (Refs::canonical, SignedRefs).
 const std = @import("std");
-const git = @import("git.zig");
+const git = @import("../git/git.zig");
 const node_id = @import("node_id.zig");
-const signature = @import("signature.zig");
+const signature = @import("../crypto/signature.zig");
 
 pub const SIGREFS_BRANCH = "refs/rad/sigrefs";
 

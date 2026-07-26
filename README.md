@@ -21,15 +21,17 @@ Wire protocol (spoken to a live node):
 - `codec` / `protocol` - QUIC-varint framing, streams, gossip messages
 - `wire` - dial a node: ping/pong, signed `NodeAnnouncement`, gossip `Subscribe`
 - `announce` - encode and sign gossip announcements
-- `fetch` - open a git stream and speak git-upload-pack (fetch, in progress)
+- `git.protocol` - hand-rolled git protocol v2 client (ls-refs, fetch, sideband)
+- `fetch` - clone a repo: git stream, v2 fetch, packfile indexed via libgit2
 
 ## CLI
 
 ```
-radish ping        <host> <port> <node-id>          handshake + ping/pong
-radish announce    <host> <port> <node-id> [alias]  send a signed NodeAnnouncement
-radish subscribe   <host> <port> <node-id> [frames] listen to gossip (nodes + inventory)
-radish fetch-probe <host> <port> <node-id> <rid>    open a git stream, read the v2 advertisement
+radish ping        <host> <port> <node-id>              handshake + ping/pong
+radish announce    <host> <port> <node-id> [alias]      send a signed NodeAnnouncement
+radish subscribe   <host> <port> <node-id> [frames]     listen to gossip (nodes + inventory)
+radish fetch-probe <host> <port> <node-id> <rid>        open a git stream, read the v2 advertisement
+radish clone       <host> <port> <node-id> <rid> <dir>  clone a repo into <dir> (bare)
 ```
 
 ## Build

@@ -5,7 +5,7 @@
 //! Source: heartwood crates/radicle-crypto/src/lib.rs (Signature Display/FromStr).
 const std = @import("std");
 const base58 = @import("base58.zig");
-const node_id = @import("node_id.zig");
+const node_id = @import("../identity/node_id.zig");
 
 const Ed = std.crypto.sign.Ed25519;
 const SIG_LEN = Ed.Signature.encoded_length; // 64

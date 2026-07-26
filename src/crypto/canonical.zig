@@ -180,7 +180,7 @@ test "heartwood: realistic doc with unicode payload" {
     try expectEncode(expected, doc);
 
     // git oid of the canonical bytes: printf '%s' <bytes> | git hash-object --stdin
-    const git = @import("git.zig");
+    const git = @import("../git/git.zig");
     const bytes = try encode(testing.allocator, doc);
     defer testing.allocator.free(bytes);
     const oid = try git.hashBlob(bytes);
@@ -195,7 +195,7 @@ test "canonical doc bytes hash to expected git oid" {
     // git.hashBlob of those bytes matches
     //   printf '%s' '{"delegates":[],"payload":{},"threshold":1}' | git hash-object --stdin
     //   -> ae590f21977f49291526fc97460553ea72439da1
-    const git = @import("git.zig");
+    const git = @import("../git/git.zig");
     const doc = Value{ .object = &.{
         .{ .key = "payload", .value = .{ .object = &.{} } },
         .{ .key = "delegates", .value = .{ .array = &.{} } },

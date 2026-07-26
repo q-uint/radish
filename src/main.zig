@@ -23,16 +23,34 @@ pub fn main(init: std.process.Init) !void {
         return fetchProbe(init, args[2], args[3], args[4], args[5]);
     }
 
+    if (args.len >= 7 and std.mem.eql(u8, args[1], "clone")) {
+        return clone(init, args[2], args[3], args[4], args[5], args[6]);
+    }
+
     std.debug.print(
         \\radish - a radicle client
         \\
         \\usage:
-        \\  radish ping        <host> <port> <node-id>          dial a node, handshake, ping/pong
-        \\  radish announce    <host> <port> <node-id> [alias]  send a signed NodeAnnouncement
-        \\  radish subscribe   <host> <port> <node-id> [frames] listen to gossip: nodes + inventory
-        \\  radish fetch-probe <host> <port> <node-id> <rid>    open a git stream, send upload-pack intro
+        \\  radish ping        <host> <port> <node-id>              dial a node, handshake, ping/pong
+        \\  radish announce    <host> <port> <node-id> [alias]      send a signed NodeAnnouncement
+        \\  radish subscribe   <host> <port> <node-id> [frames]     listen to gossip: nodes + inventory
+        \\  radish fetch-probe <host> <port> <node-id> <rid>        open a git stream, read the v2 advert
+        \\  radish clone       <host> <port> <node-id> <rid> <dir>  clone a repo into <dir> (bare)
         \\
     , .{});
+}
+
+fn clone(init: std.process.Init, host: []const u8, port_str: []const u8, nid_str: []const u8, rid_str: []const u8, dir: []const u8) !void {
+    const arena = init.arena.allocator();
+    const port = try std.fmt.parseInt(u16, port_str, 10);
+    const nid = try radish.NodeId.parse(arena, nid_str);
+
+    std.debug.print("cloning {s} from {s} into {s}...\n", .{ rid_str, nid_str, dir });
+    const result = radish.net.fetch.clone(init.io, arena, host, port, nid, rid_str, dir) catch |e| {
+        std.debug.print("clone failed: {s}\n", .{@errorName(e)});
+        return e;
+    };
+    std.debug.print("cloned {s}: {d} refs, {d} pack bytes -> {s}\n", .{ rid_str, result.refs, result.pack_bytes, dir });
 }
 
 const FetchProbePrinter = struct {
@@ -45,7 +63,7 @@ const FetchProbePrinter = struct {
         std.debug.print("git frame ({d} bytes):\n{f}\n", .{ data.len, std.zig.fmtString(data) });
     }
 
-    pub fn onControl(_: *FetchProbePrinter, ctrl: radish.protocol.ControlType, target: u64) void {
+    pub fn onControl(_: *FetchProbePrinter, ctrl: radish.net.protocol.ControlType, target: u64) void {
         std.debug.print("control {s} stream={d}\n", .{ @tagName(ctrl), target });
     }
 };
@@ -57,7 +75,7 @@ fn fetchProbe(init: std.process.Init, host: []const u8, port_str: []const u8, ni
 
     var printer = FetchProbePrinter{};
     std.debug.print("fetch-probe {s} from {s}...\n", .{ rid_str, nid_str });
-    const frames = radish.wire.fetchProbe(init.io, arena, host, port, nid, rid_str, 20, &printer) catch |e| {
+    const frames = radish.net.wire.fetchProbe(init.io, arena, host, port, nid, rid_str, 20, &printer) catch |e| {
         std.debug.print("fetch-probe failed: {s}\n", .{@errorName(e)});
         return e;
     };
@@ -72,7 +90,7 @@ fn ping(init: std.process.Init, host: []const u8, port_str: []const u8, nid_str:
     const port = try std.fmt.parseInt(u16, port_str, 10);
     const nid = try radish.NodeId.parse(arena, nid_str);
 
-    const zeroes = radish.wire.ping(init.io, arena, host, port, nid, 8) catch |e| {
+    const zeroes = radish.net.wire.ping(init.io, arena, host, port, nid, 8) catch |e| {
         std.debug.print("ping failed: {s}\n", .{@errorName(e)});
         return e;
     };
@@ -90,7 +108,7 @@ fn announce(init: std.process.Init, host: []const u8, port_str: []const u8, nid_
     const our_nid = try key.nodeId().encode(arena);
     std.debug.print("announcing as {s} (alias {s})\n", .{ our_nid, alias });
 
-    const zeroes = radish.wire.sendAnnouncement(init.io, arena, host, port, nid, key, alias) catch |e| {
+    const zeroes = radish.net.wire.sendAnnouncement(init.io, arena, host, port, nid, key, alias) catch |e| {
         std.debug.print("announce failed: {s}\n", .{@errorName(e)});
         return e;
     };
@@ -103,7 +121,7 @@ const GossipPrinter = struct {
     inventories: usize = 0,
     rids: usize = 0,
 
-    pub fn onMessage(self: *GossipPrinter, msg: radish.protocol.Message) void {
+    pub fn onMessage(self: *GossipPrinter, msg: radish.net.protocol.Message) void {
         switch (msg) {
             .node_announced => |n| {
                 self.nodes += 1;
@@ -132,7 +150,7 @@ fn subscribe(init: std.process.Init, host: []const u8, port_str: []const u8, nid
 
     var printer = GossipPrinter{ .arena = arena };
     std.debug.print("subscribing to {s} (up to {d} frames)...\n", .{ nid_str, max });
-    const frames = radish.wire.subscribe(init.io, arena, host, port, nid, max, &printer) catch |e| {
+    const frames = radish.net.wire.subscribe(init.io, arena, host, port, nid, max, &printer) catch |e| {
         std.debug.print("subscribe failed: {s}\n", .{@errorName(e)});
         return e;
     };

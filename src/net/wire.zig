@@ -2,11 +2,11 @@
 //! over TCP, and exchanging framed gossip messages. After the handshake,
 //! radicle sends protocol frames unencrypted over the connection.
 const std = @import("std");
-const noise = @import("noise.zig");
-const node_id = @import("node_id.zig");
+const noise = @import("../crypto/noise.zig");
+const node_id = @import("../identity/node_id.zig");
 const protocol = @import("protocol.zig");
 const announce = @import("announce.zig");
-const signature = @import("signature.zig");
+const signature = @import("../crypto/signature.zig");
 
 /// Connects to `host:port`, completes the Noise handshake, sends a gossip
 /// Ping, and returns the number of zero-bytes in the node's Pong.

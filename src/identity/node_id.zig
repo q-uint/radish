@@ -5,7 +5,7 @@
 //!   [0xed, 0x01] ++ <32-byte ed25519 public key>
 //! multibase-wrapped with a leading 'z' (base58btc).
 const std = @import("std");
-const base58 = @import("base58.zig");
+const base58 = @import("../crypto/base58.zig");
 
 const MULTICODEC_ED25519 = [2]u8{ 0xed, 0x01 };
 const KEY_LEN = 32;

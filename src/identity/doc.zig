@@ -8,8 +8,8 @@
 //!   - delegates: list of did:key strings
 //!   - threshold: signature threshold
 const std = @import("std");
-const canonical = @import("canonical.zig");
-const git = @import("git.zig");
+const canonical = @import("../crypto/canonical.zig");
+const git = @import("../git/git.zig");
 const rid = @import("rid.zig");
 
 pub const PROJECT_PAYLOAD = "xyz.radicle.project";

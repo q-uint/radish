@@ -4,8 +4,8 @@
 //! The character after `rad:` is a multibase tag. Radicle only permits
 //! base58btc (`z`); any other base decodes but is rejected.
 const std = @import("std");
-const base58 = @import("base58.zig");
-const git = @import("git.zig");
+const base58 = @import("../crypto/base58.zig");
+const git = @import("../git/git.zig");
 
 const RAD_PREFIX = "rad:";
 const MULTIBASE_BTC = 'z';
