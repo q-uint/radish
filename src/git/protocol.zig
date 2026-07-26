@@ -1,7 +1,7 @@
 //! Git protocol v2 client (gitprotocol-v2), spoken over a fetch Session.
-//! Drives `ls-refs` and `fetch`, demultiplexes the sideband packfile, and
-//! hands the packfile to libgit2's indexer. This exists because libgit2 has no
-//! v2 support and radicle-node requires v2.
+//! Drives `ls-refs` and `fetch` and demultiplexes the sideband packfile. This
+//! is hand-rolled because libgit2 has no v2 support and radicle-node requires
+//! v2; the returned packfile is indexed by the toolchain's own git plumbing.
 //!
 //! Request/response shapes verified against a live radicle-node 1.9.1 fetch:
 //!   -> command=ls-refs\n agent=..\n DELIM symrefs\n peel\n ref-prefix ..\n FLUSH

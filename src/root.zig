@@ -16,3 +16,10 @@ pub const SecretKey = crypto.SecretKey;
 test {
     std.testing.refAllDecls(@This());
 }
+
+test "gitpack module is importable from the toolchain" {
+    const gitpack = @import("gitpack");
+    _ = gitpack.Oid;
+    _ = gitpack.indexPack;
+    _ = gitpack.Repository;
+}

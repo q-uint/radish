@@ -11,8 +11,7 @@ const noise = @import("../crypto/noise.zig");
 const node_id = @import("../identity/node_id.zig");
 const protocol = @import("protocol.zig");
 const gitproto = @import("../git/protocol.zig");
-const git2 = @import("../git/git2.zig");
-const c = git2.c;
+const gitpack = @import("gitpack");
 
 const GIT_STREAM = protocol.StreamId.git_out.nth(1); // id 12, matches real fetch
 
@@ -156,9 +155,9 @@ fn handshake(ini: *noise.Initiator, r: *std.Io.Reader, w: *std.Io.Writer) !void 
 pub const CloneResult = struct { refs: usize, pack_bytes: usize };
 
 /// Clones `rid` from `host:port` into a fresh bare repo at `into_path`:
-/// connect + handshake, ls-refs all refs, fetch the packfile, index it with
-/// libgit2, and write the refs. Radicle stores every remote under
-/// refs/namespaces/<nid>/...; we fetch refs/rad/* and refs/namespaces/*.
+/// connect + handshake, ls-refs all refs, fetch the packfile, index it, and
+/// write the refs. Radicle stores every remote under refs/namespaces/<nid>/...;
+/// we fetch refs/rad/* and refs/namespaces/*.
 pub fn clone(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -185,43 +184,50 @@ pub fn clone(
     try gitproto.fetchPack(session, wants, &pack, allocator);
     if (pack.items.len == 0) return error.EmptyPack;
 
-    try indexAndStore(allocator, into_path, pack.items, refs.refs);
+    try indexAndStore(io, allocator, into_path, pack.items, refs.refs);
     return .{ .refs = refs.refs.len, .pack_bytes = pack.items.len };
 }
 
-/// Initializes a bare repo, indexes `pack` into it, and writes `refs`.
-fn indexAndStore(allocator: std.mem.Allocator, into_path: []const u8, pack: []const u8, refs: []const gitproto.Ref) !void {
-    _ = c.git_libgit2_init();
-    defer _ = c.git_libgit2_shutdown();
+/// Writes a bare repo at `into_path`: the packfile plus its index (built by
+/// the toolchain's `indexPack`) under objects/pack, and each ref as a loose
+/// file.
+fn indexAndStore(io: std.Io, allocator: std.mem.Allocator, into_path: []const u8, pack: []const u8, refs: []const gitproto.Ref) !void {
+    const cwd = std.Io.Dir.cwd();
+    var repo_dir = try cwd.createDirPathOpen(io, into_path, .{});
+    defer repo_dir.close(io);
+    var pack_dir = try repo_dir.createDirPathOpen(io, "objects/pack", .{});
+    defer pack_dir.close(io);
 
-    const path_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{into_path}, 0);
-    defer allocator.free(path_z);
+    // Write the packfile, then index it into a sibling .idx.
+    var pack_file = try pack_dir.createFile(io, "pkg.pack", .{ .read = true });
+    defer pack_file.close(io);
+    var pfbuf: [4096]u8 = undefined;
+    var pack_reader = blk: {
+        var pw = pack_file.writer(io, &pfbuf);
+        try pw.interface.writeAll(pack);
+        try pw.interface.flush();
+        break :blk pw.moveToReader();
+    };
 
-    var repo: ?*c.git_repository = null;
-    try git2.check(c.git_repository_init(&repo, path_z, 1));
-    defer c.git_repository_free(repo);
+    var idx_file = try pack_dir.createFile(io, "pkg.idx", .{ .read = true });
+    defer idx_file.close(io);
+    var ibuf: [4096]u8 = undefined;
+    var idx_writer = idx_file.writer(io, &ibuf);
+    try gitpack.indexPack(allocator, .sha1, &pack_reader, &idx_writer);
+    try idx_writer.interface.flush();
 
-    const pack_dir = try std.fmt.allocPrintSentinel(allocator, "{s}/objects/pack", .{into_path}, 0);
-    defer allocator.free(pack_dir);
-
-    var idx: ?*c.git_indexer = null;
-    try git2.check(c.git_indexer_new(&idx, pack_dir, 0, null, null));
-    defer c.git_indexer_free(idx);
-
-    var stats: c.git_indexer_progress = std.mem.zeroes(c.git_indexer_progress);
-    try git2.check(c.git_indexer_append(idx, pack.ptr, pack.len, &stats));
-    try git2.check(c.git_indexer_commit(idx, &stats));
-
+    // Write each advertised ref as a loose file: refs/... = "<oid>\n".
     for (refs) |ref| {
-        var oid: c.git_oid = undefined;
-        var namez: [256]u8 = undefined;
-        if (ref.name.len >= namez.len) continue;
-        @memcpy(namez[0..ref.name.len], ref.name);
-        namez[ref.name.len] = 0;
-        if (c.git_oid_fromstr(&oid, &ref.oid) != 0) continue;
-        var out_ref: ?*c.git_reference = null;
-        if (c.git_reference_create(&out_ref, repo, &namez, &oid, 1, null) == 0) {
-            c.git_reference_free(out_ref);
+        if (std.fs.path.dirnamePosix(ref.name)) |parent| {
+            var d = try repo_dir.createDirPathOpen(io, parent, .{});
+            d.close(io);
         }
+        var rf = try repo_dir.createFile(io, ref.name, .{});
+        defer rf.close(io);
+        var rbuf: [64]u8 = undefined;
+        var rw = rf.writer(io, &rbuf);
+        try rw.interface.writeAll(&ref.oid);
+        try rw.interface.writeAll("\n");
+        try rw.interface.flush();
     }
 }

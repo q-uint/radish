@@ -18,13 +18,10 @@
       in
       {
         devShells.default = pkgs.mkShell {
-          # radicle-node provides `rad`, `radicle-node`, `git-remote-rad` for
-          # integration tests against the real reference implementation.
-          packages = [ zig pkgs.libgit2 pkgs.radicle-node ];
-          # build.zig reads these to locate the system libgit2 (optional; without
-          # Nix it falls back to default system include/library paths).
-          LIBGIT2_INCLUDE = "${pkgs.libgit2.dev}/include";
-          LIBGIT2_LIB = "${pkgs.libgit2.lib}/lib";
+          # git: used by storage tests to build repos in radish's clone layout.
+          # radicle-node provides `rad`/`radicle-node` for integration tests
+          # against the real reference implementation.
+          packages = [ zig pkgs.git pkgs.radicle-node ];
         };
 
         packages.default = pkgs.stdenv.mkDerivation {
@@ -32,9 +29,6 @@
           version = "0.0.0";
           src = ./.;
           nativeBuildInputs = [ zig ];
-          buildInputs = [ pkgs.libgit2 ];
-          LIBGIT2_INCLUDE = "${pkgs.libgit2.dev}/include";
-          LIBGIT2_LIB = "${pkgs.libgit2.lib}/lib";
           XDG_CACHE_HOME = "$TMPDIR/zig-cache";
           buildPhase = ''
             zig build -Doptimize=ReleaseSafe --prefix $out

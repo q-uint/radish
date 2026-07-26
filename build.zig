@@ -7,7 +7,7 @@ pub fn build(b: *std.Build) void {
     const zg = b.dependency("zg", .{ .target = target, .optimize = optimize });
     const normalize = zg.module("Normalize");
 
-    const git2 = git2Module(b, target, optimize);
+    const gitpack = gitpackModule(b, target, optimize);
 
     const mod = b.addModule("radish", .{
         .root_source_file = b.path("src/root.zig"),
@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "zg_normalize", .module = normalize },
-            .{ .name = "git2", .module = git2 },
+            .{ .name = "gitpack", .module = gitpack },
         },
     });
 
@@ -47,29 +47,17 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
 }
 
-/// Translate-c bindings for the system libgit2, linked as a `git2` module.
-/// Paths come from the flake (LIBGIT2_INCLUDE / LIBGIT2_LIB).
-fn git2Module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    // With Nix, the flake provides exact paths. Otherwise fall back to system
-    // discovery: a header on the default include path and linkSystemLibrary.
-    const include = b.graph.environ_map.get("LIBGIT2_INCLUDE");
-    const header: std.Build.LazyPath = if (include) |inc|
-        .{ .cwd_relative = b.pathJoin(&.{ inc, "git2.h" }) }
-    else
-        .{ .cwd_relative = "git2.h" };
-
-    const tc = b.addTranslateC(.{
-        .root_source_file = header,
+/// The toolchain's own git implementation (compiler internal, std only),
+/// imported from the pinned Zig's lib dir so it tracks the Zig we build with.
+/// The path can move between versions; then this fails loudly.
+fn gitpackModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    // zig_exe is <prefix>/bin/zig; the lib dir is <prefix>/lib.
+    const bin_dir = std.fs.path.dirname(b.graph.zig_exe) orelse ".";
+    const prefix = std.fs.path.dirname(bin_dir) orelse ".";
+    const git_path = b.pathJoin(&.{ prefix, "lib", "compiler", "Maker", "Fetch", "git.zig" });
+    return b.createModule(.{
+        .root_source_file = .{ .cwd_relative = git_path },
         .target = target,
         .optimize = optimize,
     });
-    if (include) |inc| tc.addIncludePath(.{ .cwd_relative = inc });
-
-    const mod = tc.createModule();
-    if (b.graph.environ_map.get("LIBGIT2_LIB")) |libdir| {
-        mod.addLibraryPath(.{ .cwd_relative = libdir });
-    }
-    mod.linkSystemLibrary("git2", .{});
-    mod.link_libc = true;
-    return mod;
 }

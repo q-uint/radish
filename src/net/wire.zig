@@ -156,7 +156,7 @@ pub fn subscribe(
 /// Opens a git stream and sends the git-upload-pack intro for `rid`, then
 /// reads raw frames, passing each git payload to `handler.onGit([]const u8)`.
 /// This is a probe of the fetch transport: it does not yet drive the git
-/// protocol v2 conversation (that is libgit2's job). Returns frames read.
+/// protocol v2 conversation. Returns frames read.
 pub fn fetchProbe(
     io: std.Io,
     allocator: std.mem.Allocator,

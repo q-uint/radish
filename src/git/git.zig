@@ -1,16 +1,17 @@
-//! Git object types and operations, backed by libgit2. A blob's object id is
-//! the SHA-1 of "blob <len>\0" ++ content; hashing a doc yields its RID.
+//! Git object types and operations, pure Zig. A blob's object id is the SHA-1
+//! of "blob <len>\0" ++ content; hashing a doc yields its RID.
 const std = @import("std");
-const git2 = @import("git2.zig");
 
 pub const Oid = [20]u8;
-pub const Error = git2.Error;
+pub const Error = error{};
 
 /// Computes the git blob object id of `content`.
 pub fn hashBlob(content: []const u8) Error!Oid {
-    var oid: git2.c.git_oid = undefined;
-    try git2.check(git2.c.git_odb_hash(&oid, content.ptr, content.len, git2.c.GIT_OBJECT_BLOB));
-    return oid.id;
+    var h = std.crypto.hash.Sha1.init(.{});
+    var hdr: [32]u8 = undefined;
+    h.update(std.fmt.bufPrint(&hdr, "blob {d}\x00", .{content.len}) catch unreachable);
+    h.update(content);
+    return h.finalResult();
 }
 
 const testing = std.testing;
