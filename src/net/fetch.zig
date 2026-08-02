@@ -3,9 +3,9 @@
 //! wrapped in Radicle Git frames. The git protocol v2 conversation on top of
 //! this (ls-refs, want/have, packfile) is driven by the caller.
 //!
-//! libgit2 cannot drive it: it speaks only git protocol v1, while radicle-node
-//! requires v2. So the v2 client (git/protocol.zig) is hand-rolled; this
-//! module provides the Session byte-bridge it runs over, plus `clone`.
+//! radicle-node requires protocol v2, so the v2 client (git/protocol.zig) is
+//! hand-rolled; this module provides the Session byte-bridge it runs over,
+//! plus `clone`.
 const std = @import("std");
 const noise = @import("../crypto/noise.zig");
 const node_id = @import("../identity/node_id.zig");
@@ -14,6 +14,10 @@ const gitproto = @import("../git/protocol.zig");
 const gitpack = @import("gitpack");
 
 const GIT_STREAM = protocol.StreamId.git_out.nth(1); // id 12, matches real fetch
+
+/// Socket read/write buffering. Independent of the frame limit: frames are
+/// reassembled in `frame_buf`, so this only trades syscalls for memory.
+const STREAM_BUF = 64 * 1024;
 
 /// A live, handshaked git-stream to a node. `read`/`write` deal in raw git
 /// bytes; framing on/off the wire is handled here. Reads keep the leftover of
@@ -63,9 +67,9 @@ pub const Session = struct {
             .reader = undefined,
             .writer = undefined,
             .rid = rid,
-            .frame_buf = try allocator.alloc(u8, 70 * 1024),
-            .rbuf = try allocator.alloc(u8, 64 * 1024),
-            .wbuf = try allocator.alloc(u8, 64 * 1024),
+            .frame_buf = try allocator.alloc(u8, protocol.MAX_FRAME_PAYLOAD),
+            .rbuf = try allocator.alloc(u8, STREAM_BUF),
+            .wbuf = try allocator.alloc(u8, STREAM_BUF),
             .sr = undefined,
             .sw = undefined,
         };
@@ -188,6 +192,20 @@ pub fn clone(
     return .{ .refs = refs.refs.len, .pack_bytes = pack.items.len };
 }
 
+/// Basenames git gives a packfile: `pack-<checksum>`, where the checksum is the
+/// SHA-1 trailer in the pack's last 20 bytes. Naming by content keeps a second
+/// fetch into the same repo from overwriting the first.
+/// Source: gitformat-pack (the trailer), and `git index-pack` naming.
+const PackName = ["pack-".len + 40]u8;
+
+fn packName(pack: []const u8) !PackName {
+    if (pack.len < 20) return error.ShortPack;
+    var out: PackName = undefined;
+    @memcpy(out[0..5], "pack-");
+    _ = std.fmt.bufPrint(out[5..], "{x}", .{pack[pack.len - 20 ..]}) catch unreachable;
+    return out;
+}
+
 /// Writes a bare repo at `into_path`: the packfile plus its index (built by
 /// the toolchain's `indexPack`) under objects/pack, and each ref as a loose
 /// file.
@@ -199,7 +217,9 @@ fn indexAndStore(io: std.Io, allocator: std.mem.Allocator, into_path: []const u8
     defer pack_dir.close(io);
 
     // Write the packfile, then index it into a sibling .idx.
-    var pack_file = try pack_dir.createFile(io, "pkg.pack", .{ .read = true });
+    const base = try packName(pack);
+    var name_buf: [@typeInfo(PackName).array.len + ".pack".len]u8 = undefined;
+    var pack_file = try pack_dir.createFile(io, try std.fmt.bufPrint(&name_buf, "{s}.pack", .{base}), .{ .read = true });
     defer pack_file.close(io);
     var pfbuf: [4096]u8 = undefined;
     var pack_reader = blk: {
@@ -209,7 +229,7 @@ fn indexAndStore(io: std.Io, allocator: std.mem.Allocator, into_path: []const u8
         break :blk pw.moveToReader();
     };
 
-    var idx_file = try pack_dir.createFile(io, "pkg.idx", .{ .read = true });
+    var idx_file = try pack_dir.createFile(io, try std.fmt.bufPrint(&name_buf, "{s}.idx", .{base}), .{ .read = true });
     defer idx_file.close(io);
     var ibuf: [4096]u8 = undefined;
     var idx_writer = idx_file.writer(io, &ibuf);
@@ -230,4 +250,26 @@ fn indexAndStore(io: std.Io, allocator: std.mem.Allocator, into_path: []const u8
         try rw.interface.writeAll("\n");
         try rw.interface.flush();
     }
+}
+
+const testing = std.testing;
+
+// Trailer and expected name taken from a pack `git pack-objects` produced, then
+// cross-checked against the filename `git clone --no-local` wrote for it.
+test "pack is named after its sha1 trailer" {
+    var pack: [32]u8 = @splat(0);
+    const trailer = [20]u8{
+        0xdd, 0x58, 0xe7, 0xfd, 0x2a, 0x28, 0x04, 0x08, 0xd4, 0x41,
+        0x4c, 0x3d, 0x72, 0x89, 0x0a, 0xc9, 0x73, 0xab, 0xb9, 0x59,
+    };
+    @memcpy(pack[12..], &trailer);
+    const name = try packName(&pack);
+    try testing.expectEqualStrings("pack-dd58e7fd2a280408d4414c3d72890ac973abb959", &name);
+}
+
+test "distinct packs get distinct names" {
+    var a: [20]u8 = @splat(0xaa);
+    var b: [20]u8 = @splat(0xbb);
+    try testing.expect(!std.mem.eql(u8, &try packName(&a), &try packName(&b)));
+    try testing.expectError(error.ShortPack, packName("short"));
 }

@@ -10,7 +10,56 @@ const doc = @import("../identity/doc.zig");
 const DOC_PATH = "embeds/radicle.json";
 const ID_REF = "refs/rad/id";
 
-pub const Error = error{ IdRefMissing, DocMissing } || doc.ParseError;
+pub const Error = error{ IdRefMissing, DocMissing, PackMissing } || doc.ParseError;
+
+/// A uniquely-named directory under the system temp dir, removed on `deinit`.
+/// `std.testing.tmpDir` is test-only (it asserts `is_test` and writes into
+/// .zig-cache), so checkouts on the normal path need this instead.
+const TmpDir = struct {
+    dir: std.Io.Dir,
+    parent: std.Io.Dir,
+    name: [24]u8,
+
+    fn create(io: std.Io) !TmpDir {
+        var random_bytes: [18]u8 = undefined;
+        io.random(&random_bytes);
+        var name: [24]u8 = undefined;
+        _ = std.base64.url_safe.Encoder.encode(&name, &random_bytes);
+
+        // /tmp rather than $TMPDIR: reading the environment would mean
+        // threading process.Init through every caller of Repository.open.
+        var parent = try std.Io.Dir.openDirAbsolute(io, "/tmp", .{});
+        errdefer parent.close(io);
+        const dir = try parent.createDirPathOpen(io, &name, .{});
+        return .{ .dir = dir, .parent = parent, .name = name };
+    }
+
+    fn deinit(self: *TmpDir, io: std.Io) void {
+        self.dir.close(io);
+        self.parent.deleteTree(io, &self.name) catch {};
+        self.parent.close(io);
+    }
+};
+
+/// Finds the single packfile under objects/pack and returns its basename
+/// (no extension), copied into `buf`. Packs are named for their content, so
+/// the name is not known ahead of time.
+fn findPack(io: std.Io, dir: std.Io.Dir, buf: []u8) ![]const u8 {
+    var pack_dir = dir.openDir(io, "objects/pack", .{ .iterate = true }) catch
+        return error.PackMissing;
+    defer pack_dir.close(io);
+
+    var it = pack_dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".pack")) continue;
+        const base = entry.name[0 .. entry.name.len - ".pack".len];
+        if (base.len > buf.len) return error.PackMissing;
+        @memcpy(buf[0..base.len], base);
+        return buf[0..base.len];
+    }
+    return error.PackMissing;
+}
 
 pub const Repository = struct {
     io: std.Io,
@@ -34,9 +83,13 @@ pub const Repository = struct {
         self.dir = try std.Io.Dir.cwd().openDir(io, path, .{});
         errdefer self.dir.close(io);
 
-        self.pack_file = try self.dir.openFile(io, "objects/pack/pkg.pack", .{});
+        var base_buf: [std.fs.max_name_bytes]u8 = undefined;
+        const base = try findPack(io, self.dir, &base_buf);
+        var name_buf: [std.fs.max_name_bytes]u8 = undefined;
+
+        self.pack_file = try self.dir.openFile(io, try std.fmt.bufPrint(&name_buf, "objects/pack/{s}.pack", .{base}), .{});
         errdefer self.pack_file.close(io);
-        self.idx_file = try self.dir.openFile(io, "objects/pack/pkg.idx", .{});
+        self.idx_file = try self.dir.openFile(io, try std.fmt.bufPrint(&name_buf, "objects/pack/{s}.idx", .{base}), .{});
         errdefer self.idx_file.close(io);
 
         self.pbuf = try allocator.alloc(u8, 4096);
@@ -75,8 +128,8 @@ pub const Repository = struct {
     pub fn readDocBytes(self: *Repository, gpa: std.mem.Allocator, scratch: std.mem.Allocator) ![]u8 {
         const oid = try self.readRef(ID_REF);
 
-        var tmp = std.testing.tmpDir(.{}); // TODO: a non-test tmp dir helper
-        defer tmp.cleanup();
+        var tmp = try TmpDir.create(self.io);
+        defer tmp.deinit(self.io);
         var diags: gitpack.Diagnostics = .{ .allocator = scratch };
         defer diags.deinit();
         try self.repo.checkout(self.io, tmp.dir, oid, &diags);
@@ -134,8 +187,7 @@ fn buildCloneLayout(alloc: std.mem.Allocator, root: []const u8, doc_bytes: []con
         \\git add . && git commit -qm id
         \\cid=$(git rev-parse HEAD)
         \\cd .. && mkdir -p bare/objects/pack bare/refs/rad
-        \\git -C src rev-list --objects --all | git -C src pack-objects --stdout > bare/objects/pack/pkg.pack 2>/dev/null
-        \\git -C bare index-pack objects/pack/pkg.pack >/dev/null 2>&1
+        \\git -C src rev-list --objects --all | git -C src pack-objects "$PWD/bare/objects/pack/pack" >/dev/null 2>&1
         \\printf '%s\n' "$cid" > bare/refs/rad/id
     , .{ root, doc_bytes });
     defer alloc.free(script);

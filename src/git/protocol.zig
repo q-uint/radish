@@ -1,7 +1,7 @@
 //! Git protocol v2 client (gitprotocol-v2), spoken over a fetch Session.
-//! Drives `ls-refs` and `fetch` and demultiplexes the sideband packfile. This
-//! is hand-rolled because libgit2 has no v2 support and radicle-node requires
-//! v2; the returned packfile is indexed by the toolchain's own git plumbing.
+//! Drives `ls-refs` and `fetch` and demultiplexes the sideband packfile.
+//! radicle-node requires v2, so this client is hand-rolled; the returned
+//! packfile is indexed by the toolchain's own git plumbing.
 //!
 //! Request/response shapes verified against a live radicle-node 1.9.1 fetch:
 //!   -> command=ls-refs\n agent=..\n DELIM symrefs\n peel\n ref-prefix ..\n FLUSH
@@ -12,6 +12,10 @@ const std = @import("std");
 const pktline = @import("pktline.zig");
 
 pub const AGENT = "agent=radish/0.0.0\n";
+
+/// Read buffer for pkt-line responses: one max-length pkt-line plus its 4-byte
+/// header must always fit, or `PktReader` cannot make progress.
+const MAX_PKT_BUF = pktline.MAX_DATA + 4;
 
 /// This client is transport-agnostic: `session` is any value exposing
 ///   readGit([]u8) !usize   writeGit([]const u8) !void
@@ -116,7 +120,7 @@ pub fn lsRefs(allocator: std.mem.Allocator, session: anytype, prefixes: []const 
     const a = arena.allocator();
     var list: std.ArrayList(Ref) = .empty;
 
-    var rbuf: [70 * 1024]u8 = undefined;
+    var rbuf: [MAX_PKT_BUF]u8 = undefined;
     var reader = PktReader(@TypeOf(session)){ .session = session, .buf = &rbuf };
     while (true) {
         const line = try reader.next();
@@ -162,7 +166,7 @@ pub fn fetchPack(
     try writePkt(session, "done\n");
     try session.writeGit(pktline.Marker.flush.wire());
 
-    var rbuf: [70 * 1024]u8 = undefined;
+    var rbuf: [MAX_PKT_BUF]u8 = undefined;
     var reader = PktReader(@TypeOf(session)){ .session = session, .buf = &rbuf };
     var in_packfile = false;
     while (true) {

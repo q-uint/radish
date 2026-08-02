@@ -7,3 +7,10 @@ pub const sigrefs = @import("sigrefs.zig");
 pub const NodeId = node_id.NodeId;
 pub const RepoId = rid.RepoId;
 pub const Doc = doc.Doc;
+
+test {
+    _ = node_id;
+    _ = rid;
+    _ = doc;
+    _ = sigrefs;
+}

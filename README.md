@@ -22,7 +22,7 @@ Wire protocol (spoken to a live node):
 - `wire` - dial a node: ping/pong, signed `NodeAnnouncement`, gossip `Subscribe`
 - `announce` - encode and sign gossip announcements
 - `git.protocol` - hand-rolled git protocol v2 client (ls-refs, fetch, sideband)
-- `fetch` - clone a repo: git stream, v2 fetch, packfile indexed via libgit2
+- `fetch` - clone a repo: git stream, v2 fetch, packfile indexed and written to a bare repo
 
 ## CLI
 

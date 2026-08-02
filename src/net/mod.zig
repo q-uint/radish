@@ -4,3 +4,11 @@ pub const protocol = @import("protocol.zig");
 pub const wire = @import("wire.zig");
 pub const announce = @import("announce.zig");
 pub const fetch = @import("fetch.zig");
+
+test {
+    _ = codec;
+    _ = protocol;
+    _ = wire;
+    _ = announce;
+    _ = fetch;
+}

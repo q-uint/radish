@@ -14,7 +14,10 @@ pub const Signature = crypto.Signature;
 pub const SecretKey = crypto.SecretKey;
 
 test {
-    std.testing.refAllDecls(@This());
+    _ = crypto;
+    _ = identity;
+    _ = git;
+    _ = net;
 }
 
 test "gitpack module is importable from the toolchain" {

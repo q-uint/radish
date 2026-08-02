@@ -7,3 +7,11 @@ pub const noise = @import("noise.zig");
 
 pub const Signature = signature.Signature;
 pub const SecretKey = signature.SecretKey;
+
+test {
+    _ = base58;
+    _ = unicode;
+    _ = canonical;
+    _ = signature;
+    _ = noise;
+}

@@ -140,7 +140,7 @@ pub fn subscribe(
     try w.writeAll(frame);
     try w.flush();
 
-    var scratch: [70 * 1024]u8 = undefined; // inventory can be tens of KiB
+    var scratch: [protocol.MAX_FRAME_PAYLOAD]u8 = undefined;
     var oids: [protocol.INVENTORY_LIMIT][20]u8 = undefined;
     var frames: usize = 0;
     while (frames < max_frames) : (frames += 1) {
@@ -202,7 +202,7 @@ pub fn fetchProbe(
     try w.writeAll(git_frame);
     try w.flush();
 
-    var scratch: [70 * 1024]u8 = undefined;
+    var scratch: [protocol.MAX_FRAME_PAYLOAD]u8 = undefined;
     var frames: usize = 0;
     while (frames < max_frames) : (frames += 1) {
         const f = protocol.readRawFrame(r, &scratch) catch |e| switch (e) {
@@ -239,7 +239,7 @@ fn handshake(ini: *noise.Initiator, r: *std.Io.Reader, w: *std.Io.Writer) !void 
 /// Reads frames (announcements etc.) until a Pong arrives; bounded so a
 /// misbehaving peer can't loop us forever.
 fn readUntilPong(r: *std.Io.Reader) !u16 {
-    var scratch: [70 * 1024]u8 = undefined;
+    var scratch: [protocol.MAX_FRAME_PAYLOAD]u8 = undefined;
     var oids: [protocol.INVENTORY_LIMIT][20]u8 = undefined;
     var frames: usize = 0;
     while (frames < 64) : (frames += 1) {

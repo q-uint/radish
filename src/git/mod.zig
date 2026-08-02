@@ -5,3 +5,10 @@ pub const objects = @import("git.zig");
 pub const storage = @import("storage.zig");
 pub const pktline = @import("pktline.zig");
 pub const protocol = @import("protocol.zig");
+
+test {
+    _ = objects;
+    _ = storage;
+    _ = pktline;
+    _ = protocol;
+}

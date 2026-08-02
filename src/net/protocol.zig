@@ -8,6 +8,12 @@ const codec = @import("codec.zig");
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const VERSION_STRING = [4]u8{ 'r', 'a', 'd', PROTOCOL_VERSION };
 
+/// Largest frame payload we will buffer. A git frame carries at most one
+/// max-size pkt-line (65516 + 4 header); inventory gossip frames observed from
+/// a live node run to tens of KiB. Frames declaring more are rejected rather
+/// than truncated.
+pub const MAX_FRAME_PAYLOAD = 70 * 1024;
+
 /// Gossip message type ids (radicle-protocol wire/message.rs MessageType).
 pub const MessageType = enum(u16) {
     node_announcement = 2,
@@ -205,6 +211,7 @@ pub fn decodeFrameStreaming(r: *std.Io.Reader, scratch: []u8, oid_buf: [][20]u8)
     if (!std.mem.eql(u8, version, &VERSION_STRING)) return error.BadVersion;
     _ = try readStreamVarint(r); // stream id
     const len = try readStreamVarint(r);
+    if (len > scratch.len) return error.FrameTooLarge;
     const payload = scratch[0..@intCast(len)];
     try r.readSliceAll(payload);
 
@@ -228,6 +235,16 @@ pub const RawFrame = union(enum) {
     unknown: struct { stream: u64, payload: []const u8 },
 };
 
+/// Reads a varint-length-prefixed body into `scratch`, rejecting a declared
+/// length that would overrun it.
+fn readPayload(r: *std.Io.Reader, scratch: []u8) ![]const u8 {
+    const len = try readStreamVarint(r);
+    if (len > scratch.len) return error.FrameTooLarge;
+    const payload = scratch[0..@intCast(len)];
+    try r.readSliceAll(payload);
+    return payload;
+}
+
 /// Reads one frame, dispatching on the stream id's type bits. Control bodies
 /// are not length-prefixed; gossip/git bodies are varint-length-prefixed.
 pub fn readRawFrame(r: *std.Io.Reader, scratch: []u8) !RawFrame {
@@ -242,18 +259,14 @@ pub fn readRawFrame(r: *std.Io.Reader, scratch: []u8) !RawFrame {
             return .{ .control = .{ .ctrl = ctrl, .target = target } };
         },
         @backingInt(StreamType.gossip), @backingInt(StreamType.git) => {
-            const len = try readStreamVarint(r);
-            const payload = scratch[0..@intCast(len)];
-            try r.readSliceAll(payload);
+            const payload = try readPayload(r, scratch);
             return if (kind == @backingInt(StreamType.git))
                 .{ .git = payload }
             else
                 .{ .gossip = payload };
         },
         else => {
-            const len = try readStreamVarint(r);
-            const payload = scratch[0..@intCast(len)];
-            try r.readSliceAll(payload);
+            const payload = try readPayload(r, scratch);
             return .{ .unknown = .{ .stream = stream, .payload = payload } };
         },
     }
