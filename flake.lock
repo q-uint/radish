@@ -54,7 +54,8 @@
       "inputs": {
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs",
-        "zig-overlay": "zig-overlay"
+        "zig-overlay": "zig-overlay",
+        "zig-src": "zig-src"
       }
     },
     "systems": {
@@ -108,6 +109,23 @@
         "owner": "mitchellh",
         "repo": "zig-overlay",
         "type": "github"
+      }
+    },
+    "zig-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1785185278,
+        "narHash": "sha256-0vyCCkTKU8pZYn36qWWTHWj5pVjkubwnzbe5fKMcMfw=",
+        "ref": "git-index-crc32",
+        "rev": "ce19a62e41312510fd9be64f97f1de3e2913df15",
+        "revCount": 39296,
+        "type": "git",
+        "url": "https://codeberg.org/quint/zig-gpu"
+      },
+      "original": {
+        "ref": "git-index-crc32",
+        "type": "git",
+        "url": "https://codeberg.org/quint/zig-gpu"
       }
     }
   },

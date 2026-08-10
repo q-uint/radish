@@ -8,13 +8,21 @@
       url = "github:mitchellh/zig-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # Source only, never built: build.zig compiles lib/compiler/Maker/Fetch/git.zig
+    # as a standalone module, and this branch carries the pack-index CRC32 fix
+    # (ziglang/zig#36328) that stock git.zig lacks. Drop once the PR lands.
+    zig-src = {
+      url = "git+https://codeberg.org/quint/zig-gpu?ref=git-index-crc32";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, zig-overlay }:
+  outputs = { self, nixpkgs, flake-utils, zig-overlay, zig-src }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
         zig = zig-overlay.packages.${system}.master;
+        gitpackFlag = "-Dgitpack=${zig-src}/lib/compiler/Maker/Fetch/git.zig";
       in
       {
         devShells.default = pkgs.mkShell {
@@ -22,6 +30,9 @@
           # radicle-node provides `rad`/`radicle-node` for integration tests
           # against the real reference implementation.
           packages = [ zig pkgs.git pkgs.radicle-node ];
+          # build.zig falls back to this when -Dgitpack is not passed, so a bare
+          # `zig build` in the shell still gets the forked git.zig.
+          RADISH_GITPACK = "${zig-src}/lib/compiler/Maker/Fetch/git.zig";
         };
 
         packages.default = pkgs.stdenv.mkDerivation {

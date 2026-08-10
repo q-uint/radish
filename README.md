@@ -50,6 +50,10 @@ nix develop --command zig build test
 nix develop --command zig build run
 ```
 
+The pack indexer is the Zig toolchain's own `git.zig`, compiled from source as a module rather than linked from the compiler. Stock 0.17-dev writes a zeroed CRC32 table that real `git` rejects, so the flake also pins a source-only checkout of a branch carrying the fix ([ziglang/zig#36328]) and points the module at it; the toolchain itself stays a prebuilt release. Override the path with `-Dgitpack=/path/to/git.zig`, or drop the pin once the fix lands upstream.
+
+[ziglang/zig#36328]: https://codeberg.org/ziglang/zig/pulls/36328
+
 ## References
 
 See [REFERENCES.md](REFERENCES.md) for the Radicle protocol docs and the

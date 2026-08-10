@@ -252,7 +252,7 @@ fn indexAndStore(io: std.Io, allocator: std.mem.Allocator, into_path: []const u8
     defer idx_file.close(io);
     var ibuf: [4096]u8 = undefined;
     var idx_writer = idx_file.writer(io, &ibuf);
-    try gitpack.indexPack(allocator, .sha1, &pack_reader, &idx_writer);
+    try gitpack.indexPack(allocator, .sha1, &pack_reader, &idx_writer, .{ .checksums = true });
     try idx_writer.interface.flush();
 
     // Write each advertised ref as a loose file: refs/... = "<oid>\n".

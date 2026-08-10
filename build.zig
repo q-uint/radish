@@ -54,7 +54,11 @@ fn gitpackModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     // zig_exe is <prefix>/bin/zig; the lib dir is <prefix>/lib.
     const bin_dir = std.fs.path.dirname(b.graph.zig_exe) orelse ".";
     const prefix = std.fs.path.dirname(bin_dir) orelse ".";
-    const git_path = b.pathJoin(&.{ prefix, "lib", "compiler", "Maker", "Fetch", "git.zig" });
+    const default = b.pathJoin(&.{ prefix, "lib", "compiler", "Maker", "Fetch", "git.zig" });
+    // The pinned fork's copy, when the flake supplies one: stock git.zig has no
+    // IndexPackOptions, so indexPack's checksums cannot be requested from it.
+    const git_path = b.option([]const u8, "gitpack", "Path to git.zig") orelse
+        b.graph.environ_map.get("RADISH_GITPACK") orelse default;
     return b.createModule(.{
         .root_source_file = .{ .cwd_relative = git_path },
         .target = target,
