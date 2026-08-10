@@ -5,6 +5,7 @@ const std = @import("std");
 const noise = @import("../crypto/noise.zig");
 const node_id = @import("../identity/node_id.zig");
 const protocol = @import("protocol.zig");
+const dial = @import("dial.zig");
 const announce = @import("announce.zig");
 const signature = @import("../crypto/signature.zig");
 
@@ -27,8 +28,7 @@ pub fn ping(
 
     var ini = noise.Initiator.init(static, ephemeral, nid.key);
 
-    var addr = try std.Io.net.IpAddress.parseIp4(host, port);
-    var stream = try addr.connect(io, .{ .mode = .stream });
+    var stream = try dial.connect(io, host, port);
     defer stream.close(io);
 
     var wbuf: [4096]u8 = undefined;
@@ -67,8 +67,7 @@ pub fn sendAnnouncement(
     const ephemeral = try noise.KeyPair.generateDeterministic(seed);
     var ini = noise.Initiator.init(static, ephemeral, nid.key);
 
-    var addr = try std.Io.net.IpAddress.parseIp4(host, port);
-    var stream = try addr.connect(io, .{ .mode = .stream });
+    var stream = try dial.connect(io, host, port);
     defer stream.close(io);
 
     var wbuf: [4096]u8 = undefined;
@@ -122,8 +121,7 @@ pub fn subscribe(
     const ephemeral = try noise.KeyPair.generateDeterministic(seed);
     var ini = noise.Initiator.init(static, ephemeral, nid.key);
 
-    var addr = try std.Io.net.IpAddress.parseIp4(host, port);
-    var stream = try addr.connect(io, .{ .mode = .stream });
+    var stream = try dial.connect(io, host, port);
     defer stream.close(io);
 
     var wbuf: [4096]u8 = undefined;
@@ -174,8 +172,7 @@ pub fn fetchProbe(
     const ephemeral = try noise.KeyPair.generateDeterministic(seed);
     var ini = noise.Initiator.init(static, ephemeral, nid.key);
 
-    var addr = try std.Io.net.IpAddress.parseIp4(host, port);
-    var stream = try addr.connect(io, .{ .mode = .stream });
+    var stream = try dial.connect(io, host, port);
     defer stream.close(io);
 
     var wbuf: [4096]u8 = undefined;

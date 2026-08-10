@@ -13,7 +13,7 @@ Identity and encoding:
 - `canonical` - Radicle canonical JSON (NFC-normalized, sorted keys, integer-only)
 - `Doc` - identity document; its canonical git-blob hash is the RID
 - `sigrefs` - signed refs (`rad/sigrefs`)
-- `unicode` - NFC via a forked [zg](https://codeberg.org/dude_the_builder/zg)
+- `unicode` - NFC via a forked [zg](https://codeberg.org/atman/zg)
 
 Wire protocol (spoken to a live node):
 
@@ -21,8 +21,15 @@ Wire protocol (spoken to a live node):
 - `codec` / `protocol` - QUIC-varint framing, streams, gossip messages
 - `wire` - dial a node: ping/pong, signed `NodeAnnouncement`, gossip `Subscribe`
 - `announce` - encode and sign gossip announcements
+- `dial` - resolve a node address: IP literals, or a hostname via DNS
 - `git.protocol` - hand-rolled git protocol v2 client (ls-refs, fetch, sideband)
 - `fetch` - clone a repo: git stream, v2 fetch, packfile indexed and written to a bare repo
+
+Storage (reading what we cloned, pure Zig via the toolchain's git plumbing):
+
+- `storage` - the clone layout: one content-named pack plus loose refs
+- identity docs read from `refs/rad/id:embeds/radicle.json`
+- per-remote verification: each `rad/sigrefs` signature is checked against its node id, and every oid it signs must be present in the pack, so a peer cannot advertise refs it never sent objects for
 
 ## CLI
 
@@ -31,7 +38,7 @@ radish ping        <host> <port> <node-id>              handshake + ping/pong
 radish announce    <host> <port> <node-id> [alias]      send a signed NodeAnnouncement
 radish subscribe   <host> <port> <node-id> [frames]     listen to gossip (nodes + inventory)
 radish fetch-probe <host> <port> <node-id> <rid>        open a git stream, read the v2 advertisement
-radish clone       <host> <port> <node-id> <rid> <dir>  clone a repo into <dir> (bare)
+radish clone       <host> <port> <node-id> <rid> <dir>  clone a repo into <dir> (bare), verifying each remote
 ```
 
 ## Build

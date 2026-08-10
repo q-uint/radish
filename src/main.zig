@@ -46,11 +46,21 @@ fn clone(init: std.process.Init, host: []const u8, port_str: []const u8, nid_str
     const nid = try radish.NodeId.parse(arena, nid_str);
 
     std.debug.print("cloning {s} from {s} into {s}...\n", .{ rid_str, nid_str, dir });
-    const result = radish.net.fetch.clone(init.io, arena, host, port, nid, rid_str, dir) catch |e| {
+    var result = radish.net.fetch.clone(init.io, arena, host, port, nid, rid_str, dir) catch |e| {
         std.debug.print("clone failed: {s}\n", .{@errorName(e)});
         return e;
     };
+    defer result.deinit(arena);
     std.debug.print("cloned {s}: {d} refs, {d} pack bytes -> {s}\n", .{ rid_str, result.refs, result.pack_bytes, dir });
+
+    for (result.report.verified) |remote| std.debug.print("  verified {s}\n", .{remote});
+    for (result.report.failed) |f| std.debug.print("  UNVERIFIED {s}: {s}\n", .{ f.nid, @errorName(f.err) });
+    if (result.report.failed.len > 0) {
+        std.debug.print("\n{d} of {d} remotes could not be verified\n", .{
+            result.report.failed.len,
+            result.report.failed.len + result.report.verified.len,
+        });
+    }
 }
 
 const FetchProbePrinter = struct {

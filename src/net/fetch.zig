@@ -11,6 +11,8 @@ const noise = @import("../crypto/noise.zig");
 const node_id = @import("../identity/node_id.zig");
 const protocol = @import("protocol.zig");
 const gitproto = @import("../git/protocol.zig");
+const storage = @import("../git/storage.zig");
+const dial = @import("dial.zig");
 const gitpack = @import("gitpack");
 
 const GIT_STREAM = protocol.StreamId.git_out.nth(1); // id 12, matches real fetch
@@ -54,8 +56,7 @@ pub const Session = struct {
         const ephemeral = try noise.KeyPair.generateDeterministic(seed);
         var ini = noise.Initiator.init(static, ephemeral, nid.key);
 
-        var addr = try std.Io.net.IpAddress.parseIp4(host, port);
-        var stream = try addr.connect(io, .{ .mode = .stream });
+        var stream = try dial.connect(io, host, port);
         errdefer stream.close(io);
 
         const self = try allocator.create(Session);
@@ -156,7 +157,18 @@ fn handshake(ini: *noise.Initiator, r: *std.Io.Reader, w: *std.Io.Writer) !void 
     _ = ini.split();
 }
 
-pub const CloneResult = struct { refs: usize, pack_bytes: usize };
+pub const CloneResult = struct {
+    refs: usize,
+    pack_bytes: usize,
+    /// Per-remote verification of what was just written. Remotes are trusted
+    /// independently, so a failure here does not invalidate the clone; the
+    /// caller decides what to do with an unverified remote.
+    report: storage.VerifyReport,
+
+    pub fn deinit(self: *CloneResult, gpa: std.mem.Allocator) void {
+        self.report.deinit(gpa);
+    }
+};
 
 /// Clones `rid` from `host:port` into a fresh bare repo at `into_path`:
 /// connect + handshake, ls-refs all refs, fetch the packfile, index it, and
@@ -189,7 +201,14 @@ pub fn clone(
     if (pack.items.len == 0) return error.EmptyPack;
 
     try indexAndStore(io, allocator, into_path, pack.items, refs.refs);
-    return .{ .refs = refs.refs.len, .pack_bytes = pack.items.len };
+
+    // Verify what the peer actually sent: each remote's sigrefs signature, and
+    // that the objects behind those refs are really in the pack.
+    var repo = try storage.Repository.open(io, allocator, into_path);
+    defer repo.deinit();
+    const report = try repo.verifyAll(allocator, allocator);
+
+    return .{ .refs = refs.refs.len, .pack_bytes = pack.items.len, .report = report };
 }
 
 /// Basenames git gives a packfile: `pack-<checksum>`, where the checksum is the

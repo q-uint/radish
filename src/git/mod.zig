@@ -11,4 +11,5 @@ test {
     _ = storage;
     _ = pktline;
     _ = protocol;
+    _ = @import("storage_test.zig");
 }
