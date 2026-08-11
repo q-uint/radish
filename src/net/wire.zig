@@ -19,33 +19,17 @@ pub fn ping(
     nid: node_id.NodeId,
     ponglen: u16,
 ) !u16 {
-    // The responder static is the node's raw Ed25519 public key (its NID).
-    var seed: [32]u8 = undefined;
-    io.random(&seed);
-    const static = try noise.KeyPair.generateDeterministic(seed);
-    io.random(&seed);
-    const ephemeral = try noise.KeyPair.generateDeterministic(seed);
-
-    var ini = noise.Initiator.init(static, ephemeral, nid.key);
-
-    var stream = try dial.connect(io, host, port);
-    defer stream.close(io);
-
-    var wbuf: [4096]u8 = undefined;
-    var rbuf: [4096]u8 = undefined;
-    var sw = stream.writer(io, &wbuf);
-    var sr = stream.reader(io, &rbuf);
-    const w = &sw.interface;
-    const r = &sr.interface;
-
-    try handshake(&ini, r, w);
+    var session: Session = .{};
+    try session.connect(io, host, port, nid);
+    defer session.deinit(io);
+    const w = session.w();
 
     const frame = try protocol.encodePingFrame(allocator, .{ .ponglen = ponglen, .zeroes = 0 });
     defer allocator.free(frame);
     try w.writeAll(frame);
     try w.flush();
 
-    return readUntilPong(r);
+    return readUntilPong(session.r());
 }
 
 /// Connects, handshakes, sends our signed NodeAnnouncement, then a Ping. A
@@ -60,24 +44,10 @@ pub fn sendAnnouncement(
     key: signature.SecretKey,
     alias: []const u8,
 ) !u16 {
-    var seed: [32]u8 = undefined;
-    io.random(&seed);
-    const static = try noise.KeyPair.generateDeterministic(seed);
-    io.random(&seed);
-    const ephemeral = try noise.KeyPair.generateDeterministic(seed);
-    var ini = noise.Initiator.init(static, ephemeral, nid.key);
-
-    var stream = try dial.connect(io, host, port);
-    defer stream.close(io);
-
-    var wbuf: [4096]u8 = undefined;
-    var rbuf: [4096]u8 = undefined;
-    var sw = stream.writer(io, &wbuf);
-    var sr = stream.reader(io, &rbuf);
-    const w = &sw.interface;
-    const r = &sr.interface;
-
-    try handshake(&ini, r, w);
+    var session: Session = .{};
+    try session.connect(io, host, port, nid);
+    defer session.deinit(io);
+    const w = session.w();
 
     // Sign and send our NodeAnnouncement.
     const now_ms: u64 = @intCast(@divTrunc(std.Io.Clock.now(.real, io).nanoseconds, std.time.ns_per_ms));
@@ -98,7 +68,7 @@ pub fn sendAnnouncement(
     try w.writeAll(ping_frame);
     try w.flush();
 
-    return readUntilPong(r);
+    return readUntilPong(session.r());
 }
 
 /// Connects, handshakes, sends Subscribe-all, and reads up to `max_frames`
@@ -114,24 +84,11 @@ pub fn subscribe(
     max_frames: usize,
     handler: anytype,
 ) !usize {
-    var seed: [32]u8 = undefined;
-    io.random(&seed);
-    const static = try noise.KeyPair.generateDeterministic(seed);
-    io.random(&seed);
-    const ephemeral = try noise.KeyPair.generateDeterministic(seed);
-    var ini = noise.Initiator.init(static, ephemeral, nid.key);
-
-    var stream = try dial.connect(io, host, port);
-    defer stream.close(io);
-
-    var wbuf: [4096]u8 = undefined;
-    var rbuf: [4096]u8 = undefined;
-    var sw = stream.writer(io, &wbuf);
-    var sr = stream.reader(io, &rbuf);
-    const w = &sw.interface;
-    const r = &sr.interface;
-
-    try handshake(&ini, r, w);
+    var session: Session = .{};
+    try session.connect(io, host, port, nid);
+    defer session.deinit(io);
+    const w = session.w();
+    const r = session.r();
 
     const frame = try protocol.encodeSubscribeAllFrame(allocator);
     defer allocator.free(frame);
@@ -165,24 +122,11 @@ pub fn fetchProbe(
     max_frames: usize,
     handler: anytype,
 ) !usize {
-    var seed: [32]u8 = undefined;
-    io.random(&seed);
-    const static = try noise.KeyPair.generateDeterministic(seed);
-    io.random(&seed);
-    const ephemeral = try noise.KeyPair.generateDeterministic(seed);
-    var ini = noise.Initiator.init(static, ephemeral, nid.key);
-
-    var stream = try dial.connect(io, host, port);
-    defer stream.close(io);
-
-    var wbuf: [4096]u8 = undefined;
-    var rbuf: [4096]u8 = undefined;
-    var sw = stream.writer(io, &wbuf);
-    var sr = stream.reader(io, &rbuf);
-    const w = &sw.interface;
-    const r = &sr.interface;
-
-    try handshake(&ini, r, w);
+    var session: Session = .{};
+    try session.connect(io, host, port, nid);
+    defer session.deinit(io);
+    const w = session.w();
+    const r = session.r();
 
     // Real radicle uses the first non-base git stream (n=1, id 12), not the
     // base git stream (id 4); matched against an on-wire capture.
@@ -214,6 +158,55 @@ pub fn fetchProbe(
     }
     return frames;
 }
+
+/// A dialed, handshaked connection. Owns the stream and its buffers, which the
+/// reader and writer borrow, so it must outlive any use of `r`/`w`; hence
+/// `connect` taking the storage rather than returning it by value.
+const Session = struct {
+    stream: Stream = undefined,
+    wbuf: [4096]u8 = undefined,
+    rbuf: [4096]u8 = undefined,
+    sw: Stream.Writer = undefined,
+    sr: Stream.Reader = undefined,
+
+    const Stream = std.Io.net.Stream;
+
+    /// Dials `host:port` and completes the Noise_XK handshake against `nid`.
+    /// Caller closes with `deinit`.
+    fn connect(
+        self: *Session,
+        io: std.Io,
+        host: []const u8,
+        port: u16,
+        nid: node_id.NodeId,
+    ) !void {
+        var seed: [32]u8 = undefined;
+        io.random(&seed);
+        const static = try noise.KeyPair.generateDeterministic(seed);
+        io.random(&seed);
+        const ephemeral = try noise.KeyPair.generateDeterministic(seed);
+        // The responder static is the node's raw Ed25519 public key (its NID).
+        var ini = noise.Initiator.init(static, ephemeral, nid.key);
+
+        self.stream = try dial.connect(io, host, port);
+        errdefer self.stream.close(io);
+        self.sw = self.stream.writer(io, &self.wbuf);
+        self.sr = self.stream.reader(io, &self.rbuf);
+        try handshake(&ini, self.r(), self.w());
+    }
+
+    fn deinit(self: *Session, io: std.Io) void {
+        self.stream.close(io);
+    }
+
+    fn r(self: *Session) *std.Io.Reader {
+        return &self.sr.interface;
+    }
+
+    fn w(self: *Session) *std.Io.Writer {
+        return &self.sw.interface;
+    }
+};
 
 fn handshake(ini: *noise.Initiator, r: *std.Io.Reader, w: *std.Io.Writer) !void {
     var msg: [128]u8 = undefined;
