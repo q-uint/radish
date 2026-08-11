@@ -146,13 +146,36 @@ pub fn encodePingFrame(allocator: std.mem.Allocator, ping: Ping) ![]u8 {
     return wrapGossip(allocator, msg.items);
 }
 
-/// A node announcing itself: identity + advertised alias. Fields borrow the
-/// decode scratch buffer; copy them out to retain past the next frame.
+/// Max addresses in a NodeAnnouncement (radicle service/message.rs).
+pub const ADDRESS_LIMIT = 16;
+
+/// An address a node advertises for itself. `host` borrows the decode scratch
+/// buffer: 4 or 16 octets for ip, the name for dns, 32 raw bytes for onion.
+/// Source: radicle node/address.rs AddressType.
+pub const Address = struct {
+    kind: Kind,
+    host: []const u8,
+    port: u16,
+
+    pub const Kind = enum(u8) { ipv4 = 1, ipv6 = 2, dns = 3, onion = 4, i2p = 5, _ };
+};
+
+/// A node announcing itself: identity, alias, and the addresses it can be
+/// reached at. `alias`, `agent`, and each address host borrow the decode
+/// scratch buffer; copy them out to retain past the next frame.
 pub const NodeAnnounced = struct {
     node: [32]u8,
     alias: []const u8,
     agent: []const u8,
     timestamp: u64,
+    /// Inline, since the protocol caps this at ADDRESS_LIMIT: no caller-owned
+    /// buffer to thread through, unlike the unbounded inventory list.
+    addr_storage: [ADDRESS_LIMIT]Address = undefined,
+    addr_count: u8 = 0,
+
+    pub fn addresses(self: *const NodeAnnounced) []const Address {
+        return self.addr_storage[0..self.addr_count];
+    }
 };
 
 /// A node announcing which repos it holds. `inventory` is a slice of raw
@@ -274,6 +297,8 @@ pub fn readRawFrame(r: *std.Io.Reader, scratch: []u8) !RawFrame {
 
 // Announcement wrapper: node(32) ++ signature(64) ++ message. We don't verify
 // the relayed signature here (the origin node signed it, not our peer).
+/// A node announcing more addresses than ADDRESS_LIMIT keeps the overflow
+/// parsed-but-dropped: the fields after the address list still have to be read.
 fn parseNodeAnnounced(r: *codec.Reader) !NodeAnnounced {
     const node = (try r.take(32))[0..32].*;
     _ = try r.take(64); // signature
@@ -282,13 +307,30 @@ fn parseNodeAnnounced(r: *codec.Reader) !NodeAnnounced {
     const timestamp = try r.readU64();
     const alias_len = try r.readU8();
     const alias = try r.take(alias_len);
+
+    var storage: [ADDRESS_LIMIT]Address = undefined;
     const naddrs = try r.readU16();
+    var found: u8 = 0;
     var i: u16 = 0;
-    while (i < naddrs) : (i += 1) try skipAddress(r);
+    while (i < naddrs) : (i += 1) {
+        const addr = try readAddress(r) orelse continue;
+        if (found < storage.len) {
+            storage[found] = addr;
+            found += 1;
+        }
+    }
+
     _ = try r.readU64(); // nonce
     const agent_len = try r.readU8();
     const agent = try r.take(agent_len);
-    return .{ .node = node, .alias = alias, .agent = agent, .timestamp = timestamp };
+    return .{
+        .node = node,
+        .alias = alias,
+        .agent = agent,
+        .timestamp = timestamp,
+        .addr_storage = storage,
+        .addr_count = found,
+    };
 }
 
 fn parseInventoryAnnounced(r: *codec.Reader, oid_buf: [][20]u8) !InventoryAnnounced {
@@ -310,16 +352,25 @@ fn parseInventoryAnnounced(r: *codec.Reader, oid_buf: [][20]u8) !InventoryAnnoun
 
 // Address wire form (radicle-protocol wire/message.rs Address): u8 kind ++
 // host ++ u16 port. We skip past addresses we don't consume.
-fn skipAddress(r: *codec.Reader) !void {
-    const kind = try r.readU8();
-    switch (kind) {
-        1 => _ = try r.take(4), // ipv4 octets
-        2 => _ = try r.take(16), // ipv6 octets
-        3 => _ = try r.take(try r.readU8()), // dns: u8-len-prefixed string
-        4 => _ = try r.take(32), // onion v3 raw bytes
-        else => return error.UnsupportedAddress,
-    }
-    _ = try r.readU16(); // port
+/// Decodes one address. Unknown kinds are skipped rather than rejected: i2p
+/// (5) is behind a feature flag upstream and more may follow, and an address
+/// we cannot use must not cost us the rest of the announcement. Every kind is
+/// either fixed-width or length-prefixed, so an unknown one stays parseable.
+/// Source: radicle wire.rs (OnionAddrV3 raw bytes, I2pAddr as String).
+fn readAddress(r: *codec.Reader) !?Address {
+    const kind: Address.Kind = @fromBackingInt(try r.readU8());
+    const host: ?[]const u8 = switch (kind) {
+        .ipv4 => try r.take(4),
+        .ipv6 => try r.take(16),
+        .dns, .i2p => try r.take(try r.readU8()),
+        .onion => try r.take(32),
+        _ => blk: {
+            _ = try r.take(try r.readU8());
+            break :blk null;
+        },
+    };
+    const port = try r.readU16();
+    return if (host) |h| .{ .kind = kind, .host = h, .port = port } else null;
 }
 
 fn readStreamVarint(r: *std.Io.Reader) !u64 {
@@ -424,6 +475,106 @@ test "decode inventory announcement: each oid is u16-length-prefixed" {
     try testing.expectEqualSlices(u8, &oid, &inv.inventory[0]);
     try testing.expectEqual(@as(u64, 0x1122334455667788), inv.timestamp);
     try testing.expectEqualSlices(u8, &node, &inv.node);
+}
+
+// Peer discovery rides on NodeAnnouncement: the addresses field is the only
+// place the wire says where another node can be reached.
+test "decode node announcement addresses" {
+    const node: [32]u8 = @splat(0xAB);
+    const sig: [64]u8 = @splat(0xCD);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    const w = codec.Writer{ .out = &buf, .allocator = testing.allocator };
+    try w.bytes(&VERSION_STRING);
+    try w.varint(StreamId.gossip_out.value);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    const bw = codec.Writer{ .out = &body, .allocator = testing.allocator };
+    try bw.writeU16(@backingInt(MessageType.node_announcement));
+    try bw.bytes(&node);
+    try bw.bytes(&sig);
+    try bw.writeU8(1); // version
+    try bw.writeU64(0); // features
+    try bw.writeU64(0x1122334455667788); // timestamp
+    try bw.writeU8(3);
+    try bw.bytes("abc"); // alias
+    try bw.writeU16(2); // address count
+    try bw.writeU8(1); // ipv4
+    try bw.bytes(&[_]u8{ 192, 168, 0, 1 });
+    try bw.writeU16(8776);
+    try bw.writeU8(3); // dns
+    try bw.writeU8(11);
+    try bw.bytes("example.com");
+    try bw.writeU16(8777);
+    try bw.writeU64(0); // nonce
+    try bw.writeU8(5);
+    try bw.bytes("agent");
+    try w.varint(body.items.len);
+    try w.bytes(body.items);
+
+    var stream_reader = std.Io.Reader.fixed(buf.items);
+    var scratch: [1024]u8 = undefined;
+    var oids: [8][20]u8 = undefined;
+    const msg = try decodeFrameStreaming(&stream_reader, &scratch, &oids);
+    const n = msg.node_announced;
+
+    try testing.expectEqualStrings("abc", n.alias);
+    try testing.expectEqualStrings("agent", n.agent);
+    const addrs = n.addresses();
+    try testing.expectEqual(@as(usize, 2), addrs.len);
+    try testing.expectEqual(Address.Kind.ipv4, addrs[0].kind);
+    try testing.expectEqualSlices(u8, &[_]u8{ 192, 168, 0, 1 }, addrs[0].host);
+    try testing.expectEqual(@as(u16, 8776), addrs[0].port);
+    try testing.expectEqual(Address.Kind.dns, addrs[1].kind);
+    try testing.expectEqualStrings("example.com", addrs[1].host);
+    try testing.expectEqual(@as(u16, 8777), addrs[1].port);
+}
+
+// A node may advertise more than we have room for, and an address kind we do
+// not know (heartwood has i2p behind a feature flag). Neither may abort the
+// frame: the announcement's other fields are still usable.
+test "node announcement with unknown address kind is not fatal" {
+    const node: [32]u8 = @splat(0xAB);
+    const sig: [64]u8 = @splat(0xCD);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    const w = codec.Writer{ .out = &buf, .allocator = testing.allocator };
+    try w.bytes(&VERSION_STRING);
+    try w.varint(StreamId.gossip_out.value);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    const bw = codec.Writer{ .out = &body, .allocator = testing.allocator };
+    try bw.writeU16(@backingInt(MessageType.node_announcement));
+    try bw.bytes(&node);
+    try bw.bytes(&sig);
+    try bw.writeU8(1);
+    try bw.writeU64(0);
+    try bw.writeU64(7);
+    try bw.writeU8(1);
+    try bw.bytes("a");
+    try bw.writeU16(1);
+    try bw.writeU8(5); // i2p: length-prefixed, skippable without knowing it
+    try bw.writeU8(4);
+    try bw.bytes("i2pa");
+    try bw.writeU16(1234);
+    try bw.writeU64(0);
+    try bw.writeU8(1);
+    try bw.bytes("x");
+    try w.varint(body.items.len);
+    try w.bytes(body.items);
+
+    var stream_reader = std.Io.Reader.fixed(buf.items);
+    var scratch: [1024]u8 = undefined;
+    var oids: [8][20]u8 = undefined;
+    const msg = try decodeFrameStreaming(&stream_reader, &scratch, &oids);
+    const n = msg.node_announced;
+    try testing.expectEqualStrings("a", n.alias);
+    try testing.expectEqualStrings("x", n.agent);
+    try testing.expectEqual(@as(u64, 7), n.timestamp);
 }
 
 test "decode pong frame" {

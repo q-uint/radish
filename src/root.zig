@@ -5,6 +5,7 @@ pub const crypto = @import("crypto/mod.zig");
 pub const identity = @import("identity/mod.zig");
 pub const git = @import("git/mod.zig");
 pub const net = @import("net/mod.zig");
+pub const pkg = @import("pkg/mod.zig");
 
 // Common types, hoisted for convenience.
 pub const NodeId = identity.NodeId;
@@ -18,6 +19,7 @@ test {
     _ = identity;
     _ = git;
     _ = net;
+    _ = pkg;
 }
 
 test "gitpack module is importable from the toolchain" {

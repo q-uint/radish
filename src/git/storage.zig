@@ -93,6 +93,11 @@ fn parseSigrefs(gpa: std.mem.Allocator, message: []const u8) ![]sigrefs.Ref {
     return list.toOwnedSlice(gpa);
 }
 
+/// Parses a 40-hex commit id.
+pub fn parseOid(hex: []const u8) !gitpack.Oid {
+    return gitpack.Oid.parse(.sha1, hex);
+}
+
 /// A uniquely-named directory under the system temp dir, removed on `deinit`.
 /// `std.testing.tmpDir` is test-only (it asserts `is_test` and writes into
 /// .zig-cache), so checkouts on the normal path need this instead.
@@ -362,6 +367,87 @@ pub const Repository = struct {
             if (std.mem.eql(u8, bare, nid)) return true;
         }
         return false;
+    }
+
+    /// The commit a dependency resolves to. There is no single `main` in a
+    /// radicle repo, since every remote has its own namespace. The identity
+    /// document names the branch in `defaultBranch`, and delegate status says
+    /// whose copy of it counts. Delegates must agree. A disagreement is a fork
+    /// for the caller to settle, not something to resolve by readdir order.
+    pub fn canonicalHead(self: *Repository, scratch: std.mem.Allocator) !gitpack.Oid {
+        var parsed = try self.identityDoc(scratch);
+        defer parsed.deinit();
+
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        var found: ?gitpack.Oid = null;
+        for (parsed.doc.delegates) |d| {
+            const bare = if (std.mem.startsWith(u8, d, DID_KEY_PREFIX)) d[DID_KEY_PREFIX.len..] else d;
+            const ref = try std.fmt.bufPrint(&buf, "refs/namespaces/{s}/refs/heads/{s}", .{
+                bare, parsed.doc.project.default_branch,
+            });
+            const oid = self.readRef(ref, error.BranchMissing) catch continue;
+            if (found) |prev| {
+                if (!std.mem.eql(u8, prev.slice(), oid.slice())) return error.DelegatesDiverged;
+            } else found = oid;
+        }
+        return found orelse error.BranchMissing;
+    }
+
+    /// Whether `want` is a commit a delegate published, either as a signed ref
+    /// tip or somewhere in the history behind one.
+    ///
+    /// Ancestry is established by the pack rather than by walking parents,
+    /// which gitpack exposes no way to do: the clone asks for whole refs, so
+    /// the pack holds exactly the objects reachable from the tips it fetched.
+    /// A commit is in it only if some fetched tip reaches it, and every tip is
+    /// checked against a delegate's sigrefs before this returns true. A
+    /// contributor's unreferenced commit is therefore not in the pack at all.
+    ///
+    /// Requires that the caller verified the remotes first, since the argument
+    /// rests on every tip in the pack being signed.
+    pub fn revPublishedByDelegate(
+        self: *Repository,
+        scratch: std.mem.Allocator,
+        want: gitpack.Oid,
+    ) !bool {
+        if (!try self.hasObject(want)) return false;
+
+        var parsed = try self.identityDoc(scratch);
+        defer parsed.deinit();
+
+        // An exact tip match needs no further argument.
+        for (parsed.doc.delegates) |d| {
+            const bare = if (std.mem.startsWith(u8, d, DID_KEY_PREFIX)) d[DID_KEY_PREFIX.len..] else d;
+            var signed = self.verifyRemote(scratch, scratch, bare) catch continue;
+            defer signed.deinit(scratch);
+            for (signed.signed.refs.entries) |entry| {
+                const oid = gitpack.Oid.fromBytes(.sha1, &entry.oid);
+                if (std.mem.eql(u8, oid.slice(), want.slice())) return true;
+            }
+        }
+
+        // Otherwise it is an ancestor: present in a pack whose every tip a
+        // delegate signed. Confirm at least one delegate contributed tips,
+        // so an empty delegate set cannot vacuously authorize anything.
+        for (parsed.doc.delegates) |d| {
+            const bare = if (std.mem.startsWith(u8, d, DID_KEY_PREFIX)) d[DID_KEY_PREFIX.len..] else d;
+            var signed = self.verifyRemote(scratch, scratch, bare) catch continue;
+            defer signed.deinit(scratch);
+            if (signed.signed.refs.entries.len > 0) return true;
+        }
+        return false;
+    }
+
+    /// Checks `commit` out into `dest`, which must already exist.
+    pub fn checkoutTo(
+        self: *Repository,
+        scratch: std.mem.Allocator,
+        dest: std.Io.Dir,
+        commit: gitpack.Oid,
+    ) !void {
+        var diags: gitpack.Diagnostics = .{ .allocator = scratch };
+        defer diags.deinit();
+        try self.repo.checkout(self.io, dest, commit, &diags);
     }
 
     /// Verifies one remote: its sigrefs signature must check out against `nid`,

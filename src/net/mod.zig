@@ -5,6 +5,7 @@ pub const dial = @import("dial.zig");
 pub const wire = @import("wire.zig");
 pub const announce = @import("announce.zig");
 pub const fetch = @import("fetch.zig");
+pub const seeds = @import("seeds.zig");
 
 test {
     _ = codec;
@@ -13,4 +14,5 @@ test {
     _ = wire;
     _ = announce;
     _ = fetch;
+    _ = seeds;
 }

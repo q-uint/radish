@@ -86,11 +86,21 @@ pub const Repo = struct {
     }
 
     /// Signs `refs` with a key derived from `seed_byte` and files them as that
-    /// key's namespace. Returns the node id (caller frees).
+    /// key's namespace. Returns the node id (caller frees). Sorts by name
+    /// first, since sigrefs signs the canonical form: an unsorted list would
+    /// otherwise produce a signature that can never verify.
     pub fn signedRefs(self: *Repo, seed_byte: u8, refs: []const Ref) ![]u8 {
+        const sorted = try self.alloc.dupe(Ref, refs);
+        defer self.alloc.free(sorted);
+        std.mem.sort(Ref, sorted, {}, struct {
+            fn lt(_: void, a: Ref, b: Ref) bool {
+                return std.mem.order(u8, a.name, b.name) == .lt;
+            }
+        }.lt);
+
         var message: std.ArrayList(u8) = .empty;
         defer message.deinit(self.alloc);
-        for (refs) |r| {
+        for (sorted) |r| {
             try message.appendSlice(self.alloc, r.oid);
             try message.append(self.alloc, ' ');
             try message.appendSlice(self.alloc, r.name);

@@ -505,6 +505,126 @@ test "identityRoot rejects delegates that disagree on the root" {
     try testing.expectError(error.IdRootDiverged, repo.identityRootOid(alloc));
 }
 
+// A dependency has to resolve to one commit, but every remote has its own
+// namespace. The doc's defaultBranch names the branch and delegate status says
+// whose namespace to read it from, so a contributor cannot steer the result.
+test "canonicalHead reads defaultBranch from a delegate namespace" {
+    var s = try fixture.scratch(alloc);
+    defer fixture.destroy(alloc, s);
+
+    const signer = try nidForSeed(SEED_SORTS_SECOND);
+    defer alloc.free(signer);
+    const doc_bytes = try docDelegating(&.{signer});
+    defer alloc.free(doc_bytes);
+    const root = try s.repo.commit("main", "embeds/radicle.json", doc_bytes);
+    const head = try s.repo.commit("main", "f", "hi");
+
+    alloc.free(try s.repo.signedRefs(SEED_SORTS_SECOND, &.{
+        .{ .oid = root, .name = "refs/rad/root" },
+        .{ .oid = head, .name = "refs/heads/main" },
+    }));
+    try s.repo.radRoot(signer, root);
+    try s.repo.radId(root);
+    try s.repo.namespaceRef(signer, "refs/heads/main", head);
+
+    // A non-delegate publishing the same branch must not be consulted. It signs
+    // the same root and its own branch correctly, so only its lack of delegate
+    // status rules it out.
+    const decoy = try s.repo.commit("side", "f", "bye");
+    const other = try s.repo.signedRefs(SEED_SORTS_FIRST, &.{
+        .{ .oid = decoy, .name = "refs/heads/main" },
+        .{ .oid = root, .name = "refs/rad/root" },
+    });
+    defer alloc.free(other);
+    try s.repo.radRoot(other, root);
+    try s.repo.namespaceRef(other, "refs/heads/main", decoy);
+    const bare = try s.repo.finish();
+
+    var repo = try storage.Repository.open(testing.io, alloc, bare);
+    defer repo.deinit();
+
+    const got = try repo.canonicalHead(alloc);
+    const want = try gitpack.Oid.parse(.sha1, head);
+    try testing.expectEqualSlices(u8, want.slice(), got.slice());
+}
+
+test "canonicalHead rejects delegates that disagree" {
+    var s = try fixture.scratch(alloc);
+    defer fixture.destroy(alloc, s);
+
+    const a_nid = try nidForSeed(SEED_SORTS_FIRST);
+    defer alloc.free(a_nid);
+    const b_nid = try nidForSeed(SEED_SORTS_SECOND);
+    defer alloc.free(b_nid);
+    const doc_bytes = try docDelegating(&.{ a_nid, b_nid });
+    defer alloc.free(doc_bytes);
+
+    const root = try s.repo.commit("main", "embeds/radicle.json", doc_bytes);
+    const head_a = try s.repo.commit("main", "f", "hi");
+    const head_b = try s.repo.commit("side", "f", "bye");
+
+    // Both delegates sign a root and their own branch, so only the branch
+    // disagreement is left to fail on.
+    alloc.free(try s.repo.signedRefs(SEED_SORTS_FIRST, &.{
+        .{ .oid = head_a, .name = "refs/heads/main" },
+        .{ .oid = root, .name = "refs/rad/root" },
+    }));
+    alloc.free(try s.repo.signedRefs(SEED_SORTS_SECOND, &.{
+        .{ .oid = head_b, .name = "refs/heads/main" },
+        .{ .oid = root, .name = "refs/rad/root" },
+    }));
+    try s.repo.radRoot(a_nid, root);
+    try s.repo.radRoot(b_nid, root);
+    try s.repo.radId(root);
+
+    try s.repo.namespaceRef(a_nid, "refs/heads/main", head_a);
+    try s.repo.namespaceRef(b_nid, "refs/heads/main", head_b);
+    const bare = try s.repo.finish();
+
+    var repo = try storage.Repository.open(testing.io, alloc, bare);
+    defer repo.deinit();
+    try testing.expectError(error.DelegatesDiverged, repo.canonicalHead(alloc));
+}
+
+// A pinned rev is usually an ancestor of the branch head, not the tip itself.
+// The pack holds exactly what the fetched tips reach, and every tip is signed,
+// so presence in the pack is the ancestry proof.
+test "revPublishedByDelegate accepts an ancestor of a signed tip" {
+    var s = try fixture.scratch(alloc);
+    defer fixture.destroy(alloc, s);
+
+    const signer = try nidForSeed(SEED_SORTS_SECOND);
+    defer alloc.free(signer);
+    const doc_bytes = try docDelegating(&.{signer});
+    defer alloc.free(doc_bytes);
+    const root = try s.repo.commit("main", "embeds/radicle.json", doc_bytes);
+
+    const older = try s.repo.commit("main", "f", "v1");
+    const head = try s.repo.commit("main", "f", "v2");
+
+    alloc.free(try s.repo.signedRefs(SEED_SORTS_SECOND, &.{
+        .{ .oid = head, .name = "refs/heads/main" },
+        .{ .oid = root, .name = "refs/rad/root" },
+    }));
+    try s.repo.radRoot(signer, root);
+    try s.repo.radId(root);
+    try s.repo.namespaceRef(signer, "refs/heads/main", head);
+    const bare = try s.repo.finish();
+
+    var repo = try storage.Repository.open(testing.io, alloc, bare);
+    defer repo.deinit();
+
+    const tip = try gitpack.Oid.parse(.sha1, head);
+    try testing.expect(try repo.revPublishedByDelegate(alloc, tip));
+
+    const ancestor = try gitpack.Oid.parse(.sha1, older);
+    try testing.expect(try repo.revPublishedByDelegate(alloc, ancestor));
+
+    // A commit that is not in the pack at all is not reachable from any tip.
+    const absent = try gitpack.Oid.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
+    try testing.expect(!try repo.revPublishedByDelegate(alloc, absent));
+}
+
 /// The node id for a fixture seed byte, matching what `signedRefs` derives.
 fn nidForSeed(seed_byte: u8) ![]u8 {
     const seed: [32]u8 = @splat(seed_byte);
