@@ -5,7 +5,7 @@
 //! pure-Zig readers are checked against its output rather than against
 //! themselves. Nothing in this file is reachable from the shipped binary.
 //!
-//! The clone layout is not a valid git repository - it has no HEAD or config -
+//! The clone layout is not a valid git repository; it has no HEAD or config,
 //! so objects cannot be written into it directly. Everything is built in a
 //! scratch `src` repo and packed across into `bare`.
 const std = @import("std");
@@ -114,6 +114,26 @@ pub const Repo = struct {
             \\mkdir -p {s}/bare/refs/rad
             \\printf '%s\n' '{s}' > {s}/bare/refs/rad/id
         , .{ self.root, commit_oid, self.root }));
+        self.alloc.free(out);
+    }
+
+    /// Writes `refs/namespaces/<nid>/refs/rad/root` -> `commit_oid`, the
+    /// identity COB's root. Real repos publish this per remote; the RID is the
+    /// hash of the doc at that commit.
+    pub fn radRoot(self: *Repo, nid: []const u8, commit_oid: []const u8) !void {
+        try self.namespaceRef(nid, "refs/rad/root", commit_oid);
+    }
+
+    /// Writes a loose ref under `nid`'s namespace, without signing it. Lets a
+    /// test put a ref on disk that the remote's sigrefs does not cover, or
+    /// covers at a different oid.
+    pub fn namespaceRef(self: *Repo, nid: []const u8, name: []const u8, oid: []const u8) !void {
+        const out = try run(self.alloc, try std.fmt.allocPrint(self.alloc,
+            \\set -e
+            \\p="{s}/bare/refs/namespaces/{s}/{s}"
+            \\mkdir -p "$(dirname "$p")"
+            \\printf '%s\n' '{s}' > "$p"
+        , .{ self.root, nid, name, oid }));
         self.alloc.free(out);
     }
 

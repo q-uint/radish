@@ -12,6 +12,7 @@ const node_id = @import("../identity/node_id.zig");
 const protocol = @import("protocol.zig");
 const gitproto = @import("../git/protocol.zig");
 const storage = @import("../git/storage.zig");
+const repo_id = @import("../identity/rid.zig");
 const dial = @import("dial.zig");
 const gitpack = @import("gitpack");
 
@@ -206,6 +207,11 @@ pub fn clone(
     // that the objects behind those refs are really in the pack.
     var repo = try storage.Repository.open(io, allocator, into_path);
     defer repo.deinit();
+
+    // Hard failure, unlike verifyAll below: a wrong repo is never acceptable.
+    const want = try repo_id.RepoId.parse(allocator, rid);
+    try repo.checkRepoId(allocator, want);
+
     const report = try repo.verifyAll(allocator, allocator);
 
     return .{ .refs = refs.refs.len, .pack_bytes = pack.items.len, .report = report };

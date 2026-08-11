@@ -24,7 +24,11 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (args.len >= 7 and std.mem.eql(u8, args[1], "clone")) {
-        return clone(init, args[2], args[3], args[4], args[5], args[6]);
+        var require = false;
+        for (args[7..]) |a| {
+            if (std.mem.eql(u8, a, "--require-verified")) require = true;
+        }
+        return clone(init, args[2], args[3], args[4], args[5], args[6], require);
     }
 
     std.debug.print(
@@ -36,11 +40,12 @@ pub fn main(init: std.process.Init) !void {
         \\  radish subscribe   <host> <port> <node-id> [frames]     listen to gossip: nodes + inventory
         \\  radish fetch-probe <host> <port> <node-id> <rid>        open a git stream, read the v2 advert
         \\  radish clone       <host> <port> <node-id> <rid> <dir>  clone a repo into <dir> (bare)
+        \\    --require-verified                                   exit non-zero if any remote fails verification
         \\
     , .{});
 }
 
-fn clone(init: std.process.Init, host: []const u8, port_str: []const u8, nid_str: []const u8, rid_str: []const u8, dir: []const u8) !void {
+fn clone(init: std.process.Init, host: []const u8, port_str: []const u8, nid_str: []const u8, rid_str: []const u8, dir: []const u8, require_verified: bool) !void {
     const arena = init.arena.allocator();
     const port = try std.fmt.parseInt(u16, port_str, 10);
     const nid = try radish.NodeId.parse(arena, nid_str);
@@ -60,6 +65,10 @@ fn clone(init: std.process.Init, host: []const u8, port_str: []const u8, nid_str
             result.report.failed.len,
             result.report.failed.len + result.report.verified.len,
         });
+        // Verification is a report, not a filter: the refs stay on disk either
+        // way (heartwood's validate does the same). The flag only decides
+        // whether an unverified remote is worth a non-zero exit.
+        if (require_verified) return error.UnverifiedRemotes;
     }
 }
 

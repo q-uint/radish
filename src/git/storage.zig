@@ -8,6 +8,7 @@
 const std = @import("std");
 const gitpack = @import("gitpack");
 const doc = @import("../identity/doc.zig");
+const rid = @import("../identity/rid.zig");
 const sigrefs = @import("../identity/sigrefs.zig");
 const node_id = @import("../identity/node_id.zig");
 const signature = @import("../crypto/signature.zig");
@@ -15,8 +16,11 @@ const git = @import("git.zig");
 
 const DOC_PATH = "embeds/radicle.json";
 const ID_REF = "refs/rad/id";
+// Namespace-relative, as sigrefs names it.
+const ROOT_REF = "refs/rad/root";
 const MAX_DOC = 1 << 20;
 const MAX_SIGREFS = 1 << 22;
+const DID_KEY_PREFIX = "did:key:";
 
 // v2 pack index: magic, u32 version, then a 256-entry u32 fan-out table,
 // then the sorted oid table. (gitformat-pack)
@@ -31,6 +35,14 @@ pub const Error = error{
     SigrefsMissing,
     SigrefsMalformed,
     BadPackIndex,
+    MissingObject,
+    UnsignedRef,
+    MismatchedRef,
+    RepoIdMismatch,
+    IdRootMissing,
+    IdRootDiverged,
+    IdRootUnsigned,
+    IdRootUnauthorized,
 } || doc.ParseError;
 
 /// Per-remote outcome of verifying a whole repository. Remotes are trusted
@@ -182,18 +194,22 @@ pub const Repository = struct {
         self.allocator.destroy(self);
     }
 
-    /// Reads and parses the identity document from `refs/rad/id`.
+    /// Reads and parses the identity document at the signed identity root.
+    /// Nothing signs `refs/rad/id`, so authority questions must not read it.
     /// Caller owns the returned `Parsed`.
     pub fn identityDoc(self: *Repository, allocator: std.mem.Allocator) !doc.Parsed {
-        const bytes = try self.readDocBytes(allocator, allocator);
+        const root = try self.identityRootOid(allocator);
+        const bytes = self.readFileAt(allocator, allocator, root, DOC_PATH, MAX_DOC) catch
+            return error.DocMissing;
         defer allocator.free(bytes);
         return doc.parse(allocator, bytes);
     }
 
-    /// Returns the raw bytes of `refs/rad/id:embeds/radicle.json`. gitpack
-    /// exposes no blob-by-path read, so we check the commit out to a temp dir
-    /// and read the file. Caller owns the returned bytes (freed via `gpa`);
-    /// `scratch` backs the checkout diagnostics.
+    /// Raw bytes of `refs/rad/id:embeds/radicle.json`, unverified. Use
+    /// `identityDoc` when the answer has to be trustworthy. gitpack exposes no
+    /// blob-by-path read, so we check the commit out to a temp dir and read the
+    /// file. Caller owns the returned bytes (freed via `gpa`); `scratch` backs
+    /// the checkout diagnostics.
     pub fn readDocBytes(self: *Repository, gpa: std.mem.Allocator, scratch: std.mem.Allocator) ![]u8 {
         const oid = try self.readRef(ID_REF, error.IdRefMissing);
         return self.readFileAt(gpa, scratch, oid, DOC_PATH, MAX_DOC) catch error.DocMissing;
@@ -242,9 +258,118 @@ pub const Repository = struct {
         return .{ .message = message, .signed = signed };
     }
 
-    /// Verifies one remote end to end: its sigrefs signature must check out
-    /// against `nid`, and every oid it signs must actually be in the pack.
-    /// A peer can otherwise advertise refs it never sent objects for.
+    /// The RID of this repository: the git-blob hash of the identity document
+    /// at the *root* of the identity COB, not at its head. The doc is amendable
+    /// (a delegate can add payloads), so hashing `refs/rad/id` would give a
+    /// value that changes with every identity update; only the root is stable.
+    /// Source: heartwood storage/git.rs identity_root / identity_root_of.
+    pub fn repoId(self: *Repository, scratch: std.mem.Allocator) !rid.RepoId {
+        const root = try self.identityRootOid(scratch);
+        const bytes = self.readFileAt(scratch, scratch, root, DOC_PATH, MAX_DOC) catch
+            return error.DocMissing;
+        defer scratch.free(bytes);
+        return rid.RepoId.fromDoc(bytes);
+    }
+
+    /// The identity COB's root commit, read from `refs/rad/root` since the
+    /// toolchain's git exposes no commit parents to revwalk with. Only remotes
+    /// that signed the root count, and every one of them must agree: a
+    /// disagreement is a fork, not a first-match-wins race over readdir order.
+    /// Source: heartwood storage/git.rs identity_root_of.
+    pub fn identityRootOid(self: *Repository, scratch: std.mem.Allocator) !gitpack.Oid {
+        const nids = try self.remotes(scratch);
+        defer {
+            for (nids) |n| scratch.free(n);
+            scratch.free(nids);
+        }
+
+        var found: ?gitpack.Oid = null;
+        for (nids) |nid| {
+            const oid = try self.signedRoot(scratch, nid) orelse continue;
+            if (found) |prev| {
+                if (!std.mem.eql(u8, prev.slice(), oid.slice())) return error.IdRootDiverged;
+            } else found = oid;
+        }
+        return found orelse error.IdRootMissing;
+    }
+
+    /// `nid`'s `refs/rad/root`, or null when it publishes none, as contributors
+    /// do. Once the ref exists it must verify: skipping a namespace that fails
+    /// would leave its refs in the clone while another remote supplied the RID.
+    fn signedRoot(self: *Repository, scratch: std.mem.Allocator, nid: []const u8) !?gitpack.Oid {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const ref = try std.fmt.bufPrint(&buf, "refs/namespaces/{s}/{s}", .{ nid, ROOT_REF });
+        const on_disk = self.readRef(ref, error.IdRefMissing) catch return null;
+
+        // verifyRemote already requires every on-disk ref to be signed at its
+        // real oid; the explicit match below keeps this honest if that changes.
+        var signed = self.verifyRemote(scratch, scratch, nid) catch return error.IdRootUnsigned;
+        defer signed.deinit(scratch);
+        for (signed.signed.refs.entries) |entry| {
+            if (!std.mem.eql(u8, entry.name, ROOT_REF)) continue;
+            const signed_oid = gitpack.Oid.fromBytes(.sha1, &entry.oid);
+            if (!std.mem.eql(u8, signed_oid.slice(), on_disk.slice())) return error.IdRootUnsigned;
+            return on_disk;
+        }
+        return error.IdRootUnsigned;
+    }
+
+    /// Confirms this repository really is `want`. A seed is only the transport:
+    /// it can serve any internally-consistent repo, and per-remote signatures
+    /// prove nothing about *which* repo came back, so the RID is the only
+    /// binding. Establishing the RID is only half of it; a remote can sign a
+    /// root it has no authority over. Once the doc's hash matches `want` its
+    /// contents are pinned by the caller's own RID, so the delegate list inside
+    /// it can be trusted to say who was allowed to publish that root.
+    pub fn checkRepoId(self: *Repository, scratch: std.mem.Allocator, want: rid.RepoId) !void {
+        const root = try self.identityRootOid(scratch);
+        const bytes = self.readFileAt(scratch, scratch, root, DOC_PATH, MAX_DOC) catch
+            return error.DocMissing;
+        defer scratch.free(bytes);
+
+        const got = try rid.RepoId.fromDoc(bytes);
+        if (!std.mem.eql(u8, &got.oid, &want.oid)) return error.RepoIdMismatch;
+
+        var parsed = try doc.parse(scratch, bytes);
+        defer parsed.deinit();
+        if (!try self.rootSignedByDelegate(scratch, root, parsed.doc.delegates))
+            return error.IdRootUnauthorized;
+    }
+
+    /// Whether some delegate of `delegates` signed `root` in its own namespace.
+    fn rootSignedByDelegate(
+        self: *Repository,
+        scratch: std.mem.Allocator,
+        root: gitpack.Oid,
+        delegates: []const []const u8,
+    ) !bool {
+        for (delegates) |d| {
+            const bare = if (std.mem.startsWith(u8, d, DID_KEY_PREFIX)) d[DID_KEY_PREFIX.len..] else d;
+            const oid = self.signedRoot(scratch, bare) catch continue orelse continue;
+            if (std.mem.eql(u8, oid.slice(), root.slice())) return true;
+        }
+        return false;
+    }
+
+    /// Whether `nid` is a delegate in the identity document. Delegates are
+    /// stored as `did:key:z6Mk...` while namespaces on disk are bare `z6Mk...`,
+    /// so the prefix is stripped before comparing.
+    pub fn isDelegate(self: *Repository, scratch: std.mem.Allocator, nid: []const u8) !bool {
+        var parsed = try self.identityDoc(scratch);
+        defer parsed.deinit();
+        for (parsed.doc.delegates) |d| {
+            const bare = if (std.mem.startsWith(u8, d, DID_KEY_PREFIX)) d[DID_KEY_PREFIX.len..] else d;
+            if (std.mem.eql(u8, bare, nid)) return true;
+        }
+        return false;
+    }
+
+    /// Verifies one remote: its sigrefs signature must check out against `nid`,
+    /// every oid it signs must be in the pack, and every ref on disk under the
+    /// namespace must be signed at the oid it actually points to.
+    /// Non-delegates are legitimate remotes (contributors), so delegate status
+    /// is deliberately not checked here; see `isDelegate`.
+    /// Source: heartwood crates/radicle/src/storage/git.rs (Validation).
     /// Caller owns the result; call `deinit`.
     pub fn verifyRemote(
         self: *Repository,
@@ -258,7 +383,42 @@ pub const Repository = struct {
             const oid = gitpack.Oid.fromBytes(.sha1, &ref.oid);
             if (!try self.hasObject(oid)) return error.MissingObject;
         }
+        try self.checkNamespaceRefs(scratch, nid, signed.signed.refs.entries);
         return signed;
+    }
+
+    /// Walks the refs actually on disk under `nid`'s namespace and requires each
+    /// to appear in `entries` at the same oid. The signed-set direction alone
+    /// would miss a ref the peer wrote but never signed.
+    /// `refs/rad/sigrefs` is skipped: it carries the signature, so it can never
+    /// be listed inside its own signed set.
+    fn checkNamespaceRefs(
+        self: *Repository,
+        scratch: std.mem.Allocator,
+        nid: []const u8,
+        entries: []const sigrefs.Ref,
+    ) !void {
+        var prefix_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const prefix = try std.fmt.bufPrint(&prefix_buf, "refs/namespaces/{s}", .{nid});
+
+        var ns = self.dir.openDir(self.io, prefix, .{ .iterate = true }) catch return;
+        defer ns.close(self.io);
+
+        var walker = try ns.walk(scratch);
+        defer walker.deinit();
+        while (try walker.next(self.io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (std.mem.eql(u8, entry.path, sigrefs.SIGREFS_BRANCH)) continue;
+
+            var full_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const full = try std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ prefix, entry.path });
+            const on_disk = try self.readRef(full, error.SigrefsMalformed);
+
+            const signed_oid = for (entries) |ref| {
+                if (std.mem.eql(u8, ref.name, entry.path)) break gitpack.Oid.fromBytes(.sha1, &ref.oid);
+            } else return error.UnsignedRef;
+            if (!std.mem.eql(u8, on_disk.slice(), signed_oid.slice())) return error.MismatchedRef;
+        }
     }
 
     /// Verifies every remote in the repository, collecting per-remote results
