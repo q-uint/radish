@@ -63,6 +63,12 @@ pub const FILTER_SIZE_S = 1024;
 /// Max repos in an InventoryAnnouncement (radicle service/message.rs).
 pub const INVENTORY_LIMIT = 2973;
 
+/// Radicle timestamps are signed-64 milliseconds, so the largest value a node
+/// accepts is i64::MAX. Sending u64::MAX instead is rejected as an invalid
+/// timestamp and the session is dropped as "peer misbehaved".
+/// Source: radicle node/timestamp.rs Timestamp::MAX.
+pub const TIMESTAMP_MAX: u64 = std.math.maxInt(i64);
+
 /// Encodes a Subscribe frame requesting all gossip: the "match everything"
 /// filter (1 KiB of 0xff) over the full time range.
 /// Source: radicle-protocol service/message.rs Subscribe, filter.rs default().
@@ -75,7 +81,7 @@ pub fn encodeSubscribeAllFrame(allocator: std.mem.Allocator) ![]u8 {
     const all_ones: [FILTER_SIZE_S]u8 = @splat(0xff);
     try mw.bytes(&all_ones);
     try mw.writeU64(0); // since = Timestamp::MIN
-    try mw.writeU64(std.math.maxInt(u64)); // until = Timestamp::MAX
+    try mw.writeU64(TIMESTAMP_MAX); // until = Timestamp::MAX
 
     return wrapGossip(allocator, msg.items);
 }
@@ -413,7 +419,7 @@ test "encode subscribe-all frame layout" {
     const filter = try r.take(FILTER_SIZE_S);
     try testing.expect(std.mem.allEqual(u8, filter, 0xff));
     try testing.expectEqual(@as(u64, 0), try r.readU64());
-    try testing.expectEqual(std.math.maxInt(u64), try r.readU64());
+    try testing.expectEqual(TIMESTAMP_MAX, try r.readU64());
 }
 
 test "stream ids match the frame.rs table" {
