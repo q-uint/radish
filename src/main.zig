@@ -53,8 +53,17 @@ pub fn main(init: std.process.Init) !void {
         return peers(init, args[2], frames);
     }
 
-    if (args.len >= 4 and std.mem.eql(u8, args[1], "fetch-deps")) {
-        return fetchDeps(init, args[2], args[3], if (args.len >= 5) args[4] else ".rad-deps");
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "fetch-deps")) {
+        var from: ?[]const u8 = null;
+        var dir: []const u8 = ".rad-deps";
+        var i: usize = 3;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--from") and i + 1 < args.len) {
+                i += 1;
+                from = args[i];
+            } else dir = args[i];
+        }
+        return fetchDeps(init, args[2], from, dir);
     }
 
     if (args.len >= 7 and std.mem.eql(u8, args[1], "clone")) {
@@ -86,8 +95,9 @@ fn usage() void {
         \\    --frames <n>                                          gossip frames to observe (default 200)
         \\  radish peers       <host>:<port>:<node-id>              nodes seen announcing themselves
         \\    --frames <n>                                          gossip frames to observe (default 200)
-        \\  radish fetch-deps  <manifest> <host>:<port>:<node-id> [dir]
-        \\                                                          resolve `.rad` deps (default .rad-deps)
+        \\  radish fetch-deps  <manifest> [dir]                     resolve `.rad` deps (default .rad-deps)
+        \\    --from <host>:<port>:<node-id>                        fetch from this node instead of
+        \\                                                          locating a seed over gossip
         \\
     , .{});
 }
@@ -212,10 +222,11 @@ const GossipPrinter = struct {
 /// POC. See README for the limitations, the main one being that Zig cannot
 /// consume the result automatically: its dependency location is a closed union
 /// of `url` and `path`, so a `.rad` field is parsed by us and ignored by Zig.
-fn fetchDeps(init: std.process.Init, manifest_path: []const u8, from: []const u8, out_dir: []const u8) !void {
+fn fetchDeps(init: std.process.Init, manifest_path: []const u8, from: ?[]const u8, out_dir: []const u8) !void {
     const arena = init.arena.allocator();
-    const target = Target.parse(from) orelse return usage();
-    const nid = try target.nodeId(arena);
+    // Only used when the caller named a node; otherwise each dependency is
+    // located over gossip, since different repos may live on different seeds.
+    const explicit: ?Target = if (from) |f| Target.parse(f) orelse return usage() else null;
 
     const source = try std.Io.Dir.cwd().readFileAllocOptions(
         init.io,
@@ -264,9 +275,22 @@ fn fetchDeps(init: std.process.Init, manifest_path: []const u8, from: []const u8
         std.Io.Dir.cwd().deleteTree(init.io, bare) catch {};
         const rid_str = try std.fmt.allocPrint(arena, "rad:{s}", .{dep.rid});
 
-        var result = radish.net.fetch.clone(init.io, arena, target.host, target.port, nid, rid_str, bare) catch |e| {
-            std.debug.print("  clone failed: {s}\n", .{@errorName(e)});
-            return e;
+        // --from wins, then the manifest's `.node`, then discovery. A pinned
+        // node that is down is a preference we cannot honour, not an error, so
+        // it falls back rather than failing the build.
+        var result = blk: {
+            if (explicit orelse manifestNode(dep)) |pinned| {
+                if (cloneFrom(init, pinned, rid_str, bare)) |r| break :blk r else |e| {
+                    if (explicit != null) return e;
+                    std.debug.print("  {s} unreachable ({s}), locating a seed\n", .{ pinned.host, @errorName(e) });
+                    std.Io.Dir.cwd().deleteTree(init.io, bare) catch {};
+                }
+            }
+            const found = try locate(init, rid_str, 500);
+            break :blk cloneFrom(init, found, rid_str, bare) catch |e| {
+                std.debug.print("  clone failed: {s}\n", .{@errorName(e)});
+                return e;
+            };
         };
         defer result.deinit(arena);
 
@@ -331,6 +355,56 @@ fn fetchDeps(init: std.process.Init, manifest_path: []const u8, from: []const u8
     const updated = try radish.pkg.rewrite.apply(arena, source, edits.items);
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = manifest_path, .data = updated });
     std.debug.print("\nupdated {s}\n", .{manifest_path});
+}
+
+/// The dependency's pinned `.node`, or null when it names none or names one
+/// that does not parse. A malformed pin falls back to discovery rather than
+/// failing, since it is only a preference.
+fn manifestNode(dep: radish.pkg.manifest.RadDep) ?Target {
+    const spec = dep.node orelse return null;
+    return Target.parse(spec);
+}
+
+fn cloneFrom(
+    init: std.process.Init,
+    t: Target,
+    rid_str: []const u8,
+    bare: []const u8,
+) !radish.net.fetch.CloneResult {
+    const arena = init.arena.allocator();
+    const nid = try t.nodeId(arena);
+    return radish.net.fetch.clone(init.io, arena, t.host, t.port, nid, rid_str, bare);
+}
+
+/// Asks a bootstrap node who seeds `rid`, and returns the first seed that both
+/// holds it and published an address. Discovery needs an entry point of its
+/// own, so the bootstrap list is tried in order until one answers.
+fn locate(init: std.process.Init, rid_str: []const u8, frames: usize) !Target {
+    const arena = init.arena.allocator();
+    const want = try radish.RepoId.parse(arena, rid_str);
+
+    for (radish.net.seeds.BOOTSTRAP) |entry| {
+        const boot = Target.parse(entry) orelse continue;
+        const boot_nid = boot.nodeId(arena) catch continue;
+
+        var locator = radish.net.seeds.Locator.init(arena, want);
+        defer locator.deinit();
+
+        _ = radish.net.wire.subscribe(init.io, arena, boot.host, boot.port, boot_nid, frames, &locator) catch |e| {
+            std.debug.print("  {s}: {s}\n", .{ boot.host, @errorName(e) });
+            continue;
+        };
+
+        const found = locator.located() orelse {
+            std.debug.print("  {s}: no seed announced it\n", .{boot.host});
+            continue;
+        };
+        const id = try radish.NodeId.fromPublicKey(found.node).encode(arena);
+        const spec = try std.fmt.allocPrint(arena, "{s}:{s}", .{ found.addr, id });
+        std.debug.print("  found {s} at {s} (via {s})\n", .{ id, found.addr, boot.host });
+        return Target.parse(spec) orelse error.BadSeedAddress;
+    }
+    return error.NoSeedFound;
 }
 
 /// The tree hash of the directory at `path`.

@@ -23,6 +23,9 @@ pub const RadDep = struct {
     /// Expected hash of the resolved tree. Radish checks this; Zig ignores it,
     /// since it is not Zig's own `.hash` over its package format.
     rad_hash: ?[]const u8,
+    /// `host:port:node-id` to fetch from, skipping gossip discovery. Lets a
+    /// project point at a seed it runs rather than burdening the public ones.
+    node: ?[]const u8,
 };
 
 /// Parses `source` and returns its `.rad` dependencies. Caller owns the result
@@ -59,6 +62,7 @@ pub fn radDeps(gpa: std.mem.Allocator, source: [:0]const u8) ![]RadDep {
             .subdir = try optionalString(gpa, ast, dep, "subdir"),
             .rev = try optionalString(gpa, ast, dep, "rev"),
             .rad_hash = try optionalString(gpa, ast, dep, "rad_hash"),
+            .node = try optionalString(gpa, ast, dep, "node"),
         });
     }
     return out.toOwnedSlice(gpa);
@@ -86,6 +90,7 @@ fn freeDep(gpa: std.mem.Allocator, d: RadDep) void {
     if (d.subdir) |s| gpa.free(s);
     if (d.rev) |s| gpa.free(s);
     if (d.rad_hash) |s| gpa.free(s);
+    if (d.node) |s| gpa.free(s);
 }
 
 const testing = std.testing;
@@ -154,6 +159,28 @@ test "rev and rad_hash pin an exact tree" {
 
     try testing.expectEqualStrings("b8bd413c6c3adaad672f8700ba84cf0d1d3785c1", deps[0].rev.?);
     try testing.expectEqualStrings("sha256-0000", deps[0].rad_hash.?);
+}
+
+// A project can name the seed it runs, so resolving its own dependencies does
+// not fall on the public bootstrap nodes.
+test "node pins where to fetch from" {
+    const src =
+        \\.{
+        \\    .dependencies = .{
+        \\        .radish = .{
+        \\            .rad = "z4VSyUhaBGUJQrFdS7nWULf1dJdos",
+        \\            .node = "rad.0x51.dev:8776:z6Mkhh3TfBZeGW4z4uufMp7caXoBf2wcpDWDrRsELqWqmT6Y",
+        \\        },
+        \\    },
+        \\}
+    ;
+    const deps = try radDeps(testing.allocator, src);
+    defer freeDeps(testing.allocator, deps);
+
+    try testing.expectEqualStrings(
+        "rad.0x51.dev:8776:z6Mkhh3TfBZeGW4z4uufMp7caXoBf2wcpDWDrRsELqWqmT6Y",
+        deps[0].node.?,
+    );
 }
 
 test "a manifest with no dependencies yields nothing" {

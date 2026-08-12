@@ -30,8 +30,8 @@ radish seeds       <rid>                                who holds a repo; needs 
   --frames <n>                                          gossip frames to observe (default 200)
 radish peers       <host>:<port>:<node-id>              nodes seen announcing themselves, with addresses
   --frames <n>                                          gossip frames to observe (default 200)
-radish fetch-deps  <manifest> <host>:<port>:<node-id> [dir]
-                                                        resolve `.rad` dependencies (default .rad-deps)
+radish fetch-deps  <manifest> [dir]                     resolve `.rad` dependencies (default .rad-deps)
+  --from <host>:<port>:<node-id>                        fetch from this node instead of locating a seed
 ```
 
 ## Zig packages over Radicle (proof of concept)
@@ -41,8 +41,7 @@ one, checks it really is the repo that was asked for, resolves the identity
 document's `defaultBranch` from a delegate's namespace, and checks that commit
 out.
 
-Write only `.rad`; `fetch-deps` fills in the rest and rewrites the manifest in
-place, preserving comments and formatting.
+Write only `.rad`:
 
 ```
 .dependencies = .{
@@ -52,12 +51,15 @@ place, preserving comments and formatting.
 },
 ```
 
+then run:
+
 ```
-radish fetch-deps build.zig.zon rad.0x51.dev:8776:z6Mkhh3TfBZeGW4z4uufMp7caXoBf2wcpDWDrRsELqWqmT6Y
+radish fetch-deps build.zig.zon
 zig build
 ```
 
-leaves the dependency resolved and buildable:
+`fetch-deps` fills in the rest and rewrites the manifest in place, preserving
+comments and formatting, leaving the dependency resolved and buildable:
 
 ```
 .radish = .{
@@ -66,6 +68,21 @@ leaves the dependency resolved and buildable:
     .rad_hash = "radtree-1-fa8889c5...",
 },
 ```
+
+With no node named, radish asks a bootstrap seed who announces the RID and
+fetches from the first seed that also published an address. To avoid leaning on
+the public bootstrap nodes, name one in the manifest:
+
+```
+.radish = .{
+    .rad = "z4VSyUhaBGUJQrFdS7nWULf1dJdos",
+    .node = "rad.0x51.dev:8776:z6Mkhh3TfBZeGW4z4uufMp7caXoBf2wcpDWDrRsELqWqmT6Y",
+},
+```
+
+`.node` is a preference, not a requirement: if it is unreachable, radish falls
+back to discovery. `--from` overrides both and does not fall back, since naming
+a node explicitly means you want that node.
 
 Unlike a `url` dependency, the bytes are authenticated: the RID is the hash of
 the identity document, so a seed cannot serve a different repo under the same
@@ -85,10 +102,10 @@ This is a proof of concept, not a package manager. In particular:
   hashed`) because it only hashes what it fetches itself. Hence `.rad_hash`,
   which radish checks and Zig ignores. Native support would mean a `rad` variant
   of Zig's location union, which is a change to Zig itself.
-- **You must supply a node to talk to.** A RID says what, never where. Noise_XK
-  needs the node id before the first byte, and the routing table is built from
-  gossip, so a known entry point is unavoidable. `radish seeds --from` can tell
-  you who announces a RID, but that lookup is not wired into `fetch-deps`.
+- **Discovery still needs an entry point.** A RID says what, never where.
+  Noise_XK needs the node id before the first byte and the routing table is
+  built from gossip, so bootstrapping from nothing is impossible. The seeds in
+  `net/seeds.zig` are hardcoded: radish's own, then the two heartwood ships.
 - **Delegates must agree.** Without `.rev`, if delegates publish different heads
   for `defaultBranch`, resolution fails rather than picking one.
 - **No transitive dependencies** and no lockfile. A dependency whose `.rad_hash`
@@ -103,6 +120,30 @@ branch head. Ancestry comes from the pack rather than from walking parents,
 which gitpack exposes no way to do: the clone requests whole refs, so the pack
 holds exactly what the fetched tips reach, and every tip is checked against a
 delegate's sigrefs.
+
+### Radish is NOT a good network citizen...
+
+Worth being explicit, since the tool is easy to point at seeds you do not run:
+
+- **Every connection uses a throwaway identity.** `Session.connect` derives a
+  fresh key per dial, so radish appears as a new node id each time. It cannot be
+  dialed back and cannot seed anything, and each dial adds an entry to the
+  address book of the node it contacted. Those entries expire (`routingMaxAge`,
+  a week by default) so the cost is bounded, but it is still churn no real node
+  produces. Rate limits and bans also do not accumulate against a rotating
+  identity, which is evasion of the protocol's back-pressure rather than a
+  feature. A real node keeps one key, in `~/.radicle/keys`.
+- **It takes without giving.** Radish subscribes to gossip, drains what a node
+  has, and disconnects. It relays nothing, seeds nothing, and answers no
+  requests, so every byte it costs a seed is a byte the network does not get
+  back.
+- **Discovery multiplies that.** Locating a seed means a full subscribe against
+  a bootstrap node for each dependency, and the frame budget is spent whether or
+  not the RID turns up.
+
+None of this is malicious and the volumes are tiny, but it is freeloading.
+Prefer `.node` in the manifest or `--from` to point at a seed you run, and do
+not put `fetch-deps` in a loop.
 
 ## Build
 

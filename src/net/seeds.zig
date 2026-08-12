@@ -7,6 +7,18 @@ const protocol = @import("protocol.zig");
 const rid = @import("../identity/rid.zig");
 const storage = @import("../git/storage.zig");
 
+/// Where to start when the caller names no node. Discovery cannot bootstrap
+/// itself: Noise_XK needs the responder's node id before the first byte, and
+/// the routing table is only built from gossip once connected. So one entry
+/// point is unavoidable. Tried in order, so radish's own seed comes first;
+/// the rest are the ones heartwood ships.
+/// Source: radicle node/config.rs RADICLE_NODE_BOOTSTRAP_{IRIS,ROSA}.
+pub const BOOTSTRAP = [_][]const u8{
+    "rad.0x51.dev:8776:z6Mkhh3TfBZeGW4z4uufMp7caXoBf2wcpDWDrRsELqWqmT6Y", // My public node.
+    "iris.radicle.network:8776:z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7",
+    "rosa.radicle.network:8776:z6Mkmqogy2qEM2ummccUthFEaaHvyYmYBYh3dbe9W4ebScxo",
+};
+
 /// Collects the nodes whose inventory announcements include `want`. Gossip is a
 /// push stream with no "who seeds X" query, so this observes announcements as
 /// they arrive rather than asking: a node that stays quiet during the window is
@@ -56,6 +68,53 @@ pub const Peer = struct {
     node: [32]u8,
     alias: []u8,
     addrs: [][]u8,
+};
+
+/// Watches for both halves of "where can I fetch `want`": the inventory
+/// announcements naming who holds it, and the node announcements carrying an
+/// address to reach them at. A seed is only usable once both have arrived, and
+/// they arrive in no particular order, so this keeps them until they meet.
+pub const Locator = struct {
+    seeds: Collector,
+    peers: PeerCollector,
+
+    pub fn init(allocator: std.mem.Allocator, want: rid.RepoId) Locator {
+        return .{
+            .seeds = Collector.init(allocator, want),
+            .peers = PeerCollector.init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Locator) void {
+        self.seeds.deinit();
+        self.peers.deinit();
+    }
+
+    pub fn onMessage(self: *Locator, msg: protocol.Message) void {
+        self.seeds.onMessage(msg);
+        self.peers.onMessage(msg);
+    }
+
+    /// A node that announced `want` and published a dialable address, or null
+    /// while nothing has satisfied both. Nodes advertising no address are
+    /// skipped: they hold the repo but cannot be reached.
+    pub fn located(self: *const Locator) ?Located {
+        for (self.seeds.seeds()) |nid| {
+            for (self.peers.peers()) |p| {
+                if (!std.mem.eql(u8, &p.node, &nid)) continue;
+                if (p.addrs.len == 0) continue;
+                return .{ .node = nid, .addr = p.addrs[0] };
+            }
+        }
+        return null;
+    }
+};
+
+/// A seed that both holds the repo and said where to reach it.
+pub const Located = struct {
+    node: [32]u8,
+    /// `host:port`, as `formatAddress` renders it.
+    addr: []const u8,
 };
 
 /// Collects the nodes seen in NodeAnnouncements, with the addresses each
@@ -295,6 +354,66 @@ test "a node re-announcing is one peer" {
     c.onMessage(msg);
 
     try testing.expectEqual(@as(usize, 1), c.peers().len);
+}
+
+// A seed is usable only when both halves have arrived: the inventory saying
+// it holds the repo, and a node announcement saying where to reach it. They
+// arrive in either order, so neither alone is enough.
+test "locator waits for both the inventory and an address" {
+    const want = rid.RepoId.fromOid(oidOf(1));
+    var l = Locator.init(testing.allocator, want);
+    defer l.deinit();
+
+    const node: [32]u8 = @splat(0xAA);
+
+    // Address first, no inventory yet.
+    l.onMessage(announcement(node, "seed", &.{
+        .{ .kind = .dns, .host = "seed.example", .port = 8776 },
+    }));
+    try testing.expectEqual(@as(?Located, null), l.located());
+
+    l.onMessage(.{ .inventory_announced = .{
+        .node = node,
+        .inventory = &.{oidOf(1)},
+        .timestamp = 0,
+    } });
+
+    const got = l.located().?;
+    try testing.expectEqualSlices(u8, &node, &got.node);
+    try testing.expectEqualStrings("seed.example:8776", got.addr);
+}
+
+test "locator ignores a holder that published no address" {
+    const want = rid.RepoId.fromOid(oidOf(1));
+    var l = Locator.init(testing.allocator, want);
+    defer l.deinit();
+
+    const node: [32]u8 = @splat(0xAA);
+    l.onMessage(announcement(node, "unreachable", &.{}));
+    l.onMessage(.{ .inventory_announced = .{
+        .node = node,
+        .inventory = &.{oidOf(1)},
+        .timestamp = 0,
+    } });
+
+    try testing.expectEqual(@as(?Located, null), l.located());
+}
+
+test "locator ignores a reachable node that lacks the repo" {
+    const want = rid.RepoId.fromOid(oidOf(1));
+    var l = Locator.init(testing.allocator, want);
+    defer l.deinit();
+
+    l.onMessage(announcement(@splat(0xBB), "other", &.{
+        .{ .kind = .dns, .host = "other.example", .port = 8776 },
+    }));
+    l.onMessage(.{ .inventory_announced = .{
+        .node = @splat(0xBB),
+        .inventory = &.{oidOf(9)},
+        .timestamp = 0,
+    } });
+
+    try testing.expectEqual(@as(?Located, null), l.located());
 }
 
 test "node announcements are not seeds" {
