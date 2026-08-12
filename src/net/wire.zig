@@ -87,13 +87,25 @@ pub fn subscribe(
     var session: Session = .{};
     try session.connect(io, host, port, nid);
     defer session.deinit(io);
-    const w = session.w();
-    const r = session.r();
+    return subscribeOver(allocator, session.r(), session.w(), max_frames, handler);
+}
 
-    const frame = try protocol.encodeSubscribeAllFrame(allocator);
-    defer allocator.free(frame);
-    try w.writeAll(frame);
-    try w.flush();
+/// The subscribe conversation over an already-handshaked pair: send
+/// Subscribe-all, then read frames until `max_frames` or end of stream.
+/// Split from `subscribe` so it can be driven from in-memory buffers.
+pub fn subscribeOver(
+    allocator: std.mem.Allocator,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    max_frames: usize,
+    handler: anytype,
+) !usize {
+    {
+        const frame = try protocol.encodeSubscribeAllFrame(allocator);
+        defer allocator.free(frame);
+        try w.writeAll(frame);
+        try w.flush();
+    }
 
     var scratch: [protocol.MAX_FRAME_PAYLOAD]u8 = undefined;
     var oids: [protocol.INVENTORY_LIMIT][20]u8 = undefined;
@@ -125,9 +137,19 @@ pub fn fetchProbe(
     var session: Session = .{};
     try session.connect(io, host, port, nid);
     defer session.deinit(io);
-    const w = session.w();
-    const r = session.r();
+    return fetchProbeOver(allocator, session.r(), session.w(), rid, max_frames, handler);
+}
 
+/// The fetch-probe conversation over an already-handshaked pair. Split from
+/// `fetchProbe` so it can be driven from in-memory buffers.
+pub fn fetchProbeOver(
+    allocator: std.mem.Allocator,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    rid: []const u8,
+    max_frames: usize,
+    handler: anytype,
+) !usize {
     // Real radicle uses the first non-base git stream (n=1, id 12), not the
     // base git stream (id 4); matched against an on-wire capture.
     const git_stream = protocol.StreamId.git_out.nth(1);
@@ -240,4 +262,105 @@ fn readUntilPong(r: *std.Io.Reader) !u16 {
         }
     }
     return error.NoPong;
+}
+
+const testing = std.testing;
+
+/// A handler that records what it was given, for driving the loops without a
+/// socket.
+const Recorder = struct {
+    alloc: std.mem.Allocator,
+    nodes: usize = 0,
+    inventories: usize = 0,
+    git_frames: usize = 0,
+    git_bytes: usize = 0,
+    controls: usize = 0,
+
+    pub fn onMessage(self: *Recorder, msg: protocol.Message) void {
+        switch (msg) {
+            .node_announced => self.nodes += 1,
+            .inventory_announced => self.inventories += 1,
+            else => {},
+        }
+    }
+
+    pub fn onGit(self: *Recorder, data: []const u8) void {
+        self.git_frames += 1;
+        self.git_bytes += data.len;
+    }
+
+    pub fn onControl(self: *Recorder, _: protocol.ControlType, _: u64) void {
+        self.controls += 1;
+    }
+};
+
+test "subscribe sends Subscribe-all before reading" {
+    var out_buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&out_buf);
+    var r = std.Io.Reader.fixed(&.{});
+
+    var rec = Recorder{ .alloc = testing.allocator };
+    const frames = try subscribeOver(testing.allocator, &r, &w, 10, &rec);
+    try testing.expectEqual(@as(usize, 0), frames);
+
+    const want = try protocol.encodeSubscribeAllFrame(testing.allocator);
+    defer testing.allocator.free(want);
+    try testing.expectEqualSlices(u8, want, w.buffered());
+}
+
+// An empty stream is the common case against a node with nothing stored, and
+// must end the loop rather than surface as an error.
+test "subscribe stops at end of stream" {
+    var out_buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&out_buf);
+
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    for (0..3) |_| {
+        const f = try protocol.encodePingFrame(testing.allocator, .{ .ponglen = 0, .zeroes = 0 });
+        defer testing.allocator.free(f);
+        try frames.appendSlice(testing.allocator, f);
+    }
+    var r = std.Io.Reader.fixed(frames.items);
+
+    var rec = Recorder{ .alloc = testing.allocator };
+    // Asks for more than the stream holds: the short read ends it.
+    const read = try subscribeOver(testing.allocator, &r, &w, 100, &rec);
+    try testing.expectEqual(@as(usize, 3), read);
+}
+
+test "subscribe stops at max_frames with input left" {
+    var out_buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&out_buf);
+
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    for (0..5) |_| {
+        const f = try protocol.encodePingFrame(testing.allocator, .{ .ponglen = 0, .zeroes = 0 });
+        defer testing.allocator.free(f);
+        try frames.appendSlice(testing.allocator, f);
+    }
+    var r = std.Io.Reader.fixed(frames.items);
+
+    var rec = Recorder{ .alloc = testing.allocator };
+    const read = try subscribeOver(testing.allocator, &r, &w, 2, &rec);
+    try testing.expectEqual(@as(usize, 2), read);
+}
+
+test "fetch-probe opens a git stream and sends the upload-pack intro" {
+    var out_buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&out_buf);
+    var r = std.Io.Reader.fixed(&.{});
+
+    var rec = Recorder{ .alloc = testing.allocator };
+    _ = try fetchProbeOver(testing.allocator, &r, &w, "rad:z4VSyUhaBGUJQrFdS7nWULf1dJdos", 10, &rec);
+
+    const git_stream = protocol.StreamId.git_out.nth(1);
+    const open = try protocol.encodeControlFrame(testing.allocator, .open, git_stream);
+    defer testing.allocator.free(open);
+    const sent = w.buffered();
+    try testing.expect(std.mem.startsWith(u8, sent, open));
+    // The bare rid, no `rad:` prefix, is what the responder expects.
+    try testing.expect(std.mem.indexOf(u8, sent, "git-upload-pack /z4VSyUhaBGUJQrFdS7nWULf1dJdos") != null);
+    try testing.expect(std.mem.indexOf(u8, sent, "version=2") != null);
 }
