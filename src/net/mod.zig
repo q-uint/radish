@@ -6,6 +6,7 @@ pub const wire = @import("wire.zig");
 pub const announce = @import("announce.zig");
 pub const fetch = @import("fetch.zig");
 pub const seeds = @import("seeds.zig");
+pub const node = @import("node.zig");
 
 test {
     _ = codec;
@@ -15,4 +16,5 @@ test {
     _ = announce;
     _ = fetch;
     _ = seeds;
+    _ = node;
 }

@@ -45,6 +45,15 @@ pub fn main(init: std.process.Init) !void {
         return seeds(init, opts);
     }
 
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "serve")) {
+        const port = std.fmt.parseInt(u16, args[2], 10) catch return usage();
+        const sessions: usize = if (args.len >= 4)
+            std.fmt.parseInt(usize, args[3], 10) catch return usage()
+        else
+            std.math.maxInt(usize);
+        return serve(init, port, sessions);
+    }
+
     if (args.len >= 3 and std.mem.eql(u8, args[1], "peers")) {
         var frames: usize = 200;
         if (args.len >= 5 and std.mem.eql(u8, args[3], "--frames")) {
@@ -355,6 +364,44 @@ fn fetchDeps(init: std.process.Init, manifest_path: []const u8, from: ?[]const u
     const updated = try radish.pkg.rewrite.apply(arena, source, edits.items);
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = manifest_path, .data = updated });
     std.debug.print("\nupdated {s}\n", .{manifest_path});
+}
+
+const ServePrinter = struct {
+    sessions: usize = 0,
+
+    pub fn onSession(self: *ServePrinter, stats: radish.net.node.SessionStats) void {
+        self.sessions += 1;
+        std.debug.print("session: {d} frames, {d} pings, {d} subscribes, {d} announcements\n", .{
+            stats.frames, stats.pings, stats.subscribes, stats.announcements,
+        });
+    }
+
+    pub fn onSessionFailed(_: *ServePrinter, err: anyerror) void {
+        std.debug.print("session failed: {s}\n", .{@errorName(err)});
+    }
+};
+
+/// Answers inbound connections. The identity is generated per run, so peers
+/// cannot find this node again across restarts; a stored key is the next piece
+/// of work.
+fn serve(init: std.process.Init, port: u16, sessions: usize) !void {
+    const arena = init.arena.allocator();
+
+    // randomSecure rather than random: this seeds a node identity, and
+    // `random` falls back to a weaker source on entropy failure instead of
+    // reporting it.
+    var seed: [32]u8 = undefined;
+    try init.io.randomSecure(&seed);
+    const key = try radish.SecretKey.fromSeed(seed);
+    const nid = try key.nodeId().encode(arena);
+
+    var printer = ServePrinter{};
+    std.debug.print("listening on 0.0.0.0:{d} as {s}\n", .{ port, nid });
+    const served = radish.net.node.listen(init.io, arena, port, seed, "radish", sessions, &printer) catch |e| {
+        std.debug.print("serve failed: {s}\n", .{@errorName(e)});
+        return e;
+    };
+    std.debug.print("\nserved {d} sessions\n", .{served});
 }
 
 /// The dependency's pinned `.node`, or null when it names none or names one

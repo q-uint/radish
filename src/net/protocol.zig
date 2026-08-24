@@ -57,6 +57,17 @@ pub const StreamId = struct {
 pub const Ping = struct { ponglen: u16 = 0, zeroes: u16 = 0 };
 pub const Pong = struct { zeroes: u16 };
 
+/// Largest message body a node will encode: the u16 size the transport allows,
+/// less the type id that shares it.
+/// Source: radicle-protocol wire/message.rs Message::MAX_SIZE.
+pub const MAX_MESSAGE_SIZE: u16 = std.math.maxInt(u16) - @sizeOf(u16);
+
+/// Max zero bytes a Pong may carry: the body, less the u16 length prefix the
+/// zeroes themselves need. Note this is below u16::MAX, so a peer can ask for
+/// a Pong that will not fit.
+/// Source: radicle-protocol service/message.rs Ping::MAX_PONG_ZEROES.
+pub const MAX_PONG_ZEROES: u16 = MAX_MESSAGE_SIZE - @sizeOf(u16);
+
 /// Smallest gossip bloom-filter (radicle service/filter.rs FILTER_SIZE_S).
 pub const FILTER_SIZE_S = 1024;
 
@@ -148,6 +159,19 @@ pub fn encodePingFrame(allocator: std.mem.Allocator, ping: Ping) ![]u8 {
     try mw.writeU16(ping.zeroes);
     var i: u16 = 0;
     while (i < ping.zeroes) : (i += 1) try mw.writeU8(0);
+
+    return wrapGossip(allocator, msg.items);
+}
+
+/// Encodes a gossip `Pong` as a full frame. Caller owns the result.
+pub fn encodePongFrame(allocator: std.mem.Allocator, zeroes: u16) ![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(allocator);
+    const mw = codec.Writer{ .out = &msg, .allocator = allocator };
+    try mw.writeU16(@backingInt(MessageType.pong));
+    try mw.writeU16(zeroes);
+    var i: u16 = 0;
+    while (i < zeroes) : (i += 1) try mw.writeU8(0);
 
     return wrapGossip(allocator, msg.items);
 }

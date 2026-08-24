@@ -160,6 +160,13 @@ pub const Transport = struct {
     }
 };
 
+/// Noise_XK message sizes on the wire. A reader has to know these up front:
+/// the messages are not length-prefixed, so reading the wrong count blocks
+/// forever waiting for bytes the peer will never send.
+pub const MSG1_LEN = 32; // e, es: ephemeral key + empty payload
+pub const MSG2_LEN = 32; // e, ee: ephemeral key + empty payload
+pub const MSG3_LEN = 48; // s, se: static key (32) + tag (16) + empty payload
+
 /// An Ed25519 key pair for the Edwards25519 DH. `secret_key` is the 32-byte
 /// seed; `public_key` is the compressed Edwards point (the NID bytes).
 pub const KeyPair = struct {
@@ -316,15 +323,15 @@ test "XK handshake: initiator and responder agree, transport works" {
     var buf: [128]u8 = undefined;
 
     const n1 = ini.writeMsg1(&buf);
-    try testing.expectEqual(@as(usize, 32), n1); // e + empty payload
+    try testing.expectEqual(MSG1_LEN, n1); // e + empty payload
     try res.readMsg1(buf[0..n1]);
 
     const n2 = res.writeMsg2(&buf);
-    try testing.expectEqual(@as(usize, 32), n2);
+    try testing.expectEqual(MSG2_LEN, n2);
     try ini.readMsg2(buf[0..n2]);
 
     const n3 = ini.writeMsg3(&buf);
-    try testing.expectEqual(@as(usize, 48), n3); // s(32+16 tag) + empty payload
+    try testing.expectEqual(MSG3_LEN, n3); // s(32+16 tag) + empty payload
     const recovered_is = try res.readMsg3(buf[0..n3]);
     try testing.expectEqualSlices(u8, &i_s.public_key, &recovered_is);
 

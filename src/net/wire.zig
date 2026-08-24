@@ -236,7 +236,7 @@ fn handshake(ini: *noise.Initiator, r: *std.Io.Reader, w: *std.Io.Writer) !void 
     try w.writeAll(msg[0..n1]);
     try w.flush();
 
-    const m2 = try r.takeArray(32); // e + empty payload
+    const m2 = try r.takeArray(noise.MSG2_LEN);
     try ini.readMsg2(m2);
 
     const n3 = ini.writeMsg3(&msg);
