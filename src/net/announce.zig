@@ -7,7 +7,7 @@
 //! Source: radicle-protocol service/message.rs (NodeAnnouncement, Announcement),
 //! wire.rs (Encode for &str/slice), node.rs (MAX_ALIAS_LENGTH).
 const std = @import("std");
-const codec = @import("codec.zig");
+const codec = @import("../codec.zig");
 const signature = @import("../crypto/signature.zig");
 const node_id = @import("../identity/node_id.zig");
 const protocol = @import("protocol.zig");

@@ -3,7 +3,7 @@
 //! A message is: type_id(u16) ++ body.
 //! Source: radicle-protocol/src/wire/{frame,message}.rs, service/message.rs.
 const std = @import("std");
-const codec = @import("codec.zig");
+const codec = @import("../codec.zig");
 
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const VERSION_STRING = [4]u8{ 'r', 'a', 'd', PROTOCOL_VERSION };
