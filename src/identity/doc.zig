@@ -194,7 +194,7 @@ test "repoId round trips through rad: string" {
     const repo = try HEARTWOOD_DOC.repoId(testing.allocator);
     const s = try repo.encode(testing.allocator);
     defer testing.allocator.free(s);
-    const back = try rid.RepoId.parse(testing.allocator, s);
+    const back = try rid.RepoId.parse(s);
     try testing.expectEqualSlices(u8, &repo.oid, &back.oid);
 }
 

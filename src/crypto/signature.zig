@@ -27,10 +27,16 @@ pub const Signature = struct {
         return out;
     }
 
-    pub fn parse(allocator: std.mem.Allocator, s: []const u8) Error!Signature {
+    const max_encoded = base58.encodedLenMax(SIG_LEN);
+
+    pub fn parse(s: []const u8) Error!Signature {
         if (s.len == 0 or s[0] != MULTIBASE_BTC) return error.InvalidMultibase;
-        const decoded = try base58.decode(allocator, s[1..]);
-        defer allocator.free(decoded);
+        if (s.len - 1 > max_encoded) return error.InvalidLength;
+
+        // An all-'1' input maps every character to a zero byte, so that, not
+        // the base58 ratio, is the worst case this has to hold.
+        var buf: [max_encoded + 1]u8 = undefined;
+        const decoded = try base58.decodeBuf(&buf, s[1..]);
         if (decoded.len != SIG_LEN) return error.InvalidLength;
         var sig: Signature = undefined;
         @memcpy(&sig.bytes, decoded);
@@ -107,6 +113,6 @@ test "signature string round trips" {
     defer testing.allocator.free(s);
     try testing.expect(s[0] == 'z');
 
-    const back = try Signature.parse(testing.allocator, s);
+    const back = try Signature.parse(s);
     try testing.expectEqualSlices(u8, &sig.bytes, &back.bytes);
 }

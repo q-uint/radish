@@ -113,7 +113,7 @@ fn usage() void {
 
 fn clone(init: std.process.Init, t: Target, rid_str: []const u8, dir: []const u8, require_verified: bool) !void {
     const arena = init.arena.allocator();
-    const nid = try t.nodeId(arena);
+    const nid = try t.nodeId();
 
     std.debug.print("cloning {s} from {s} into {s}...\n", .{ rid_str, t.nid, dir });
     var result = radish.net.fetch.clone(init.io, arena, t.host, t.port, nid, rid_str, dir) catch |e| {
@@ -154,7 +154,7 @@ const FetchProbePrinter = struct {
 
 fn fetchProbe(init: std.process.Init, t: Target, rid_str: []const u8) !void {
     const arena = init.arena.allocator();
-    const nid = try t.nodeId(arena);
+    const nid = try t.nodeId();
 
     var printer = FetchProbePrinter{};
     std.debug.print("fetch-probe {s} from {s}...\n", .{ rid_str, t.nid });
@@ -170,7 +170,7 @@ fn fetchProbe(init: std.process.Init, t: Target, rid_str: []const u8) !void {
 
 fn ping(init: std.process.Init, t: Target) !void {
     const arena = init.arena.allocator();
-    const nid = try t.nodeId(arena);
+    const nid = try t.nodeId();
 
     const zeroes = radish.net.wire.ping(init.io, arena, t.host, t.port, nid, 8) catch |e| {
         std.debug.print("ping failed: {s}\n", .{@errorName(e)});
@@ -181,7 +181,7 @@ fn ping(init: std.process.Init, t: Target) !void {
 
 fn announce(init: std.process.Init, t: Target, alias: []const u8) !void {
     const arena = init.arena.allocator();
-    const nid = try t.nodeId(arena);
+    const nid = try t.nodeId();
 
     var seed: [32]u8 = undefined;
     init.io.random(&seed);
@@ -419,7 +419,7 @@ fn cloneFrom(
     bare: []const u8,
 ) !radish.net.fetch.CloneResult {
     const arena = init.arena.allocator();
-    const nid = try t.nodeId(arena);
+    const nid = try t.nodeId();
     return radish.net.fetch.clone(init.io, arena, t.host, t.port, nid, rid_str, bare);
 }
 
@@ -428,16 +428,16 @@ fn cloneFrom(
 /// own, so the bootstrap list is tried in order until one answers.
 fn locate(init: std.process.Init, rid_str: []const u8, frames: usize) !Target {
     const arena = init.arena.allocator();
-    const want = try radish.RepoId.parse(arena, rid_str);
+    const want = try radish.RepoId.parse(rid_str);
 
     for (radish.net.seeds.BOOTSTRAP) |entry| {
         const boot = Target.parse(entry) orelse continue;
-        const boot_nid = boot.nodeId(arena) catch continue;
+        const boot_nid = boot.nodeId() catch continue;
 
         var locator = radish.net.seeds.Locator.init(arena, want);
         defer locator.deinit();
 
-        _ = radish.net.wire.subscribe(init.io, arena, boot.host, boot.port, boot_nid, frames, &locator) catch |e| {
+        _ = radish.net.wire.subscribe(init.io, boot.host, boot.port, boot_nid, frames, &locator) catch |e| {
             std.debug.print("  {s}: {s}\n", .{ boot.host, @errorName(e) });
             continue;
         };
@@ -489,8 +489,8 @@ const Target = struct {
     }
 
     /// The parsed node id, which every command needs before dialing.
-    fn nodeId(self: Target, arena: std.mem.Allocator) !radish.NodeId {
-        return radish.NodeId.parse(arena, self.nid);
+    fn nodeId(self: Target) !radish.NodeId {
+        return radish.NodeId.parse(self.nid);
     }
 };
 
@@ -499,13 +499,13 @@ const Target = struct {
 fn peers(init: std.process.Init, from: []const u8, frames: usize) !void {
     const arena = init.arena.allocator();
     const target = Target.parse(from) orelse return usage();
-    const nid = try target.nodeId(arena);
+    const nid = try target.nodeId();
 
     var collector = radish.net.seeds.PeerCollector.init(arena);
     defer collector.deinit();
 
     std.debug.print("watching {s} for peers (up to {d} frames)...\n", .{ target.host, frames });
-    const read = radish.net.wire.subscribe(init.io, arena, target.host, target.port, nid, frames, &collector) catch |e| {
+    const read = radish.net.wire.subscribe(init.io, target.host, target.port, nid, frames, &collector) catch |e| {
         std.debug.print("subscribe failed: {s}\n", .{@errorName(e)});
         return e;
     };
@@ -545,14 +545,14 @@ fn seeds(init: std.process.Init, opts: SeedsOpts) !void {
     if (opts.dir != null) std.debug.print("\n", .{});
 
     const target = Target.parse(from) orelse return usage();
-    const nid = try target.nodeId(arena);
-    const want = try radish.RepoId.parse(arena, opts.rid);
+    const nid = try target.nodeId();
+    const want = try radish.RepoId.parse(opts.rid);
 
     var collector = radish.net.seeds.Collector.init(arena, want);
     defer collector.deinit();
 
     std.debug.print("watching {s} for seeds of {s} (up to {d} frames)...\n", .{ target.host, opts.rid, opts.frames });
-    const read = radish.net.wire.subscribe(init.io, arena, target.host, target.port, nid, opts.frames, &collector) catch |e| {
+    const read = radish.net.wire.subscribe(init.io, target.host, target.port, nid, opts.frames, &collector) catch |e| {
         std.debug.print("subscribe failed: {s}\n", .{@errorName(e)});
         return e;
     };
@@ -569,11 +569,11 @@ fn seeds(init: std.process.Init, opts: SeedsOpts) !void {
 
 fn subscribe(init: std.process.Init, t: Target, max: usize) !void {
     const arena = init.arena.allocator();
-    const nid = try t.nodeId(arena);
+    const nid = try t.nodeId();
 
     var printer = GossipPrinter{ .arena = arena };
     std.debug.print("subscribing to {s} (up to {d} frames)...\n", .{ t.nid, max });
-    const frames = radish.net.wire.subscribe(init.io, arena, t.host, t.port, nid, max, &printer) catch |e| {
+    const frames = radish.net.wire.subscribe(init.io, t.host, t.port, nid, max, &printer) catch |e| {
         std.debug.print("subscribe failed: {s}\n", .{@errorName(e)});
         return e;
     };

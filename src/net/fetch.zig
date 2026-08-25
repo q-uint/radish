@@ -209,7 +209,7 @@ pub fn clone(
     defer repo.deinit();
 
     // Hard failure, unlike verifyAll below: a wrong repo is never acceptable.
-    const want = try repo_id.RepoId.parse(allocator, rid);
+    const want = try repo_id.RepoId.parse(rid);
     try repo.checkRepoId(allocator, want);
 
     const report = try repo.verifyAll(allocator, allocator);

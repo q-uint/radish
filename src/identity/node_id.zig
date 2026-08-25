@@ -24,13 +24,22 @@ pub const NodeId = struct {
         return .{ .key = key };
     }
 
-    /// Parses a `z6Mk...` human-encoding into a NodeId.
-    pub fn parse(allocator: std.mem.Allocator, s: []const u8) Error!NodeId {
-        if (s.len == 0 or s[0] != MULTIBASE_BTC) return error.InvalidMultibase;
-        const decoded = try base58.decode(allocator, s[1..]);
-        defer allocator.free(decoded);
+    /// Longest `z6Mk...` string that can hold a valid NodeId, and the buffer a
+    /// decode of one needs. Both are comptime, so parsing needs no allocator.
+    const payload_len = MULTICODEC_ED25519.len + KEY_LEN;
+    const max_encoded = base58.encodedLenMax(payload_len);
 
-        if (decoded.len != MULTICODEC_ED25519.len + KEY_LEN) return error.InvalidLength;
+    /// Parses a `z6Mk...` human-encoding into a NodeId.
+    pub fn parse(s: []const u8) Error!NodeId {
+        if (s.len == 0 or s[0] != MULTIBASE_BTC) return error.InvalidMultibase;
+        if (s.len - 1 > max_encoded) return error.InvalidLength;
+
+        // An all-'1' input maps every character to a zero byte, so that, not
+        // the base58 ratio, is the worst case this has to hold.
+        var buf: [max_encoded + 1]u8 = undefined;
+        const decoded = try base58.decodeBuf(&buf, s[1..]);
+
+        if (decoded.len != payload_len) return error.InvalidLength;
         if (!std.mem.eql(u8, decoded[0..2], &MULTICODEC_ED25519)) return error.InvalidMulticodec;
 
         var nid: NodeId = undefined;
@@ -73,7 +82,7 @@ test "round trip" {
     const s = try nid.encode(testing.allocator);
     defer testing.allocator.free(s);
 
-    const back = try NodeId.parse(testing.allocator, s);
+    const back = try NodeId.parse(s);
     try testing.expectEqualSlices(u8, &key, &back.key);
 }
 
@@ -86,7 +95,7 @@ test "heartwood vectors decode" {
         "z6MknGc3ocHs3zdPiJbnaaqDi58NGb4pk1Sp9WxWufuXSdxf",
     };
     for (vectors) |v| {
-        _ = try NodeId.parse(testing.allocator, v);
+        _ = try NodeId.parse(v);
     }
 }
 
@@ -94,12 +103,21 @@ test "heartwood encode-decode round trip" {
     // Source: heartwood did.rs test_did_encode_decode: decode then re-encode
     // must reproduce the input string exactly.
     const input = "z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
-    const nid = try NodeId.parse(testing.allocator, input);
+    const nid = try NodeId.parse(input);
     const s = try nid.encode(testing.allocator);
     defer testing.allocator.free(s);
     try testing.expectEqualStrings(input, s);
 }
 
 test "parse rejects bad multibase" {
-    try testing.expectError(error.InvalidMultibase, NodeId.parse(testing.allocator, "x6Mk"));
+    try testing.expectError(error.InvalidMultibase, NodeId.parse("x6Mk"));
+}
+
+// Leading '1's decode 1:1 to zero bytes, so this is the longest decoding a
+// valid-length input can produce. It must be rejected as the wrong length, not
+// as a buffer that would not fit.
+test "parse rejects an all-ones string of legal length" {
+    var ones: [1 + NodeId.max_encoded]u8 = @splat('1');
+    ones[0] = MULTIBASE_BTC;
+    try testing.expectError(error.InvalidLength, NodeId.parse(&ones));
 }

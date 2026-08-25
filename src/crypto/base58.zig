@@ -9,18 +9,44 @@ var decode_map: [256]i16 = blk: {
     break :blk m;
 };
 
-pub const Error = error{ InvalidCharacter, OutOfMemory };
+pub const Error = error{ InvalidCharacter, NoSpaceLeft, OutOfMemory };
 
-/// Encodes `input` into a freshly allocated base58 string. Caller owns the result.
-pub fn encode(allocator: std.mem.Allocator, input: []const u8) Error![]u8 {
-    // Count leading zero bytes; each maps to a leading '1'.
+/// Upper bound on the encoding of `n` bytes: log(256)/log(58) ~= 1.365.
+/// Source: bitcoin base58.cpp.
+pub fn encodedLenMax(n: usize) usize {
+    return n * 138 / 100 + 1;
+}
+
+/// Upper bound on the decoding of `n` characters: log(58)/log(256) ~= 0.733.
+pub fn decodedLenMax(n: usize) usize {
+    return n * 733 / 1000 + 1;
+}
+
+/// Working bytes `encodeBuf` needs. Leading zero bytes map 1:1 to '1', so they
+/// skip the expansion factor rather than being multiplied by it.
+fn encodeSize(input: []const u8) usize {
+    var zeros: usize = 0;
+    while (zeros < input.len and input[zeros] == 0) zeros += 1;
+    return zeros + encodedLenMax(input.len - zeros);
+}
+
+/// Working bytes `decodeBuf` needs. Leading '1's map 1:1 to zero bytes, so they
+/// enter at full weight rather than shrinking by the ratio.
+fn decodeSize(input: []const u8) usize {
+    var zeros: usize = 0;
+    while (zeros < input.len and input[zeros] == ALPHABET[0]) zeros += 1;
+    return zeros + decodedLenMax(input.len - zeros);
+}
+
+/// Encodes into `out`, returning the used prefix. The base conversion runs in
+/// `out` itself, so this needs no scratch buffer.
+pub fn encodeBuf(out: []u8, input: []const u8) Error![]u8 {
     var zeros: usize = 0;
     while (zeros < input.len and input[zeros] == 0) zeros += 1;
 
-    // Upper bound: log(256)/log(58) ~= 1.365.
-    const size = zeros + (input.len - zeros) * 138 / 100 + 1;
-    var buf = try allocator.alloc(u8, size);
-    defer allocator.free(buf);
+    const size = encodeSize(input);
+    if (out.len < size) return error.NoSpaceLeft;
+    const buf = out[0..size];
     @memset(buf, 0);
 
     for (input[zeros..]) |b| {
@@ -34,24 +60,24 @@ pub fn encode(allocator: std.mem.Allocator, input: []const u8) Error![]u8 {
         }
     }
 
-    // Skip leading zeros in the base58 buffer.
     var it = zeros;
     while (it < size and buf[it] == 0) it += 1;
 
-    var out = try allocator.alloc(u8, zeros + (size - it));
-    @memset(out[0..zeros], ALPHABET[0]);
-    for (buf[it..], zeros..) |v, k| out[k] = ALPHABET[v];
-    return out;
+    // Shift the digits down over the unused slots, mapping as we go. `it` is
+    // never below `zeros`, so a write never lands on a byte still to be read.
+    for (0..size - it) |k| buf[zeros + k] = ALPHABET[buf[it + k]];
+    @memset(buf[0..zeros], ALPHABET[0]);
+    return out[0 .. zeros + (size - it)];
 }
 
-/// Decodes a base58 string into freshly allocated bytes. Caller owns the result.
-pub fn decode(allocator: std.mem.Allocator, input: []const u8) Error![]u8 {
+/// Decodes into `out`, returning the used prefix.
+pub fn decodeBuf(out: []u8, input: []const u8) Error![]u8 {
     var zeros: usize = 0;
     while (zeros < input.len and input[zeros] == ALPHABET[0]) zeros += 1;
 
-    const size = zeros + (input.len - zeros) * 733 / 1000 + 1;
-    var buf = try allocator.alloc(u8, size);
-    defer allocator.free(buf);
+    const size = decodeSize(input);
+    if (out.len < size) return error.NoSpaceLeft;
+    const buf = out[0..size];
     @memset(buf, 0);
 
     for (input[zeros..]) |c| {
@@ -70,10 +96,24 @@ pub fn decode(allocator: std.mem.Allocator, input: []const u8) Error![]u8 {
     var it = zeros;
     while (it < size and buf[it] == 0) it += 1;
 
-    var out = try allocator.alloc(u8, zeros + (size - it));
-    @memset(out[0..zeros], 0);
-    @memcpy(out[zeros..], buf[it..]);
-    return out;
+    std.mem.copyForwards(u8, buf[zeros .. zeros + (size - it)], buf[it..size]);
+    @memset(buf[0..zeros], 0);
+    return out[0 .. zeros + (size - it)];
+}
+
+/// Encodes into fresh memory. Caller owns the result. For a bounded input,
+/// prefer `encodeBuf` with a stack buffer.
+pub fn encode(allocator: std.mem.Allocator, input: []const u8) Error![]u8 {
+    const buf = try allocator.alloc(u8, encodeSize(input));
+    errdefer allocator.free(buf);
+    return allocator.realloc(buf, (try encodeBuf(buf, input)).len);
+}
+
+/// Decodes into fresh memory. Caller owns the result.
+pub fn decode(allocator: std.mem.Allocator, input: []const u8) Error![]u8 {
+    const buf = try allocator.alloc(u8, decodeSize(input));
+    errdefer allocator.free(buf);
+    return allocator.realloc(buf, (try decodeBuf(buf, input)).len);
 }
 
 const testing = std.testing;

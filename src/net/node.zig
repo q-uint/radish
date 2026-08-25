@@ -165,8 +165,7 @@ fn greet(
     // No inventory announcement yet: we hold nothing to announce, and an empty
     // one would claim we serve nothing rather than say nothing.
 
-    const sub = try protocol.encodeSubscribeAllFrame(allocator);
-    defer allocator.free(sub);
+    const sub = &protocol.subscribe_all_frame;
     try w.writeAll(sub);
     try w.flush();
 }
@@ -261,8 +260,7 @@ test "counts a peer's subscribe and announcements" {
 
     var input: std.ArrayList(u8) = .empty;
     defer input.deinit(testing.allocator);
-    const sub = try protocol.encodeSubscribeAllFrame(testing.allocator);
-    defer testing.allocator.free(sub);
+    const sub = &protocol.subscribe_all_frame;
     try input.appendSlice(testing.allocator, sub);
 
     var r = std.Io.Reader.fixed(input.items);

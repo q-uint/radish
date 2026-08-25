@@ -298,7 +298,7 @@ test "checkRepoId rejects a doc that hashes to a different RID" {
     var repo = try storage.Repository.open(testing.io, alloc, bare);
     defer repo.deinit();
 
-    const wrong = try rid.RepoId.parse(alloc, "rad:z3WukSjzicL8WaZHFALbBwb2r8W52");
+    const wrong = try rid.RepoId.parse("rad:z3WukSjzicL8WaZHFALbBwb2r8W52");
     try testing.expectError(error.RepoIdMismatch, repo.checkRepoId(alloc, wrong));
 }
 

@@ -252,7 +252,7 @@ pub const Repository = struct {
         defer scratch.free(raw);
         if (raw.len != 64) return error.SigrefsMalformed;
 
-        const id = node_id.NodeId.parse(scratch, nid) catch return error.SigrefsMalformed;
+        const id = node_id.NodeId.parse(nid) catch return error.SigrefsMalformed;
         var sig: signature.Signature = undefined;
         @memcpy(&sig.bytes, raw);
 

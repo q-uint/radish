@@ -77,7 +77,6 @@ pub fn sendAnnouncement(
 /// of frames read.
 pub fn subscribe(
     io: std.Io,
-    allocator: std.mem.Allocator,
     host: []const u8,
     port: u16,
     nid: node_id.NodeId,
@@ -87,22 +86,20 @@ pub fn subscribe(
     var session: Session = .{};
     try session.connect(io, host, port, nid);
     defer session.deinit(io);
-    return subscribeOver(allocator, session.r(), session.w(), max_frames, handler);
+    return subscribeOver(session.r(), session.w(), max_frames, handler);
 }
 
 /// The subscribe conversation over an already-handshaked pair: send
 /// Subscribe-all, then read frames until `max_frames` or end of stream.
 /// Split from `subscribe` so it can be driven from in-memory buffers.
 pub fn subscribeOver(
-    allocator: std.mem.Allocator,
     r: *std.Io.Reader,
     w: *std.Io.Writer,
     max_frames: usize,
     handler: anytype,
 ) !usize {
     {
-        const frame = try protocol.encodeSubscribeAllFrame(allocator);
-        defer allocator.free(frame);
+        const frame = &protocol.subscribe_all_frame;
         try w.writeAll(frame);
         try w.flush();
     }
@@ -300,11 +297,10 @@ test "subscribe sends Subscribe-all before reading" {
     var r = std.Io.Reader.fixed(&.{});
 
     var rec = Recorder{ .alloc = testing.allocator };
-    const frames = try subscribeOver(testing.allocator, &r, &w, 10, &rec);
+    const frames = try subscribeOver(&r, &w, 10, &rec);
     try testing.expectEqual(@as(usize, 0), frames);
 
-    const want = try protocol.encodeSubscribeAllFrame(testing.allocator);
-    defer testing.allocator.free(want);
+    const want = &protocol.subscribe_all_frame;
     try testing.expectEqualSlices(u8, want, w.buffered());
 }
 
@@ -325,7 +321,7 @@ test "subscribe stops at end of stream" {
 
     var rec = Recorder{ .alloc = testing.allocator };
     // Asks for more than the stream holds: the short read ends it.
-    const read = try subscribeOver(testing.allocator, &r, &w, 100, &rec);
+    const read = try subscribeOver(&r, &w, 100, &rec);
     try testing.expectEqual(@as(usize, 3), read);
 }
 
@@ -343,7 +339,7 @@ test "subscribe stops at max_frames with input left" {
     var r = std.Io.Reader.fixed(frames.items);
 
     var rec = Recorder{ .alloc = testing.allocator };
-    const read = try subscribeOver(testing.allocator, &r, &w, 2, &rec);
+    const read = try subscribeOver(&r, &w, 2, &rec);
     try testing.expectEqual(@as(usize, 2), read);
 }
 

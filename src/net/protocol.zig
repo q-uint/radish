@@ -80,22 +80,28 @@ pub const INVENTORY_LIMIT = 2973;
 /// Source: radicle node/timestamp.rs Timestamp::MAX.
 pub const TIMESTAMP_MAX: u64 = std.math.maxInt(i64);
 
-/// Encodes a Subscribe frame requesting all gossip: the "match everything"
-/// filter (1 KiB of 0xff) over the full time range.
+/// A Subscribe frame requesting all gossip: the "match everything" filter
+/// (1 KiB of 0xff) over the full time range. It depends on nothing at runtime,
+/// so it is built once at compile time rather than allocated per call.
 /// Source: radicle-protocol service/message.rs Subscribe, filter.rs default().
-pub fn encodeSubscribeAllFrame(allocator: std.mem.Allocator) ![]u8 {
-    var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(allocator);
-    const mw = codec.Writer{ .out = &msg, .allocator = allocator };
-    try mw.writeU16(@backingInt(MessageType.subscribe));
-    try mw.writeU16(FILTER_SIZE_S); // filter: u16-len-prefixed bytes
-    const all_ones: [FILTER_SIZE_S]u8 = @splat(0xff);
-    try mw.bytes(&all_ones);
-    try mw.writeU64(0); // since = Timestamp::MIN
-    try mw.writeU64(TIMESTAMP_MAX); // until = Timestamp::MAX
+pub const subscribe_all_frame = blk: {
+    // message: type ++ filter(u16 len ++ bytes) ++ since ++ until
+    const msg_len = 2 + 2 + FILTER_SIZE_S + 8 + 8;
+    var msg: [msg_len]u8 = undefined;
+    std.mem.writeInt(u16, msg[0..2], @backingInt(MessageType.subscribe), .big);
+    std.mem.writeInt(u16, msg[2..4], FILTER_SIZE_S, .big);
+    @memset(msg[4 .. 4 + FILTER_SIZE_S], 0xff);
+    std.mem.writeInt(u64, msg[4 + FILTER_SIZE_S ..][0..8], 0, .big); // since
+    std.mem.writeInt(u64, msg[12 + FILTER_SIZE_S ..][0..8], TIMESTAMP_MAX, .big); // until
 
-    return wrapGossip(allocator, msg.items);
-}
+    // frame: version ++ stream varint ++ length varint ++ message
+    var frame: [VERSION_STRING.len + 1 + 2 + msg_len]u8 = undefined;
+    @memcpy(frame[0..VERSION_STRING.len], &VERSION_STRING);
+    frame[VERSION_STRING.len] = @intCast(StreamId.gossip_out.value);
+    std.mem.writeInt(u16, frame[VERSION_STRING.len + 1 ..][0..2], (0b01 << 14) | @as(u16, msg_len), .big);
+    @memcpy(frame[VERSION_STRING.len + 3 ..], &msg);
+    break :blk frame;
+};
 
 /// Wraps a varint-payload frame: version ++ stream ++ varint(len) ++ body.
 /// Used for gossip and git streams (both length-prefix their payload).
@@ -427,8 +433,7 @@ test "encode ping frame layout" {
 }
 
 test "encode subscribe-all frame layout" {
-    const frame = try encodeSubscribeAllFrame(testing.allocator);
-    defer testing.allocator.free(frame);
+    const frame = &subscribe_all_frame;
 
     // Header: version(rad,1) ++ stream(0x02) ++ len(varint).
     // Message: type(00 08) ++ filter-len(04 00) ++ 1024*0xff ++ since(8) ++ until(8).
