@@ -1,6 +1,21 @@
-//! Test vectors from RFC 9001 Appendix A.2, extracted verbatim from the
-//! RFC text. Generated rather than transcribed, since the packet is 1200
-//! bytes.
+//! Test vectors from RFC 9001 Appendix A, plus the helpers that read them.
+//! The two hex constants are generated from the RFC text rather than
+//! transcribed, since the packet is 1200 bytes.
+const std = @import("std");
+
+/// Vectors read better as the hex the RFC prints them in.
+pub fn hex(comptime s: []const u8) [s.len / 2]u8 {
+    var out: [s.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, s) catch unreachable;
+    return out;
+}
+
+/// The client-chosen Destination Connection ID every Appendix A vector uses.
+/// Source: RFC 9001 s A.
+pub const dcid = "8394c8f03e515708";
+
+/// An id unrelated to the RFC's, for tests that build their own packets.
+pub const other_dcid = "0011223344556677";
 
 /// The client Initial packet as it appears on the wire: header protected,
 /// payload encrypted, 1200 bytes.

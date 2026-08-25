@@ -43,6 +43,18 @@ pub const Reader = struct {
     }
 };
 
+/// Writes the canonical (shortest) varint for `v`.
+///
+/// Takes a `std.Io.Writer` so one implementation serves both a fixed packet
+/// buffer and a growing one.
+pub fn writeVarint(w: *std.Io.Writer, v: u64) !void {
+    if (v < (1 << 6)) return w.writeInt(u8, @intCast(v), .big);
+    if (v < (1 << 14)) return w.writeInt(u16, @as(u16, 0b01 << 14) | @as(u16, @intCast(v)), .big);
+    if (v < (1 << 30)) return w.writeInt(u32, @as(u32, 0b10 << 30) | @as(u32, @intCast(v)), .big);
+    if (v < (1 << 62)) return w.writeInt(u64, (@as(u64, 0b11) << 62) | v, .big);
+    return error.VarIntTooLarge;
+}
+
 /// Appends encoded values to an ArrayList.
 pub const Writer = struct {
     out: *std.ArrayList(u8),
@@ -65,24 +77,14 @@ pub const Writer = struct {
     }
 
     /// Writes a QUIC varint using the minimal length (canonical form).
+    ///
+    /// Defers to `writeVarint` so the encoding lives in one place. A varint is
+    /// at most 8 bytes, so the detour through a stack buffer costs nothing.
     pub fn varint(self: Writer, v: u64) !void {
-        if (v < (1 << 6)) {
-            try self.writeU8(@intCast(v));
-        } else if (v < (1 << 14)) {
-            var b: [2]u8 = undefined;
-            std.mem.writeInt(u16, &b, @as(u16, 0b01 << 14) | @as(u16, @intCast(v)), .big);
-            try self.out.appendSlice(self.allocator, &b);
-        } else if (v < (1 << 30)) {
-            var b: [4]u8 = undefined;
-            std.mem.writeInt(u32, &b, @as(u32, 0b10 << 30) | @as(u32, @intCast(v)), .big);
-            try self.out.appendSlice(self.allocator, &b);
-        } else if (v < (1 << 62)) {
-            var b: [8]u8 = undefined;
-            std.mem.writeInt(u64, &b, (@as(u64, 0b11) << 62) | v, .big);
-            try self.out.appendSlice(self.allocator, &b);
-        } else {
-            return error.VarIntTooLarge;
-        }
+        var buf: [8]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try writeVarint(&w, v);
+        try self.out.appendSlice(self.allocator, w.buffered());
     }
 
     pub fn bytes(self: Writer, data: []const u8) !void {
@@ -105,9 +107,22 @@ test "varint RFC 9000 A.1 vectors" {
         try (Writer{ .out = &out, .allocator = testing.allocator }).varint(c[0]);
         try testing.expectEqualSlices(u8, c[1], out.items);
 
+        // The same vectors through the allocation-free path, so both sinks are
+        // pinned rather than one relying on the other.
+        var buf: [8]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try writeVarint(&w, c[0]);
+        try testing.expectEqualSlices(u8, c[1], w.buffered());
+
         var r = Reader{ .buf = c[1] };
         try testing.expectEqual(c[0], try r.varint());
     }
+}
+
+test "a value too large to encode is rejected" {
+    var buf: [8]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try testing.expectError(error.VarIntTooLarge, writeVarint(&w, 1 << 62));
 }
 
 test "varint small values are 1 byte" {
