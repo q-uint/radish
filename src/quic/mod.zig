@@ -6,9 +6,13 @@
 pub const crypto = @import("crypto.zig");
 pub const packet = @import("packet.zig");
 pub const frame = @import("frame.zig");
+pub const tls = @import("tls.zig");
+pub const handshake = @import("handshake.zig");
 
 test {
     _ = crypto;
     _ = packet;
     _ = frame;
+    _ = tls;
+    _ = handshake;
 }

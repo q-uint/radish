@@ -107,6 +107,7 @@ fn usage() void {
         \\  radish fetch-deps  <manifest> [dir]                     resolve `.rad` deps (default .rad-deps)
         \\    --from <host>:<port>:<node-id>                        fetch from this node instead of
         \\                                                          locating a seed over gossip
+        \\  radish serve       <port> [sessions]                    answer inbound connections
         \\
     , .{});
 }

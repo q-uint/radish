@@ -32,6 +32,7 @@ radish peers       <host>:<port>:<node-id>              nodes seen announcing th
   --frames <n>                                          gossip frames to observe (default 200)
 radish fetch-deps  <manifest> [dir]                     resolve `.rad` dependencies (default .rad-deps)
   --from <host>:<port>:<node-id>                        fetch from this node instead of locating a seed
+radish serve       <port> [sessions]                    answer inbound connections (one at a time)
 ```
 
 ## Zig packages over Radicle (proof of concept)
@@ -126,9 +127,10 @@ delegate's sigrefs.
 Worth being explicit, since the tool is easy to point at seeds you do not run:
 
 - **Every connection uses a throwaway identity.** `Session.connect` derives a
-  fresh key per dial, so radish appears as a new node id each time. It cannot be
-  dialed back and cannot seed anything, and each dial adds an entry to the
-  address book of the node it contacted. Those entries expire (`routingMaxAge`,
+  fresh key per dial, so radish appears as a new node id each time. `serve`
+  answers inbound connections but generates its key per run too, so it is a
+  different node after every restart and still seeds nothing. Each dial adds an
+  entry to the address book of the node it contacted. Those entries expire (`routingMaxAge`,
   a week by default) so the cost is bounded, but it is still churn no real node
   produces. Rate limits and bans also do not accumulate against a rotating
   identity, which is evasion of the protocol's back-pressure rather than a
@@ -144,6 +146,40 @@ Worth being explicit, since the tool is easy to point at seeds you do not run:
 None of this is malicious and the volumes are tiny, but it is freeloading.
 Prefer `.node` in the manifest or `--from` to point at a seed you run, and do
 not put `fetch-deps` in a loop.
+
+## QUIC (for Radicle 2.x)
+
+Radicle 2.0 replaces the Cyphernet dependencies with [iroh](https://iroh.computer),
+so the transport becomes QUIC over UDP and 1.x nodes will not connect to 2.y
+nodes. Everything above (storage, identities, sigrefs, COBs) is unaffected;
+`src/net/` is the part that is 1.x-only.
+
+`src/quic/` is an independent QUIC implementation growing alongside it. It knows
+nothing about node ids or gossip. What works today:
+
+- Initial packet protection: HKDF key derivation, header protection, AES-GCM
+- Long header parse and serialize, packet number encode/decode, coalesced datagrams
+- PADDING, PING, CRYPTO and ACK frames
+- The TLS 1.3 key schedule and ClientHello construction
+
+Every step is pinned to published vectors rather than to itself. RFC 9001
+Appendix A covers packet protection: the client Initial is rebuilt from its
+plaintext and compared byte for byte, and the server's reply is decrypted and
+checked against its published payload. RFC 8448 covers the key schedule and the
+transcript. Between them, ClientHello bytes -> transcript hash -> traffic
+secrets -> packet keys is one continuously checked chain.
+
+Not started: the handshake state machine, short headers, streams, flow control,
+loss recovery, congestion control.
+
+QUIC is only the transport iroh runs on. Above it sit discovery, hole punching
+and relays, and those are built from named pieces rather than invented:
+addressing is a signed [Pkarr](https://pkarr.org) packet mapping an endpoint id
+to its home relay, published over HTTP and resolved by DNS. iroh 1.0 commits to
+wire stability across minor versions and languages, and
+[documents](https://docs.iroh.computer) the architecture in detail. The
+client-to-relay framing and the hole-punching messages are described by
+mechanism rather than byte layout, so those would need reading from the Rust.
 
 ## Build
 

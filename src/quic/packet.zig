@@ -452,6 +452,39 @@ test "opens the RFC 9001 A.2 client Initial and finds the ClientHello" {
     try testing.expectEqual(first.crypto.data.len - 4, hs_len);
 }
 
+// The other direction, and the first real ServerHello: server Initial keys come
+// from the client's *original* connection id, not the new one this packet
+// carries in its header.
+test "opens the RFC 9001 A.3 server Initial and finds the ServerHello" {
+    var packet: [135]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&packet, testdata.rfc9001_server_initial_hex);
+
+    const keys = crypto.keysFromSecret(crypto.initialSecrets(&hex(testdata.dcid)).server);
+    var out: [256]u8 = undefined;
+    const opened = try open(&out, &packet, keys, null);
+
+    try testing.expectEqual(@as(u64, 1), opened.pn);
+    // The client's source id was empty, so the server addresses it with none;
+    // f067a5502a4262b5 is the new id the server offers for itself.
+    try testing.expectEqual(@as(usize, 0), opened.header.dcid.len);
+    try testing.expectEqualSlices(u8, &hex("f067a5502a4262b5"), opened.header.scid);
+
+    var expected: [99]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, testdata.rfc9001_server_payload_hex);
+    try testing.expectEqualSlices(u8, &expected, opened.payload);
+
+    // An ACK for the client's packet 0, then the ServerHello.
+    var it = frame.Iterator.init(opened.payload);
+    const ack = (try it.next()).?.ack;
+    try testing.expectEqual(@as(u64, 0), ack.largest);
+    try testing.expectEqual(@as(u64, 0), ack.range_count);
+
+    const ch = (try it.next()).?.crypto;
+    try testing.expectEqual(@as(usize, 90), ch.data.len);
+    try testing.expectEqual(@as(u8, 0x02), ch.data[0]); // server_hello
+    try testing.expectEqual(@as(?frame.Frame, null), try it.next());
+}
+
 // The strictest test available: rebuild the RFC's packet from its plaintext
 // and compare all 1200 bytes. Decryption alone can hide two errors that cancel
 // out; reproducing the exact bytes cannot.
