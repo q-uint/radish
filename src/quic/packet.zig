@@ -67,7 +67,12 @@ pub fn unprotectHeader(header: []u8, pn_offset: usize, mask: [crypto.mask_len]u8
 
     header[0] ^= mask[0] & maskedBits(header[0]);
     const n = pnLen(header[0]);
-    if (header.len < pn_offset + n) return error.PacketTooShort;
+    if (header.len < pn_offset + n) {
+        // Undo it, so a refused packet is still the bytes that arrived. The
+        // form bit is outside the mask, so `maskedBits` has not changed.
+        header[0] ^= mask[0] & maskedBits(header[0]);
+        return error.PacketTooShort;
+    }
 
     for (0..n) |i| header[pn_offset + i] ^= mask[1 + i];
     return n;
@@ -131,7 +136,7 @@ pub fn parseLongHeader(packet: []const u8) Error!LongHeader {
     if (first & 0x40 == 0) return error.NotLongHeader;
     if (version != version_1) return error.UnsupportedVersion;
 
-    const kind: Kind = @fromBackingInt(@intCast(@as(u2, @truncate(first >> 4))));
+    const kind: Kind = @fromBackingInt(@as(u2, @truncate(first >> 4)));
     if (kind == .retry) return error.UnsupportedPacket;
 
     // Both connection ids are length-prefixed by a single byte, which is why
@@ -229,8 +234,7 @@ pub fn open(out: []u8, packet: []u8, keys: crypto.Keys, largest_pn: ?u64) Error!
     if (packet[0] & 0x0c != 0) return error.ProtocolViolation;
     if (length < pn_len + Aes128Gcm.tag_length) return error.PacketTooShort;
 
-    var truncated: u64 = 0;
-    for (packet[hdr.pn_offset..][0..pn_len]) |b| truncated = (truncated << 8) | b;
+    const truncated = std.mem.readVarInt(u64, packet[hdr.pn_offset..][0..pn_len], .big);
     const pn = decodePacketNumber(largest_pn, truncated, pn_len);
 
     // The AEAD authenticates the header in the unprotected form it now has.
@@ -328,14 +332,14 @@ pub fn writeLongHeader(out: []u8, b: Build, payload_len: usize) Error!Header {
 /// before the header can be masked. On the way in, the header must be unmasked
 /// before the payload can be decrypted.
 pub fn seal(out: []u8, b: Build, payload: []const u8, keys: crypto.Keys) Error!usize {
+    // Before the header is written, so a refused packet leaves `out` untouched.
+    // Padding is the caller's call: PADDING frames are frames the peer parses.
+    if (payload.len < minPayloadLen(b.pn_len)) return error.PayloadTooShortToSample;
+
     const h = try writeLongHeader(out, b, payload.len);
 
     const end = h.len + payload.len + Aes128Gcm.tag_length;
     if (out.len < end) return error.BufferTooSmall;
-
-    // Before encrypting, so a refused packet leaves `out` untouched. Padding is
-    // the caller's call: PADDING frames are frames the peer parses.
-    if (payload.len < minPayloadLen(b.pn_len)) return error.PayloadTooShortToSample;
 
     // The header authenticates as associated data, unprotected as it is now.
     var tag: [Aes128Gcm.tag_length]u8 = undefined;
@@ -403,12 +407,12 @@ test "packet number and nonce helpers" {
 
 test "parses the RFC 9001 A.2 long header" {
     var packet: [1200]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&packet, testdata.client_initial_protected_hex);
+    _ = try std.fmt.hexToBytes(&packet, testdata.rfc9001_client_initial_hex);
 
     const h = try parseLongHeader(&packet);
     try testing.expectEqual(Kind.initial, h.kind);
     try testing.expectEqual(@as(u32, 1), h.version); // QUIC v1
-    try testing.expectEqualSlices(u8, &hex(testdata.dcid), h.dcid);
+    try testing.expectEqualSlices(u8, &hex(testdata.rfc9001_dcid), h.dcid);
     try testing.expectEqual(@as(usize, 0), h.scid.len);
     try testing.expectEqual(@as(usize, 0), h.token.len);
     try testing.expectEqual(@as(u64, 1182), h.length); // 4 pn + 1162 frames + 16 tag
@@ -421,9 +425,9 @@ test "parses the RFC 9001 A.2 long header" {
 // TLS ClientHello that started a connection out.
 test "opens the RFC 9001 A.2 client Initial and finds the ClientHello" {
     var packet: [1200]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&packet, testdata.client_initial_protected_hex);
+    _ = try std.fmt.hexToBytes(&packet, testdata.rfc9001_client_initial_hex);
 
-    const keys = crypto.keysFromSecret(crypto.initialSecrets(&hex(testdata.dcid)).client);
+    const keys = crypto.keysFromSecret(crypto.initialSecrets(&hex(testdata.rfc9001_dcid)).client);
 
     var out: [1200]u8 = undefined;
     const opened = try open(&out, &packet, keys, null);
@@ -439,7 +443,7 @@ test "opens the RFC 9001 A.2 client Initial and finds the ClientHello" {
     try testing.expectEqual(@as(usize, 241), first.crypto.data.len);
 
     var expected: [245]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&expected, testdata.client_initial_crypto_frame_hex);
+    _ = try std.fmt.hexToBytes(&expected, testdata.rfc9001_client_crypto_hex);
     try testing.expectEqualSlices(u8, expected[4..], first.crypto.data);
 
     try testing.expectEqual(@as(usize, 917), (try it.next()).?.padding);
@@ -459,7 +463,7 @@ test "opens the RFC 9001 A.3 server Initial and finds the ServerHello" {
     var packet: [135]u8 = undefined;
     _ = try std.fmt.hexToBytes(&packet, testdata.rfc9001_server_initial_hex);
 
-    const keys = crypto.keysFromSecret(crypto.initialSecrets(&hex(testdata.dcid)).server);
+    const keys = crypto.keysFromSecret(crypto.initialSecrets(&hex(testdata.rfc9001_dcid)).server);
     var out: [256]u8 = undefined;
     const opened = try open(&out, &packet, keys, null);
 
@@ -491,7 +495,7 @@ test "opens the RFC 9001 A.3 server Initial and finds the ServerHello" {
 test "seals the RFC 9001 A.2 client Initial byte for byte" {
     // The plaintext is the CRYPTO frame, then PADDING out to 1162 bytes.
     var payload: [1162]u8 = @splat(0);
-    _ = try std.fmt.hexToBytes(payload[0..245], testdata.client_initial_crypto_frame_hex);
+    _ = try std.fmt.hexToBytes(payload[0..245], testdata.rfc9001_client_crypto_hex);
 
     const dcid = hex("8394c8f03e515708");
     const keys = crypto.keysFromSecret(crypto.initialSecrets(&dcid).client);
@@ -505,7 +509,7 @@ test "seals the RFC 9001 A.2 client Initial byte for byte" {
     }, &payload, keys);
 
     var expected: [1200]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&expected, testdata.client_initial_protected_hex);
+    _ = try std.fmt.hexToBytes(&expected, testdata.rfc9001_client_initial_hex);
     try testing.expectEqual(@as(usize, 1200), n);
     try testing.expectEqualSlices(u8, &expected, out[0..n]);
 }
@@ -566,30 +570,25 @@ test "invalid builds are refused" {
     // One byte short of a sample for a 1-byte packet number.
     try testing.expectError(error.PayloadTooShortToSample, seal(&out, .{ .kind = .handshake, .dcid = &dcid, .pn = 1, .pn_len = 1 }, &[_]u8{ 1, 1 }, keys));
 
-    // All refused before the AEAD ran, so no half-written packet escaped.
-    try testing.expectEqual(@as(u8, 0xaa), out[255]);
+    // All refused before a single byte was written, header included.
+    try testing.expectEqualSlices(u8, &@as([256]u8, @splat(0xaa)), &out);
 }
 
-// Version Negotiation has version 0 and leaves the rest of the first byte
-// arbitrary, so it must be recognised before the fixed-bit check.
-test "malformed headers are rejected" {
+test "malformed packets are rejected" {
+    // Fixed bit clear, since Version Negotiation leaves it arbitrary.
     try testing.expectError(error.VersionNegotiation, parseLongHeader(&hex("8000000000" ++ "00" ++ "00" ++ "00000001")));
     try testing.expectError(error.UnsupportedVersion, parseLongHeader(&hex("c0aabbccdd" ++ "00" ++ "00" ++ "00")));
+    try testing.expectError(error.ConnectionIdTooLong, parseLongHeader(&hex("c000000001" ++ "15")));
 
     var short = hex("c300000001088394c8f03e5157080000449e0000");
     try testing.expectError(error.PacketTooShort, protectHeader(&short, a2_pn_offset, hex(a2_mask)));
-}
 
-// A declared length too small to hold a sample must be discarded, not allowed
-// to sample whatever follows it in the datagram. `writeLongHeader` will build
-// such a packet; `seal` is what refuses to.
-test "a length too small to hold a sample is discarded" {
+    // Declared length too small to hold a sample.
     const dcid = hex(testdata.other_dcid);
-    var packet: [64]u8 = @splat(0);
-    _ = try writeLongHeader(&packet, .{ .kind = .handshake, .dcid = &dcid, .pn = 1, .pn_len = 1 }, 0);
-
+    var tiny: [64]u8 = @splat(0);
+    _ = try writeLongHeader(&tiny, .{ .kind = .handshake, .dcid = &dcid, .pn = 1, .pn_len = 1 }, 0);
     var out: [64]u8 = undefined;
-    try testing.expectError(error.PacketTooShort, open(&out, &packet, clientKeys(testdata.other_dcid), null));
+    try testing.expectError(error.PacketTooShort, open(&out, &tiny, clientKeys(testdata.other_dcid), null));
 }
 
 // The header is the AEAD's associated data, so the two cannot be tampered with
@@ -597,14 +596,14 @@ test "a length too small to hold a sample is discarded" {
 // half-unmasked ones.
 test "a failed open reports the tamper and restores the packet" {
     var packet: [1200]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&packet, testdata.client_initial_protected_hex);
+    _ = try std.fmt.hexToBytes(&packet, testdata.rfc9001_client_initial_hex);
     // Byte 0 is the header form, 1-4 the version, 5 the id length, so the
     // connection id starts at 6. Keys stay derived from the original id.
     packet[6] ^= 0x01;
     const arrived = packet;
 
     var out: [1200]u8 = undefined;
-    try testing.expectError(error.AuthenticationFailed, open(&out, &packet, clientKeys(testdata.dcid), null));
+    try testing.expectError(error.AuthenticationFailed, open(&out, &packet, clientKeys(testdata.rfc9001_dcid), null));
     try testing.expectEqualSlices(u8, &arrived, &packet);
 }
 

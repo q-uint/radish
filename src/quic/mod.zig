@@ -8,6 +8,9 @@ pub const packet = @import("packet.zig");
 pub const frame = @import("frame.zig");
 pub const tls = @import("tls.zig");
 pub const handshake = @import("handshake.zig");
+pub const client = @import("client.zig");
+pub const probe = @import("probe.zig");
+pub const testdata = @import("testdata.zig");
 
 test {
     _ = crypto;
@@ -15,4 +18,7 @@ test {
     _ = frame;
     _ = tls;
     _ = handshake;
+    _ = client;
+    _ = probe;
+    _ = &probe.run;
 }

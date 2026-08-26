@@ -19,7 +19,17 @@ pub const Type = enum(u64) {
     ack = 0x02,
     ack_ecn = 0x03,
     crypto = 0x06,
+    connection_close = 0x1c,
+    connection_close_app = 0x1d,
     _,
+};
+
+/// Why a peer is closing. `frame_type` is absent on an application close.
+/// Source: RFC 9000 s19.19.
+pub const ConnectionClose = struct {
+    error_code: u64,
+    frame_type: ?u64,
+    reason: []const u8,
 };
 
 pub const Ecn = struct { ect0: u64, ect1: u64, ce: u64 };
@@ -93,6 +103,7 @@ pub const Frame = union(enum) {
     ping,
     ack: Ack,
     crypto: Crypto,
+    connection_close: ConnectionClose,
 };
 
 /// Iterates the frames in a decrypted payload. Slices borrow from it.
@@ -106,7 +117,7 @@ pub const Iterator = struct {
     pub fn next(self: *Iterator) Error!?Frame {
         if (self.r.pos >= self.r.buf.len) return null;
 
-        switch (@as(Type, @fromBackingInt(@intCast(try self.r.varint())))) {
+        switch (@as(Type, @fromBackingInt(try self.r.varintCanonical()))) {
             .padding => {
                 var n: usize = 1;
                 while (self.r.pos < self.r.buf.len and self.r.buf[self.r.pos] == 0) : (self.r.pos += 1) {
@@ -147,6 +158,16 @@ pub const Iterator = struct {
                 const len = try self.r.varint();
                 return .{ .crypto = .{ .offset = offset, .data = try self.r.take(@intCast(len)) } };
             },
+            .connection_close, .connection_close_app => |t| {
+                const code = try self.r.varint();
+                const frame_type: ?u64 = if (t == .connection_close) try self.r.varint() else null;
+                const len = try self.r.varint();
+                return .{ .connection_close = .{
+                    .error_code = code,
+                    .frame_type = frame_type,
+                    .reason = try self.r.take(@intCast(len)),
+                } };
+            },
             else => return error.UnsupportedFrame,
         }
     }
@@ -182,6 +203,18 @@ test "walks ack ranges downward" {
     try testing.expectEqual(AckRange{ .largest = 55, .smallest = 52 }, (try r.next()).?);
     try testing.expectEqual(AckRange{ .largest = 50, .smallest = 50 }, (try r.next()).?);
     try testing.expectEqual(@as(?AckRange, null), try r.next());
+    try testing.expectEqual(@as(?Ecn, null), ack.ecn);
+}
+
+// Type 0x03 appends three counts after the ranges.
+test "reads the ecn counts of an ack_ecn frame" {
+    var payload = [_]u8{ 0x03, 10, 0x00, 0x00, 0x00, 0x05, 0x06, 0x07 };
+    var it = Iterator.init(&payload);
+    const ack = (try it.next()).?.ack;
+
+    try testing.expectEqual(@as(u64, 10), ack.largest);
+    try testing.expectEqual(Ecn{ .ect0 = 5, .ect1 = 6, .ce = 7 }, ack.ecn.?);
+    try testing.expectEqual(@as(?Frame, null), try it.next());
 }
 
 // A peer can encode gaps that drive the computation below zero. The RFC
@@ -205,4 +238,11 @@ test "an unknown frame type is fatal" {
     var payload = [_]u8{0x1f};
     var it = Iterator.init(&payload);
     try testing.expectError(error.UnsupportedFrame, it.next());
+}
+
+// 0x4001 is a two-byte encoding of 1, which would otherwise read as PING.
+test "an overlong frame type encoding is rejected" {
+    var payload = [_]u8{ 0x40, 0x01 };
+    var it = Iterator.init(&payload);
+    try testing.expectError(error.VarIntNotCanonical, it.next());
 }

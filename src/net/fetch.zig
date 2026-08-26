@@ -51,9 +51,9 @@ pub const Session = struct {
         rid: []const u8,
     ) !*Session {
         var seed: [32]u8 = undefined;
-        io.random(&seed);
+        try io.randomSecure(&seed);
         const static = try noise.KeyPair.generateDeterministic(seed);
-        io.random(&seed);
+        try io.randomSecure(&seed);
         const ephemeral = try noise.KeyPair.generateDeterministic(seed);
         var ini = noise.Initiator.init(static, ephemeral, nid.key);
 

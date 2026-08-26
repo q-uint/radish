@@ -200,9 +200,9 @@ const Session = struct {
         nid: node_id.NodeId,
     ) !void {
         var seed: [32]u8 = undefined;
-        io.random(&seed);
+        try io.randomSecure(&seed);
         const static = try noise.KeyPair.generateDeterministic(seed);
-        io.random(&seed);
+        try io.randomSecure(&seed);
         const ephemeral = try noise.KeyPair.generateDeterministic(seed);
         // The responder static is the node's raw Ed25519 public key (its NID).
         var ini = noise.Initiator.init(static, ephemeral, nid.key);

@@ -110,7 +110,7 @@ fn accept(
     alias: []const u8,
 ) !SessionStats {
     var eph_seed: [32]u8 = undefined;
-    io.random(&eph_seed);
+    try io.randomSecure(&eph_seed);
     const ephemeral = try noise.KeyPair.generateDeterministic(eph_seed);
     // noise.KeyPair carries the seed as its secret, matching how the initiator
     // builds one; the node id is the Ed25519 public key over that seed.

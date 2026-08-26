@@ -4,7 +4,15 @@
 //! Source: radicle-protocol/src/wire/varint.rs.
 const std = @import("std");
 
-pub const Error = error{ UnexpectedEnd, VarIntTooLarge };
+pub const Error = error{ UnexpectedEnd, VarIntTooLarge, VarIntNotCanonical };
+
+/// Bytes the canonical encoding of `v` occupies.
+pub fn varintLen(v: u64) usize {
+    if (v < (1 << 6)) return 1;
+    if (v < (1 << 14)) return 2;
+    if (v < (1 << 30)) return 4;
+    return 8;
+}
 
 /// Reads bytes from a buffer, tracking position.
 pub const Reader = struct {
@@ -39,6 +47,16 @@ pub const Reader = struct {
         for (1..len) |_| {
             v = (v << 8) | try self.readU8();
         }
+        return v;
+    }
+
+    /// A varint that must use the shortest encoding for its value. QUIC only
+    /// requires this of frame types.
+    /// Source: RFC 9000 s12.4.
+    pub fn varintCanonical(self: *Reader) Error!u64 {
+        const start = self.pos;
+        const v = try self.varint();
+        if (self.pos - start != varintLen(v)) return error.VarIntNotCanonical;
         return v;
     }
 };
@@ -116,6 +134,19 @@ test "varint RFC 9000 A.1 vectors" {
 
         var r = Reader{ .buf = c[1] };
         try testing.expectEqual(c[0], try r.varint());
+    }
+}
+
+// `writeVarint` picks widths from its own thresholds, so pin them together.
+test "varintLen agrees with what writeVarint emits" {
+    for ([_]u64{ 0, 63, 64, 16383, 16384, (1 << 30) - 1, 1 << 30, (1 << 62) - 1 }) |v| {
+        var buf: [8]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try writeVarint(&w, v);
+        try testing.expectEqual(w.buffered().len, varintLen(v));
+
+        var r = Reader{ .buf = w.buffered() };
+        try testing.expectEqual(v, try r.varintCanonical());
     }
 }
 

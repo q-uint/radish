@@ -54,6 +54,13 @@ pub fn main(init: std.process.Init) !void {
         return serve(init, port, sessions);
     }
 
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "quic-probe")) {
+        const port = std.fmt.parseInt(u16, args[3], 10) catch return usage();
+        const alpn = if (args.len >= 5) args[4] else "h3";
+        const sni = if (args.len >= 6) args[5] else null;
+        return quicProbe(init, args[2], port, alpn, sni);
+    }
+
     if (args.len >= 3 and std.mem.eql(u8, args[1], "peers")) {
         var frames: usize = 200;
         if (args.len >= 5 and std.mem.eql(u8, args[3], "--frames")) {
@@ -108,6 +115,8 @@ fn usage() void {
         \\    --from <host>:<port>:<node-id>                        fetch from this node instead of
         \\                                                          locating a seed over gossip
         \\  radish serve       <port> [sessions]                    answer inbound connections
+        \\  radish quic-probe  <host> <port> [alpn] [sni]           send a QUIC Initial, read the
+        \\                                                          ServerHello (default alpn h3)
         \\
     , .{});
 }
@@ -185,7 +194,7 @@ fn announce(init: std.process.Init, t: Target, alias: []const u8) !void {
     const nid = try t.nodeId();
 
     var seed: [32]u8 = undefined;
-    init.io.random(&seed);
+    try init.io.randomSecure(&seed);
     const key = try radish.SecretKey.fromSeed(seed);
     const our_nid = try key.nodeId().encode(arena);
     std.debug.print("announcing as {s} (alias {s})\n", .{ our_nid, alias });
@@ -382,15 +391,57 @@ const ServePrinter = struct {
     }
 };
 
+/// One QUIC first flight against a live server. The x25519 key is fixed, so a
+/// recorded reply replays byte for byte; that also means the exchange has no
+/// forward secrecy, which is fine for a probe of public traffic.
+fn quicProbe(init: std.process.Init, host: []const u8, port: u16, alpn: []const u8, sni: ?[]const u8) !void {
+    const quic = radish.quic;
+    var secret: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&secret, quic.testdata.fixed_x25519_secret);
+    var random: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&random, quic.testdata.fixed_hello_random);
+
+    var reply: [2048]u8 = undefined;
+    var plain: [2048]u8 = undefined;
+    std.debug.print("quic-probe {s}:{d} alpn={s}\n", .{ host, port, alpn });
+
+    const r = quic.probe.run(init.io, .{
+        .host = host,
+        .port = port,
+        .alpn = alpn,
+        .secret = secret,
+        .random = random,
+        .dcid = &[_]u8{ 0xc0, 0xff, 0xee, 0x00, 0xc0, 0xff, 0xee, 0x01 },
+        .server_name = sni,
+    }, &reply, &plain) catch |e| {
+        std.debug.print("probe failed: {s}\n", .{@errorName(e)});
+        return e;
+    };
+
+    std.debug.print("sent {d} bytes, received {d} in {d} datagram(s)\n", .{ r.sent, r.received, r.datagrams });
+    if (r.accepted) |a| {
+        std.debug.print("cipher suite 0x{x:0>4}\n", .{a.cipher_suite});
+        std.debug.print("server connection id: {x}\n", .{a.scid()});
+        std.debug.print("client handshake secret: {x}\n", .{a.handshake.client});
+        std.debug.print("server handshake secret: {x}\n", .{a.handshake.server});
+    } else if (r.closed) |c| {
+        std.debug.print("peer closed: error 0x{x} frame {?d}\n  reason: {s}\n", .{
+            c.error_code, c.frame_type, c.reason,
+        });
+    } else if (r.err) |e| {
+        std.debug.print("could not read the reply: {s}\n", .{@errorName(e)});
+    }
+    std.debug.print("\nreply datagram ({d} bytes):\n{x}\n", .{ r.reply.len, r.reply });
+}
+
 /// Answers inbound connections. The identity is generated per run, so peers
 /// cannot find this node again across restarts; a stored key is the next piece
 /// of work.
 fn serve(init: std.process.Init, port: u16, sessions: usize) !void {
     const arena = init.arena.allocator();
 
-    // randomSecure rather than random: this seeds a node identity, and
-    // `random` falls back to a weaker source on entropy failure instead of
-    // reporting it.
+    // randomSecure everywhere a key is derived: `random` degrades to a weaker
+    // source on entropy failure instead of reporting it.
     var seed: [32]u8 = undefined;
     try init.io.randomSecure(&seed);
     const key = try radish.SecretKey.fromSeed(seed);

@@ -32,21 +32,26 @@ pub fn initialSecrets(dcid: []const u8) Secrets {
     };
 }
 
+const Aead = std.crypto.aead.aes_gcm.Aes128Gcm;
+
+pub const Key = [Aead.key_length]u8;
+pub const Iv = [Aead.nonce_length]u8;
+
 /// One direction's protection. `hp` is separate from `key` so header masking
 /// cannot be derived from payload keys. Sized for AEAD_AES_128_GCM, which
 /// Initial packets always use; becomes a union once TLS can negotiate another.
 pub const Keys = struct {
-    key: [16]u8,
-    iv: [12]u8,
-    hp: [16]u8,
+    key: Key,
+    iv: Iv,
+    hp: Key,
 };
 
 /// Source: RFC 9001 s5.1.
 pub fn keysFromSecret(secret: [Hkdf.prk_length]u8) Keys {
     return .{
-        .key = expandLabel(Hkdf, secret, "quic key", "", 16),
-        .iv = expandLabel(Hkdf, secret, "quic iv", "", 12),
-        .hp = expandLabel(Hkdf, secret, "quic hp", "", 16),
+        .key = expandLabel(Hkdf, secret, "quic key", "", @sizeOf(Key)),
+        .iv = expandLabel(Hkdf, secret, "quic iv", "", @sizeOf(Iv)),
+        .hp = expandLabel(Hkdf, secret, "quic hp", "", @sizeOf(Key)),
     };
 }
 
@@ -60,7 +65,7 @@ pub const mask_len = 5;
 /// nothing else. Entangles the layers: the header cannot change without
 /// invalidating the payload.
 /// Source: RFC 9001 s5.4.3.
-pub fn headerMask(hp: [16]u8, sample: [sample_len]u8) [mask_len]u8 {
+pub fn headerMask(hp: Key, sample: [sample_len]u8) [mask_len]u8 {
     var block: [16]u8 = undefined;
     std.crypto.core.aes.Aes128.initEnc(hp).encrypt(&block, &sample);
     return block[0..mask_len].*;
@@ -73,7 +78,7 @@ const hex = testdata.hex;
 // The whole chain, both directions. Matching key/iv/hp pins every step above
 // them, since each is expanded from the one before.
 test "RFC 9001 A.1 key schedule" {
-    const dcid = hex(testdata.dcid);
+    const dcid = hex(testdata.rfc9001_dcid);
     try testing.expectEqualSlices(
         u8,
         &hex("7db5df06e7a69e432496adedb00851923595221596ae2ae9fb8115c1e9ed0a44"),
@@ -106,14 +111,14 @@ test "RFC 9001 A.1 key schedule" {
 }
 
 test "RFC 9001 A.2 header protection mask" {
-    const hp = keysFromSecret(initialSecrets(&hex(testdata.dcid)).client).hp;
+    const hp = keysFromSecret(initialSecrets(&hex(testdata.rfc9001_dcid)).client).hp;
     try testing.expectEqualSlices(u8, &hex("437b9aec36"), &headerMask(hp, hex("d1b1c98dd7689fb8ec11d242b123dc9b")));
 }
 
 // Keys must depend on the connection id and on the direction, or the salt is
 // being used alone somewhere and every connection shares protection.
 test "keys are bound to connection id and direction" {
-    const a = initialSecrets(&hex(testdata.dcid));
+    const a = initialSecrets(&hex(testdata.rfc9001_dcid));
     const b = initialSecrets(&hex("0000000000000000"));
     try testing.expect(!std.mem.eql(u8, &keysFromSecret(a.client).key, &keysFromSecret(b.client).key));
     try testing.expect(!std.mem.eql(u8, &keysFromSecret(a.client).key, &keysFromSecret(a.server).key));

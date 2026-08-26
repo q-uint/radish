@@ -149,7 +149,7 @@ test "heartwood: nfc value" {
 }
 
 test "heartwood: keys are nfc-normalized then sorted" {
-    // key "e"+acute normalizes to "é" (0xC3 0xA9), which sorts AFTER "z" (0x7A).
+    // key "e"+acute normalizes to U+00E9 (0xC3 0xA9), which sorts AFTER "z" (0x7A).
     try expectEncode("{\"z\":2,\"\u{00E9}\":1}", .{ .object = &.{
         .{ .key = "e\u{0301}", .value = .{ .int = 1 } },
         .{ .key = "z", .value = .{ .int = 2 } },

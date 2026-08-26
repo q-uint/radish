@@ -64,6 +64,17 @@ pub const Directions = struct {
     server: Secret,
 };
 
+const X25519 = std.crypto.dh.X25519;
+
+pub const PublicKey = [X25519.public_length]u8;
+pub const SecretKey = [X25519.secret_length]u8;
+
+/// The (EC)DHE input to `handshakeSecret`: raw X25519, no hashing.
+/// Source: RFC 8446 s7.4.2.
+pub fn x25519(secret: SecretKey, peer_public: PublicKey) !Secret {
+    return X25519.scalarmult(secret, peer_public);
+}
+
 const testing = std.testing;
 const testdata = @import("testdata.zig");
 const messages = @import("handshake.zig");
@@ -78,7 +89,16 @@ test "RFC 8448 key schedule" {
         &early,
     );
 
-    const shared = hex("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
+    const shared = try x25519(
+        hex("49af42ba7f7994852d713ef2784bcbcaa7911de26adc5642cb634540e7ea5005"),
+        hex("c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f"),
+    );
+    try testing.expectEqualSlices(
+        u8,
+        &hex("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d"),
+        &shared,
+    );
+
     const handshake = handshakeSecret(early, &shared);
     try testing.expectEqualSlices(
         u8,
