@@ -60,7 +60,7 @@ pub fn hashDir(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) ![]u8 {
 const testing = std.testing;
 
 fn scratchDir(io: std.Io, name: []const u8) !std.Io.Dir {
-    var tmp = try std.Io.Dir.openDirAbsolute(io, "/tmp", .{});
+    var tmp = try std.Io.Dir.openDirAbsolute(io, @import("build_options").tmp_dir, .{});
     defer tmp.close(io);
     tmp.deleteTree(io, name) catch {};
     return tmp.createDirPathOpen(io, name, .{});

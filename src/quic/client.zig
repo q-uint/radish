@@ -12,6 +12,7 @@ const tls = @import("tls.zig");
 const ExtensionType = std.crypto.tls.ExtensionType;
 const NamedGroup = std.crypto.tls.NamedGroup;
 const SignatureScheme = std.crypto.tls.SignatureScheme;
+const Ed25519 = std.crypto.sign.Ed25519;
 
 pub const Error = error{
     BufferTooSmall,
@@ -21,6 +22,14 @@ pub const Error = error{
     FragmentedCrypto,
     UnsupportedCipherSuite,
     HelloRetryRequest,
+    UnsupportedSignature,
+    BadCertificateVerify,
+    BadFinished,
+    HandshakeIncomplete,
+    UnexpectedMessage,
+    UnsupportedCertificateType,
+    KeysUnavailable,
+    FlightAlreadySent,
 } || packet.Error || handshake.Error || frame.Error;
 
 /// A u16-length-prefixed list of u16s, the shape most TLS extensions take.
@@ -32,13 +41,19 @@ fn u16List(comptime values: []const u16) [2 + 2 * values.len]u8 {
 }
 
 const supported_groups = u16List(&.{@backingInt(NamedGroup.x25519)});
-/// ed25519 is what radicle uses, but a public server signs with ECDSA or RSA,
-/// and offering ed25519 alone draws a handshake_failure.
-const signature_algorithms = u16List(&.{
-    @backingInt(SignatureScheme.ecdsa_secp256r1_sha256),
-    @backingInt(SignatureScheme.rsa_pss_rsae_sha256),
-    @backingInt(SignatureScheme.ed25519),
-});
+
+/// Radicle identities are ed25519 and a raw public key carries nothing else, so
+/// there is no second scheme to offer. X.509 is not supported: verifying a chain
+/// needs ECDSA and RSA, which radish has no use for anywhere else.
+const signature_algorithms = u16List(&.{@backingInt(SignatureScheme.ed25519)});
+
+/// The `raw_public_key` CertificateType, the only one radish negotiates. The
+/// peer sends a bare SubjectPublicKeyInfo in place of a chain.
+/// Source: RFC 7250 s3, s4.
+pub const raw_public_key: u8 = 2;
+
+/// The body both certificate_type extensions carry: a list of one entry.
+const certificate_types = [_]u8{ 1, raw_public_key };
 
 /// An Initial datagram must reach this before a server will answer, so that a
 /// spoofed source cannot make QUIC an amplifier.
@@ -55,7 +70,9 @@ pub const Config = struct {
     random: handshake.Random,
     public_key: tls.PublicKey,
     alpn: []const u8,
-    /// A server hosting many names needs this to pick a certificate.
+    /// A server hosting many names needs this to pick a certificate. iroh
+    /// disables SNI so the endpoint id stays out of the ClientHello, so leave it
+    /// null there.
     server_name: ?[]const u8 = null,
 };
 
@@ -80,6 +97,11 @@ fn writeExtensions(w: *std.Io.Writer, cfg: Config) !void {
     try handshake.writeExtension(w, @backingInt(ExtensionType.supported_groups), &supported_groups);
 
     try handshake.writeExtension(w, @backingInt(ExtensionType.signature_algorithms), &signature_algorithms);
+
+    // Both directions, since iroh authenticates mutually: we present a raw
+    // public key too.
+    try handshake.writeExtension(w, @backingInt(ExtensionType.client_certificate_type), &certificate_types);
+    try handshake.writeExtension(w, @backingInt(ExtensionType.server_certificate_type), &certificate_types);
 
     var alpn: [64]u8 = undefined;
     var aw = std.Io.Writer.fixed(&alpn);
@@ -125,12 +147,9 @@ pub fn initialDatagram(out: []u8, hello_buf: []u8, cfg: Config) Error!Initial {
 
     // CRYPTO frame at offset 0, then PADDING to the datagram minimum. The
     // padding is sized so the sealed packet lands exactly on the floor.
-    var payload: [min_initial_datagram]u8 = @splat(0);
+    var payload: [min_initial_datagram]u8 = undefined;
     var fw = std.Io.Writer.fixed(&payload);
-    codec.writeVarint(&fw, @backingInt(frame.Type.crypto)) catch return error.BufferTooSmall;
-    codec.writeVarint(&fw, 0) catch return error.BufferTooSmall;
-    codec.writeVarint(&fw, ch.len) catch return error.BufferTooSmall;
-    fw.writeAll(ch) catch return error.BufferTooSmall;
+    writeCryptoFrame(&fw, 0, ch) catch return error.BufferTooSmall;
     const frames_len = fw.buffered().len;
 
     const keys = crypto.keysFromSecret(crypto.initialSecrets(cfg.dcid).client);
@@ -152,138 +171,754 @@ pub fn initialDatagram(out: []u8, hello_buf: []u8, cfg: Config) Error!Initial {
     }
     if (payload_len > payload.len) return error.BufferTooSmall;
 
+    fw.splatByteAll(0, payload_len - frames_len) catch return error.BufferTooSmall;
+
     return .{
-        .len = try packet.seal(out, build, payload[0..payload_len], keys),
+        .len = try packet.seal(out, build, fw.buffered(), keys),
         .client_hello = ch,
     };
 }
 
-/// What the server's Initial yields once opened and its ServerHello read.
-/// The connection id is copied rather than borrowed: it lives in the packet
-/// buffer, which the caller is free to reuse or drop.
+/// Why the peer closed. `frame.ConnectionClose` borrows the buffer the packet
+/// was decrypted into, so this keeps its own copy and stays valid once that
+/// buffer is reused. Copyable by value: nothing points back into it.
+pub const Close = struct {
+    error_code: u64,
+    frame_type: ?u64,
+    reason_buf: [256]u8 = undefined,
+    reason_len: usize = 0,
+
+    pub fn reason(self: *const Close) []const u8 {
+        return self.reason_buf[0..self.reason_len];
+    }
+
+    /// An over-long reason is truncated: it is diagnostic text on a connection
+    /// that is already over.
+    pub fn from(c: frame.ConnectionClose) Close {
+        var self: Close = .{ .error_code = c.error_code, .frame_type = c.frame_type };
+        self.reason_len = @min(c.reason.len, self.reason_buf.len);
+        @memcpy(self.reason_buf[0..self.reason_len], c.reason[0..self.reason_len]);
+        return self;
+    }
+};
+
+/// What the server has told us so far. The connection id is copied rather than
+/// borrowed: it lives in the packet buffer, which the caller may reuse or drop.
 pub const Accepted = struct {
-    scid_buf: [packet.max_cid_len]u8,
-    scid_len: usize,
-    cipher_suite: u16,
-    handshake: tls.Directions,
+    scid_buf: [packet.max_cid_len]u8 = undefined,
+    scid_len: usize = 0,
+    cipher_suite: u16 = 0,
+    handshake: ?tls.Directions = null,
+    /// The 1-RTT secrets, once the server's Finished has been verified.
+    application: ?tls.Directions = null,
+    /// The peer's ed25519 key, once a raw public key certificate has arrived.
+    peer_key: ?[32]u8 = null,
+    /// Set once `peer_key` has signed the transcript, so the key is the peer's
+    /// and not merely something the peer sent.
+    peer_verified: bool = false,
+    alpn_buf: [64]u8 = undefined,
+    alpn_len: usize = 0,
 
     /// The connection id the server wants us to address it by from now on.
     pub fn scid(self: *const Accepted) []const u8 {
         return self.scid_buf[0..self.scid_len];
     }
+
+    pub fn alpn(self: *const Accepted) []const u8 {
+        return self.alpn_buf[0..self.alpn_len];
+    }
 };
 
-/// Opens a server Initial, reads its ServerHello, and derives both handshake
-/// traffic secrets. `client_hello` is the message we sent, needed for the
-/// transcript. `packet_buf` is mutated in place by `open`.
-///
-/// Reads only the first packet of a coalesced datagram: the ServerHello is in
-/// the Initial, and the Handshake packets behind it need the keys this derives.
-pub fn acceptServerInitial(
-    out: []u8,
-    packet_buf: []u8,
-    original_dcid: []const u8,
-    client_hello: []const u8,
-    secret: tls.SecretKey,
-    /// Filled in when the peer closes rather than replying, alongside
-    /// `error.PeerClosed`.
-    closed: *frame.ConnectionClose,
-) Error!Accepted {
-    const keys = crypto.keysFromSecret(crypto.initialSecrets(original_dcid).server);
-    const opened = try packet.open(out, packet_buf, keys, null);
-
-    // Reassembling a CRYPTO stream is not implemented, so the ServerHello has
-    // to arrive whole at offset 0.
-    var server_hello: ?[]const u8 = null;
-    var it = frame.Iterator.init(opened.payload);
-    while (try it.next()) |f| switch (f) {
-        .crypto => |c| {
-            if (c.offset != 0 or server_hello != null) return error.FragmentedCrypto;
-            server_hello = c.data;
-        },
-        .connection_close => |c| {
-            closed.* = c;
-            return error.PeerClosed;
-        },
-        else => {},
-    };
-    const sh_bytes = server_hello orelse return error.Malformed;
-
-    const sh = try handshake.parseServerHello(sh_bytes);
-
-    // Only x25519 is offered, so a retry means the server wants a group we do
-    // not have. Reported as itself rather than as a malformed key_share.
-    if (sh.isHelloRetryRequest()) return error.HelloRetryRequest;
-
-    // The schedule below is SHA-256 and AES-128 throughout; another suite would
-    // derive silently wrong secrets.
-    if (sh.cipher_suite != cipher_suite) return error.UnsupportedCipherSuite;
-
-    const ks = (try sh.keyShare()) orelse return error.Malformed;
-    if (ks.group != .x25519 or ks.key.len != 32) return error.UnsupportedGroup;
-
-    var transcript: handshake.Transcript = .{};
-    transcript.update(client_hello);
-    transcript.update(sh_bytes[0..sh.len]);
-
-    const shared = tls.x25519(secret, ks.key[0..32].*) catch return error.UnsupportedGroup;
-    const hs = tls.handshakeSecret(tls.earlySecret(), &shared);
-
-    var accepted: Accepted = .{
-        .scid_buf = undefined,
-        .scid_len = opened.header.scid.len,
-        .cipher_suite = sh.cipher_suite,
-        .handshake = tls.handshakeTraffic(hs, transcript.hash()),
-    };
-    @memcpy(accepted.scid_buf[0..accepted.scid_len], opened.header.scid);
-    return accepted;
+fn writeCryptoFrame(w: *std.Io.Writer, offset: u64, data: []const u8) !void {
+    try codec.writeVarint(w, @backingInt(frame.Type.crypto));
+    try codec.writeVarint(w, offset);
+    try codec.writeVarint(w, data.len);
+    try w.writeAll(data);
 }
+
+/// A client handshake in progress. Keys for the Handshake packet number space
+/// only exist once the ServerHello has been read, so the two CRYPTO streams and
+/// the transcript outlive any single datagram.
+pub const Handshaker = struct {
+    /// Everything the ServerHello yields at once. One optional, because a
+    /// packet key without the secret that made it is not a state this can be in.
+    pub const Derived = struct {
+        /// The master secret, and so the application keys, still need this
+        /// after the traffic secrets have been derived from it.
+        secret: tls.Secret,
+        keys: crypto.Keys,
+    };
+
+    /// One key phase, both ways.
+    pub const Directional = struct {
+        send: crypto.Keys,
+        recv: crypto.Keys,
+    };
+
+    /// The order the server's messages must arrive in; a message out of turn is
+    /// refused. EncryptedExtensions carries the negotiated certificate type,
+    /// and the peer's key can only be read once that is known.
+    /// Source: RFC 8446 Appendix A.1.
+    pub const Phase = enum {
+        wait_server_hello,
+        wait_encrypted_extensions,
+        /// A CertificateRequest is optional, so either may come next.
+        wait_certificate_or_request,
+        wait_certificate,
+        wait_certificate_verify,
+        wait_finished,
+        connected,
+    };
+
+    secret: tls.SecretKey,
+    initial_keys: crypto.Keys,
+    derived: ?Derived = null,
+    /// 1-RTT protection, once the server's Finished has been verified. Named by
+    /// direction: the two are not interchangeable, and using the wrong one
+    /// produces a packet the peer cannot unmask.
+    app_keys: ?Directional = null,
+    /// A short header carries no connection id length, so the length we issued
+    /// for ourselves is the only way to find the packet number.
+    our_cid_len: usize,
+    largest_app_pn: ?u64 = null,
+    /// Set when EncryptedExtensions names raw_public_key. X.509 is the default
+    /// when the extension is absent, which radish treats as fatal rather than
+    /// continue with a peer it cannot authenticate.
+    /// Source: RFC 7250 s4.1, s4.2.
+    negotiated_raw_key: bool = false,
+
+    /// HANDSHAKE_DONE, so the server accepted our flight. It only ever travels
+    /// in a 1-RTT packet.
+    confirmed: bool = false,
+    /// `writeFlight` has run, so the transcript now includes our flight.
+    flight_sent: bool = false,
+    /// Owed back to the peer as a PATH_RESPONSE.
+    path_challenge: ?[8]u8 = null,
+
+    transcript: handshake.Transcript = .{},
+    /// Each packet number space carries its own CRYPTO stream, with its own
+    /// offsets: the ServerHello arrives on the Initial one, everything from
+    /// EncryptedExtensions onward on the Handshake one.
+    initial_crypto: handshake.Reassembler,
+    handshake_crypto: handshake.Reassembler,
+    initial_read: usize = 0,
+    handshake_read: usize = 0,
+
+    /// The context a CertificateRequest asked us to echo. `requested` is what
+    /// says the server wants client authentication.
+    request_buf: [255]u8 = undefined,
+    request_len: usize = 0,
+    requested: bool = false,
+
+    accepted: Accepted = .{},
+    /// Set alongside `error.PeerClosed`.
+    /// Set alongside `error.PeerClosed`.
+    closed: ?Close = null,
+    phase: Phase = .wait_server_hello,
+
+    /// True once the server's Finished has been verified.
+    pub fn done(self: *const Handshaker) bool {
+        return self.phase == .connected;
+    }
+
+    pub const Options = struct {
+        /// The id the client chose; Initial keys stay pinned to it.
+        original_dcid: []const u8,
+        /// The id we gave for ourselves. Its length is the only way to find the
+        /// packet number in a 1-RTT header.
+        our_scid: []const u8,
+        /// Opens the transcript.
+        client_hello: []const u8,
+        secret: tls.SecretKey,
+        /// Hold the reassembled CRYPTO streams, borrowed for the handshake's
+        /// life. One per packet number space.
+        initial_buf: []u8,
+        handshake_buf: []u8,
+    };
+
+    pub fn init(opts: Options) Handshaker {
+        var self: Handshaker = .{
+            .secret = opts.secret,
+            .initial_keys = crypto.keysFromSecret(crypto.initialSecrets(opts.original_dcid).server),
+            .our_cid_len = opts.our_scid.len,
+            .initial_crypto = handshake.Reassembler.init(opts.initial_buf),
+            .handshake_crypto = handshake.Reassembler.init(opts.handshake_buf),
+        };
+        self.transcript.update(opts.client_hello);
+        return self;
+    }
+
+    /// Opens every packet in one datagram, in order, feeding their CRYPTO
+    /// frames to the matching stream. `datagram` is decrypted in place;
+    /// `scratch` receives each packet's plaintext.
+    pub fn push(self: *Handshaker, scratch: []u8, datagram: []u8) Error!void {
+        var rest = datagram;
+        while (rest.len > 0) {
+            if (!packet.isLongHeader(rest[0])) {
+                // No length field, so this packet is the remainder of the
+                // datagram and nothing can follow it.
+                const keys = (self.app_keys orelse return error.KeysUnavailable).recv;
+                const opened = try packet.openShort(
+                    scratch,
+                    rest,
+                    self.our_cid_len,
+                    keys,
+                    self.largest_app_pn,
+                );
+                // The reference is the largest number processed, so a reordered
+                // or retransmitted packet must not lower it.
+                // Source: RFC 9000 A.3.
+                self.largest_app_pn = @max(self.largest_app_pn orelse 0, opened.pn);
+                try self.appFrames(opened.payload);
+                return;
+            }
+
+            // Version Negotiation, an unsupported version and Retry all surface
+            // here, and each ends the attempt rather than leaving the caller
+            // unable to tell a rejection from silence.
+            const hdr = try packet.parseLongHeader(rest);
+            const keys = switch (hdr.kind) {
+                .initial => self.initial_keys,
+                // Arriving before the ServerHello means reordering, which needs
+                // buffering we do not do; the server retransmits.
+                .handshake => (self.derived orelse return error.KeysUnavailable).keys,
+                else => return error.UnsupportedPacket,
+            };
+
+            const opened = try packet.open(scratch, rest, keys, null);
+            try self.frames(hdr.kind, opened);
+            rest = rest[opened.len..];
+
+            try self.drain(&self.initial_crypto, &self.initial_read);
+            if (self.derived != null) {
+                try self.drain(&self.handshake_crypto, &self.handshake_read);
+            }
+        }
+    }
+
+    /// Frames from a 1-RTT packet. STREAM data is parsed but not kept: nothing
+    /// above this consumes application data yet.
+    fn appFrames(self: *Handshaker, payload: []const u8) Error!void {
+        var it = frame.Iterator.init(payload);
+        while (try it.next()) |f| switch (f) {
+            .handshake_done => self.confirmed = true,
+            .path_challenge => |c| self.path_challenge = c,
+            .connection_close => |c| {
+                self.closed = .from(c);
+                return error.PeerClosed;
+            },
+            else => {},
+        };
+    }
+
+    /// A PATH_RESPONSE echoing the challenge the peer sent, sealed as 1-RTT.
+    /// Source: RFC 9000 s8.2.
+    pub fn sealPathResponse(self: *Handshaker, out: []u8, pn: u64) Error!?usize {
+        const challenge = self.path_challenge orelse return null;
+        const keys = (self.app_keys orelse return error.HandshakeIncomplete).send;
+
+        var payload: [64]u8 = @splat(0);
+        var pw = std.Io.Writer.fixed(&payload);
+        codec.writeVarint(&pw, @backingInt(frame.Type.path_response)) catch return error.BufferTooSmall;
+        pw.writeAll(&challenge) catch return error.BufferTooSmall;
+
+        const n = try packet.sealShort(out, .{
+            .dcid = self.accepted.scid(),
+            .pn = pn,
+            .pn_len = 4,
+        }, pw.buffered(), keys);
+        self.path_challenge = null;
+        return n;
+    }
+
+    fn frames(self: *Handshaker, kind: packet.Kind, opened: packet.Opened) Error!void {
+        if (kind == .initial and self.accepted.scid_len == 0) {
+            self.accepted.scid_len = opened.header.scid.len;
+            @memcpy(self.accepted.scid_buf[0..self.accepted.scid_len], opened.header.scid);
+        }
+
+        var it = frame.Iterator.init(opened.payload);
+        while (try it.next()) |f| switch (f) {
+            .crypto => |c| {
+                const stream = if (kind == .initial) &self.initial_crypto else &self.handshake_crypto;
+                try stream.push(c.offset, c.data);
+            },
+            .connection_close => |c| {
+                self.closed = .from(c);
+                return error.PeerClosed;
+            },
+            else => {},
+        };
+    }
+
+    /// Hands every newly complete message to `message`, advancing the stream's
+    /// read watermark by whole messages so the next pass starts on a boundary.
+    fn drain(self: *Handshaker, stream: *const handshake.Reassembler, read: *usize) Error!void {
+        var it = handshake.MessageIterator.init(stream.contiguous()[read.*..]);
+        while (it.next()) |msg| {
+            // Consumed before dispatch: `message` hashes into the transcript
+            // before it can fail, so a retry would hash it twice.
+            read.* += msg.raw.len;
+            try self.message(msg);
+        }
+    }
+
+    fn message(self: *Handshaker, msg: handshake.Message) Error!void {
+        switch (msg.type) {
+            .server_hello => {
+                if (self.phase != .wait_server_hello) return error.UnexpectedMessage;
+                const sh = try handshake.parseServerHello(msg.raw);
+                if (sh.isHelloRetryRequest()) return error.HelloRetryRequest;
+                if (sh.cipher_suite != cipher_suite) return error.UnsupportedCipherSuite;
+
+                const ks = (try sh.keyShare()) orelse return error.Malformed;
+                if (ks.group != .x25519 or ks.key.len != 32) return error.UnsupportedGroup;
+
+                // The handshake traffic secrets take the transcript through
+                // ServerHello inclusive, so hash before deriving.
+                self.transcript.update(msg.raw);
+                const shared = tls.x25519(self.secret, ks.key[0..32].*) catch
+                    return error.UnsupportedGroup;
+                const secret = tls.handshakeSecret(tls.earlySecret(), &shared);
+                const hs = tls.handshakeTraffic(secret, self.transcript.hash());
+
+                self.accepted.cipher_suite = sh.cipher_suite;
+                self.accepted.handshake = hs;
+                self.derived = .{ .secret = secret, .keys = crypto.keysFromSecret(hs.server) };
+                self.phase = .wait_encrypted_extensions;
+            },
+            .encrypted_extensions => {
+                if (self.phase != .wait_encrypted_extensions) return error.UnexpectedMessage;
+                self.transcript.update(msg.raw);
+                try self.encryptedExtensions(msg.body);
+                self.phase = .wait_certificate_or_request;
+            },
+            .certificate_request => {
+                if (self.phase != .wait_certificate_or_request) return error.UnexpectedMessage;
+                var r = codec.Reader{ .buf = msg.body };
+                const ctx = try r.take(try r.readU8());
+                if (ctx.len > self.request_buf.len) return error.BufferTooSmall;
+                @memcpy(self.request_buf[0..ctx.len], ctx);
+                self.request_len = ctx.len;
+                self.requested = true;
+                self.transcript.update(msg.raw);
+                self.phase = .wait_certificate;
+            },
+            .certificate => {
+                switch (self.phase) {
+                    .wait_certificate_or_request, .wait_certificate => {},
+                    else => return error.UnexpectedMessage,
+                }
+                self.transcript.update(msg.raw);
+                self.accepted.peer_key = try handshake.rawPublicKey(msg.body);
+                self.phase = .wait_certificate_verify;
+            },
+            .certificate_verify => {
+                if (self.phase != .wait_certificate_verify) return error.UnexpectedMessage;
+                try self.certificateVerify(msg.body);
+                self.transcript.update(msg.raw);
+                self.phase = .wait_finished;
+            },
+            .new_session_ticket => {
+                // Post-handshake, so outside the transcript entirely.
+                if (self.phase != .connected) return error.UnexpectedMessage;
+            },
+            .finished => {
+                if (self.phase != .wait_finished) return error.UnexpectedMessage;
+                // Reaching 1-RTT with an unauthenticated peer must not be
+                // possible: the key in the certificate has to have signed the
+                // transcript.
+                if (!self.accepted.peer_verified) return error.BadCertificateVerify;
+                const d = self.derived orelse return error.Malformed;
+                const hs = self.accepted.handshake orelse return error.Malformed;
+                const expect = tls.verifyData(hs.server, self.transcript.hash());
+                if (msg.body.len != expect.len) return error.BadFinished;
+                if (!std.crypto.timing_safe.eql([32]u8, expect, msg.body[0..32].*)) {
+                    return error.BadFinished;
+                }
+                // The application traffic secrets take the transcript through
+                // this message, so hash it once it is trusted.
+                self.transcript.update(msg.raw);
+                const app = tls.applicationTraffic(
+                    tls.masterSecret(d.secret),
+                    self.transcript.hash(),
+                );
+                self.accepted.application = app;
+                self.app_keys = .{
+                    .send = crypto.keysFromSecret(app.client),
+                    .recv = crypto.keysFromSecret(app.server),
+                };
+                self.phase = .connected;
+            },
+            else => return error.UnexpectedMessage,
+        }
+    }
+
+    /// Our half of mutual authentication, as one CRYPTO stream: Certificate and
+    /// CertificateVerify when the server asked for them, then Finished. Each
+    /// message is hashed as it is written, since the two that sign the
+    /// transcript cover everything before themselves.
+    ///
+    /// Advances the transcript, so it can only be called once.
+    /// Source: RFC 8446 s4.4.
+    pub fn writeFlight(self: *Handshaker, out: []u8, key: Ed25519.KeyPair) Error![]const u8 {
+        if (!self.done()) return error.HandshakeIncomplete;
+        // The transcript advances past the flight, so a second call would sign
+        // and MAC over the wrong prefix. Retransmission resends these bytes.
+        if (self.flight_sent) return error.FlightAlreadySent;
+        self.flight_sent = true;
+        const hs = self.accepted.handshake orelse return error.HandshakeIncomplete;
+
+        var w = std.Io.Writer.fixed(out);
+        if (self.requested) {
+            const cert_at = w.buffered().len;
+            handshake.writeRawPublicKeyCertificate(
+                &w,
+                self.request_buf[0..self.request_len],
+                key.public_key.toBytes(),
+            ) catch return error.BufferTooSmall;
+            self.transcript.update(w.buffered()[cert_at..]);
+
+            var content: [handshake.max_verify_content]u8 = undefined;
+            const signed = try handshake.verifyContent(
+                &content,
+                handshake.client_verify_context,
+                self.transcript.hash(),
+            );
+            const sig = (key.sign(signed, null) catch return error.BadCertificateVerify).toBytes();
+
+            const cv_at = w.buffered().len;
+            handshake.writeCertificateVerify(
+                &w,
+                @backingInt(SignatureScheme.ed25519),
+                &sig,
+            ) catch return error.BufferTooSmall;
+            self.transcript.update(w.buffered()[cv_at..]);
+        }
+
+        const vd = tls.verifyData(hs.client, self.transcript.hash());
+        const fin_at = w.buffered().len;
+        handshake.writeMessage(&w, .finished, &vd) catch return error.BufferTooSmall;
+        self.transcript.update(w.buffered()[fin_at..]);
+
+        return w.buffered();
+    }
+
+    /// `writeFlight` sealed into a Handshake packet, addressed to the id the
+    /// server gave us.
+    pub fn sealFlight(
+        self: *Handshaker,
+        out: []u8,
+        our_scid: []const u8,
+        pn: u64,
+        key: Ed25519.KeyPair,
+    ) Error!usize {
+        var messages: [1024]u8 = undefined;
+        const stream = try self.writeFlight(&messages, key);
+        const hs = self.accepted.handshake orelse return error.HandshakeIncomplete;
+
+        var frame_buf: [1200]u8 = undefined;
+        var fw = std.Io.Writer.fixed(&frame_buf);
+        writeCryptoFrame(&fw, 0, stream) catch return error.BufferTooSmall;
+
+        return packet.seal(out, .{
+            .kind = .handshake,
+            .dcid = self.accepted.scid(),
+            .scid = our_scid,
+            .pn = pn,
+            .pn_len = 4,
+        }, fw.buffered(), crypto.keysFromSecret(hs.client));
+    }
+
+    /// Checks the peer's signature over the transcript through Certificate.
+    /// Only the raw public key profile is verifiable: an X.509 chain signs with
+    /// ECDSA or RSA, neither of which radish has.
+    fn certificateVerify(self: *Handshaker, body: []const u8) Error!void {
+        const cv = try handshake.parseCertificateVerify(body);
+        if (cv.algorithm != @backingInt(SignatureScheme.ed25519)) return error.UnsupportedSignature;
+        if (cv.signature.len != Ed25519.Signature.encoded_length) return error.BadCertificateVerify;
+        const key = self.accepted.peer_key orelse return error.Malformed;
+
+        var content: [handshake.max_verify_content]u8 = undefined;
+        const signed = try handshake.verifyContent(
+            &content,
+            handshake.server_verify_context,
+            self.transcript.hash(),
+        );
+
+        const pk = Ed25519.PublicKey.fromBytes(key) catch return error.BadCertificateVerify;
+        const sig = Ed25519.Signature.fromBytes(cv.signature[0..Ed25519.Signature.encoded_length].*);
+        sig.verify(signed, pk) catch return error.BadCertificateVerify;
+        self.accepted.peer_verified = true;
+    }
+
+    fn encryptedExtensions(self: *Handshaker, body: []const u8) Error!void {
+        var r = codec.Reader{ .buf = body };
+        var it = handshake.ExtensionIterator.init(try r.take(try r.readU16()));
+        while (try it.next()) |e| switch (e.type) {
+            .server_certificate_type => {
+                if (e.body.len != 1) return error.Malformed;
+                // The server must select from the list the client offered, and
+                // raw_public_key is the only entry.
+                // Source: RFC 7250 s4.1.
+                if (e.body[0] != raw_public_key) return error.UnsupportedCertificateType;
+                self.negotiated_raw_key = true;
+            },
+            .application_layer_protocol_negotiation => {
+                var ar = codec.Reader{ .buf = e.body };
+                _ = try ar.readU16(); // list length
+                const name = try ar.take(try ar.readU8());
+                if (name.len > self.accepted.alpn_buf.len) return error.BufferTooSmall;
+                @memcpy(self.accepted.alpn_buf[0..name.len], name);
+                self.accepted.alpn_len = name.len;
+            },
+            else => {},
+        };
+
+        // A server that cannot do raw public keys either omits the extension or
+        // sends an unsupported_certificate alert. Both end the connection here,
+        // since the alternative is an unauthenticated peer.
+        // Source: RFC 7250 s4.2.
+        if (!self.negotiated_raw_key) return error.UnsupportedCertificateType;
+    }
+};
+
 
 const testing = std.testing;
 const testdata = @import("testdata.zig");
 const hex = testdata.hex;
 
-/// Rebuilds the ClientHello the probe sent, which is deterministic given the
-/// fixed key, random and connection id.
-fn recordedClientHello(datagram: []u8, hello_buf: []u8) ![]const u8 {
-    const dcid = hex(testdata.live_dcid);
-    const kp = try std.crypto.dh.X25519.KeyPair.generateDeterministic(hex(testdata.fixed_x25519_secret));
-    const initial = try initialDatagram(datagram, hello_buf, .{
+// The wiring end to end: one datagram carrying an Initial and a Handshake
+// packet, with the Handshake CRYPTO stream split in two and the tail arriving
+// first. The server side is built here, so this pins the plumbing rather than
+// another implementation.
+test "walks a coalesced flight and reads a raw public key certificate" {
+    const dcid = hex(testdata.other_dcid);
+    const server_scid = hex("aabbccdd");
+    const secret = hex(testdata.fixed_x25519_secret);
+
+    var mine: [1500]u8 = undefined;
+    var hello_buf: [max_client_hello]u8 = undefined;
+    const kp = try std.crypto.dh.X25519.KeyPair.generateDeterministic(secret);
+    const initial = try initialDatagram(&mine, &hello_buf, .{
         .dcid = &dcid,
         .scid = &dcid,
         .random = hex(testdata.fixed_hello_random),
         .public_key = kp.public_key,
-        .alpn = testdata.live_alpn,
-        .server_name = testdata.live_sni,
+        .alpn = "radicle/2",
     });
-    return initial.client_hello;
-}
 
-// A reply captured from a live server, replayed offline. Unlike the RFC
-// vectors this pins radish against another implementation's actual output.
-test "replays a recorded cloudflare handshake" {
-    var mine: [1500]u8 = undefined;
-    var hello_buf: [max_client_hello]u8 = undefined;
-    const client_hello = try recordedClientHello(&mine, &hello_buf);
+    // RFC 8448's ServerHello: its key share pairs with fixed_x25519_secret, so
+    // the schedule below actually runs.
+    var sh: [90]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&sh, testdata.rfc8448_server_hello_hex);
 
-    var reply: [1200]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&reply, testdata.live_server_initial_hex);
+    // The keys the server would use, derived the same way the Handshaker will.
+    var t: handshake.Transcript = .{};
+    t.update(initial.client_hello);
+    t.update(&sh);
+    const share = (try (try handshake.parseServerHello(&sh)).keyShare()).?.key;
+    const shared = try tls.x25519(secret, share[0..32].*);
+    const hs = tls.handshakeTraffic(tls.handshakeSecret(tls.earlySecret(), &shared), t.hash());
 
-    var plain: [1500]u8 = undefined;
-    var closed: frame.ConnectionClose = undefined;
-    const a = try acceptServerInitial(
-        &plain,
-        &reply,
-        &hex(testdata.live_dcid),
-        client_hello,
-        hex(testdata.fixed_x25519_secret),
-        &closed,
-    );
+    // EncryptedExtensions announcing raw public keys and the ALPN, then a
+    // Certificate holding one ed25519 SubjectPublicKeyInfo, then Finished.
+    // A real key from a fixed seed, so CertificateVerify can sign against it
+    // once that lands.
+    const server_key = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(7));
+    const peer_key = server_key.public_key.toBytes();
+    // Hashed one message at a time: CertificateVerify and Finished each cover
+    // the transcript up to but not including themselves.
+    var stream: [1024]u8 = undefined;
+    var stw = std.Io.Writer.fixed(&stream);
+    var st: handshake.Transcript = .{};
+    st.update(initial.client_hello);
+    st.update(&sh);
 
+    {
+        var ext: [64]u8 = undefined;
+        var ew = std.Io.Writer.fixed(&ext);
+        try handshake.writeExtension(&ew, @backingInt(ExtensionType.server_certificate_type), &.{raw_public_key});
+        try handshake.writeExtension(&ew, @backingInt(ExtensionType.application_layer_protocol_negotiation), &.{ 0, 10, 9, 'r', 'a', 'd', 'i', 'c', 'l', 'e', '/', '2' });
+
+        var body: [128]u8 = undefined;
+        var bw = std.Io.Writer.fixed(&body);
+        try bw.writeInt(u16, @intCast(ew.buffered().len), .big);
+        try bw.writeAll(ew.buffered());
+
+        const at = stw.buffered().len;
+        try handshake.writeMessage(&stw, .encrypted_extensions, bw.buffered());
+        st.update(stw.buffered()[at..]);
+    }
+    {
+        // Asking for a client certificate, so the mTLS path is exercised.
+        var body: [8]u8 = undefined;
+        var bw = std.Io.Writer.fixed(&body);
+        try bw.writeInt(u8, 0, .big); // certificate_request_context
+        try bw.writeInt(u16, 0, .big); // extensions
+
+        const at = stw.buffered().len;
+        try handshake.writeMessage(&stw, .certificate_request, bw.buffered());
+        st.update(stw.buffered()[at..]);
+    }
+    {
+        const at = stw.buffered().len;
+        try handshake.writeRawPublicKeyCertificate(&stw, &.{}, peer_key);
+        st.update(stw.buffered()[at..]);
+    }
+    {
+        var content: [handshake.max_verify_content]u8 = undefined;
+        const signed = try handshake.verifyContent(&content, handshake.server_verify_context, st.hash());
+        const sig = (try server_key.sign(signed, null)).toBytes();
+
+        const at = stw.buffered().len;
+        try handshake.writeCertificateVerify(&stw, @backingInt(SignatureScheme.ed25519), &sig);
+        st.update(stw.buffered()[at..]);
+    }
+    {
+        const vd = tls.verifyData(hs.server, st.hash());
+        const at = stw.buffered().len;
+        try handshake.writeMessage(&stw, .finished, &vd);
+        st.update(stw.buffered()[at..]);
+    }
+    const messages = stw.buffered();
+
+    var buf: [2048]u8 = undefined;
+    var used: usize = 0;
+    {
+        var fw = std.Io.Writer.fixed(buf[0..]);
+        try writeCryptoFrame(&fw, 0, &sh);
+        var pkt: [512]u8 = undefined;
+        const n = try packet.seal(&pkt, .{
+            .kind = .initial,
+            .dcid = &dcid,
+            .scid = &server_scid,
+            .pn = 0,
+            .pn_len = 4,
+        }, fw.buffered(), crypto.keysFromSecret(crypto.initialSecrets(&dcid).server));
+        @memcpy(buf[used..][0..n], pkt[0..n]);
+        used += n;
+    }
+    {
+        // Tail first, so `contiguous` yields nothing until the head lands.
+        const split = 20;
+        var frames_buf: [1024]u8 = undefined;
+        var fw = std.Io.Writer.fixed(&frames_buf);
+        try writeCryptoFrame(&fw, split, messages[split..]);
+        try writeCryptoFrame(&fw, 0, messages[0..split]);
+
+        var pkt: [1024]u8 = undefined;
+        const n = try packet.seal(&pkt, .{
+            .kind = .handshake,
+            .dcid = &dcid,
+            .scid = &server_scid,
+            .pn = 0,
+            .pn_len = 4,
+        }, fw.buffered(), crypto.keysFromSecret(hs.server));
+        @memcpy(buf[used..][0..n], pkt[0..n]);
+        used += n;
+    }
+
+    var plain: [2048]u8 = undefined;
+    var initial_crypto: [4096]u8 = undefined;
+    var handshake_crypto: [4096]u8 = undefined;
+    var h = Handshaker.init(.{
+        .original_dcid = &dcid,
+        .our_scid = &dcid,
+        .client_hello = initial.client_hello,
+        .secret = secret,
+        .initial_buf = &initial_crypto,
+        .handshake_buf = &handshake_crypto,
+    });
+    try h.push(&plain, buf[0..used]);
+
+    const a = h.accepted;
     try testing.expectEqual(cipher_suite, a.cipher_suite);
-    try testing.expectEqualSlices(u8, &hex(testdata.live_scid), a.scid());
-    try testing.expectEqualSlices(u8, &hex(testdata.live_client_hs_secret), &a.handshake.client);
-    try testing.expectEqualSlices(u8, &hex(testdata.live_server_hs_secret), &a.handshake.server);
+    try testing.expectEqualSlices(u8, &server_scid, a.scid());
+    try testing.expectEqualSlices(u8, &hs.server, &a.handshake.?.server);
+    try testing.expect(h.negotiated_raw_key);
+    try testing.expectEqualSlices(u8, &peer_key, &a.peer_key.?);
+    try testing.expectEqualStrings("radicle/2", a.alpn());
+    try testing.expect(a.peer_verified);
+    try testing.expect(h.done());
+    try testing.expect(a.application != null);
+
+    // Our half of mutual authentication, checked the way the server would:
+    // Certificate echoing the request context, CertificateVerify over the
+    // transcript through it, then Finished under the client secret.
+    const our_key = try Ed25519.KeyPair.generateDeterministic(@splat(9));
+    var flight: [1024]u8 = undefined;
+    const sent = try h.sealFlight(&flight, &dcid, 0, our_key);
+
+    var mirror: handshake.Transcript = .{};
+    mirror.update(initial.client_hello);
+    mirror.update(&sh);
+    mirror.update(messages);
+
+    var opened_buf: [1024]u8 = undefined;
+    var copy: [1024]u8 = undefined;
+    @memcpy(copy[0..sent], flight[0..sent]);
+    const ours = try packet.open(&opened_buf, copy[0..sent], crypto.keysFromSecret(hs.client), null);
+
+    var fit = frame.Iterator.init(ours.payload);
+    const ours_crypto = (try fit.next()).?.crypto;
+    try testing.expectEqual(@as(u64, 0), ours_crypto.offset);
+
+    var mit = handshake.MessageIterator.init(ours_crypto.data);
+    const cert = mit.next().?;
+    try testing.expectEqual(std.crypto.tls.HandshakeType.certificate, cert.type);
+    try testing.expectEqualSlices(u8, &our_key.public_key.toBytes(), &try handshake.rawPublicKey(cert.body));
+    mirror.update(cert.raw);
+
+    const cv = mit.next().?;
+    try testing.expectEqual(std.crypto.tls.HandshakeType.certificate_verify, cv.type);
+    {
+        const parsed = try handshake.parseCertificateVerify(cv.body);
+        try testing.expectEqual(@as(u16, @backingInt(SignatureScheme.ed25519)), parsed.algorithm);
+        var content: [handshake.max_verify_content]u8 = undefined;
+        const signed = try handshake.verifyContent(&content, handshake.client_verify_context, mirror.hash());
+        const sig = Ed25519.Signature.fromBytes(parsed.signature[0..64].*);
+        try sig.verify(signed, our_key.public_key);
+    }
+    mirror.update(cv.raw);
+
+    const fin = mit.next().?;
+    try testing.expectEqual(std.crypto.tls.HandshakeType.finished, fin.type);
+    try testing.expectEqualSlices(u8, &tls.verifyData(hs.client, mirror.hash()), fin.body);
+    try testing.expectEqual(@as(?handshake.Message, null), mit.next());
+
+    // The server's 1-RTT reply: HANDSHAKE_DONE confirming our flight, and a
+    // PATH_CHALLENGE we owe an answer to. Sent to the id we chose for ourselves,
+    // whose length is all a short header gives the receiver.
+    const app = a.application.?;
+    var one_rtt: [256]u8 = undefined;
+    var ow = std.Io.Writer.fixed(&one_rtt);
+    try codec.writeVarint(&ow, @backingInt(frame.Type.handshake_done));
+    try codec.writeVarint(&ow, @backingInt(frame.Type.path_challenge));
+    try ow.writeAll(&[_]u8{ 9, 9, 9, 9, 9, 9, 9, 9 });
+
+    var sealed: [512]u8 = undefined;
+    const m = try packet.sealShort(&sealed, .{
+        .dcid = &dcid,
+        .pn = 0,
+        .pn_len = 4,
+    }, ow.buffered(), crypto.keysFromSecret(app.server));
+
+    try h.push(&plain, sealed[0..m]);
+    try testing.expect(h.confirmed);
+    try testing.expectEqualSlices(u8, &.{ 9, 9, 9, 9, 9, 9, 9, 9 }, &h.path_challenge.?);
+
+    // Echoed back under our own application key, and the debt cleared.
+    var response: [256]u8 = undefined;
+    const r = (try h.sealPathResponse(&response, 1)).?;
+    var rcopy: [256]u8 = undefined;
+    @memcpy(rcopy[0..r], response[0..r]);
+    const echoed = try packet.openShort(&opened_buf, rcopy[0..r], server_scid.len, crypto.keysFromSecret(app.client), null);
+
+    var rit = frame.Iterator.init(echoed.payload);
+    try testing.expectEqualSlices(u8, &.{ 9, 9, 9, 9, 9, 9, 9, 9 }, &(try rit.next()).?.path_response);
+    try testing.expectEqual(@as(?[8]u8, null), h.path_challenge);
+    try testing.expectEqual(@as(?usize, null), try h.sealPathResponse(&response, 2));
 }
 
 test "builds an Initial datagram we can open again" {
@@ -324,6 +959,13 @@ test "builds an Initial datagram we can open again" {
     try testing.expect(try ch.find(.application_layer_protocol_negotiation) != null);
     try testing.expect(try ch.find(.key_share) != null);
 
+    // What iroh requires: raw public keys in both directions, ed25519 alone,
+    // and no SNI unless one was asked for.
+    try testing.expectEqualSlices(u8, &certificate_types, (try ch.find(.client_certificate_type)).?);
+    try testing.expectEqualSlices(u8, &certificate_types, (try ch.find(.server_certificate_type)).?);
+    try testing.expectEqualSlices(u8, &signature_algorithms, (try ch.find(.signature_algorithms)).?);
+    try testing.expectEqual(@as(?[]const u8, null), try ch.find(.server_name));
+
     const params = (try ch.find(.quic_transport_parameters)).?;
     var pit = handshake.TransportParamIterator.init(params);
     var saw_scid = false;
@@ -335,3 +977,79 @@ test "builds an Initial datagram we can open again" {
     }
     try testing.expect(saw_scid);
 }
+
+// A packet radish cannot decrypt yet must not read as an empty success, or a
+// rejection is indistinguishable from silence.
+test "packets that cannot be opened are reported" {
+    const dcid = hex(testdata.other_dcid);
+    var initial_crypto: [1024]u8 = undefined;
+    var handshake_crypto: [1024]u8 = undefined;
+    var h = Handshaker.init(.{
+        .original_dcid = &dcid,
+        .our_scid = &dcid,
+        .client_hello = "",
+        .secret = hex(testdata.fixed_x25519_secret),
+        .initial_buf = &initial_crypto,
+        .handshake_buf = &handshake_crypto,
+    });
+
+    var scratch: [512]u8 = undefined;
+    var payload: [32]u8 = @splat(0);
+    payload[0] = 0x01;
+
+    // A Handshake packet before the ServerHello: its keys do not exist yet.
+    var early: [256]u8 = undefined;
+    const n = try packet.seal(&early, .{
+        .kind = .handshake,
+        .dcid = &dcid,
+        .pn = 0,
+        .pn_len = 4,
+    }, &payload, crypto.keysFromSecret(crypto.initialSecrets(&dcid).server));
+    try testing.expectError(error.KeysUnavailable, h.push(&scratch, early[0..n]));
+
+    // A 1-RTT packet, likewise.
+    var short: [256]u8 = undefined;
+    const m = try packet.sealShort(&short, .{
+        .dcid = &dcid,
+        .pn = 0,
+        .pn_len = 4,
+    }, &payload, crypto.keysFromSecret(crypto.initialSecrets(&dcid).server));
+    try testing.expectError(error.KeysUnavailable, h.push(&scratch, short[0..m]));
+
+    // Version Negotiation, which is a rejection rather than a packet to open.
+    var vn = hex("8000000000" ++ "00" ++ "00" ++ "00000001");
+    try testing.expectError(error.VersionNegotiation, h.push(&scratch, &vn));
+}
+
+test "a handshake message out of turn is refused" {
+    const dcid = hex(testdata.other_dcid);
+    var initial_crypto: [1024]u8 = undefined;
+    var handshake_crypto: [1024]u8 = undefined;
+    var h = Handshaker.init(.{
+        .original_dcid = &dcid,
+        .our_scid = &dcid,
+        .client_hello = "",
+        .secret = hex(testdata.fixed_x25519_secret),
+        .initial_buf = &initial_crypto,
+        .handshake_buf = &handshake_crypto,
+    });
+
+    try testing.expectEqual(Handshaker.Phase.wait_server_hello, h.phase);
+
+    var msg: [64]u8 = undefined;
+    var mw = std.Io.Writer.fixed(&msg);
+    try handshake.writeRawPublicKeyCertificate(&mw, &.{}, @splat(1));
+    try testing.expectError(error.UnexpectedMessage, h.message(firstMessage(mw.buffered())));
+
+    // A Finished needs the handshake secret, which no ServerHello has produced.
+    var fin: [64]u8 = undefined;
+    var fw = std.Io.Writer.fixed(&fin);
+    try handshake.writeMessage(&fw, .finished, &@as([32]u8, @splat(0)));
+    try testing.expectError(error.UnexpectedMessage, h.message(firstMessage(fw.buffered())));
+}
+
+fn firstMessage(bytes: []const u8) handshake.Message {
+    var it = handshake.MessageIterator.init(bytes);
+    return it.next().?;
+}
+

@@ -5,23 +5,63 @@
 //! every frame type has a self-describing length, which is also why an unknown
 //! frame type is fatal rather than skippable. Without recognising the type,
 //! there is no way to know how far to skip.
+//!
+//! QUIC v1 assigns 0x00 through 0x1e and nothing beyond, so every layout here
+//! is known and an unknown code means a peer speaking something else.
 const std = @import("std");
 const codec = @import("../codec.zig");
 
 pub const Error = error{ UnsupportedFrame, FrameEncoding } || codec.Error;
 
-/// Frame type codes. Only the ones an Initial packet can carry are handled so
-/// far; the rest arrive with the handshake and the data phase.
+/// Every frame type QUIC v1 defines.
 /// Source: RFC 9000 s19, Table 3.
 pub const Type = enum(u64) {
     padding = 0x00,
     ping = 0x01,
     ack = 0x02,
     ack_ecn = 0x03,
+    reset_stream = 0x04,
+    stop_sending = 0x05,
     crypto = 0x06,
+    new_token = 0x07,
+    /// 0x08 through 0x0f: the low three bits carry the OFF, LEN and FIN flags.
+    stream = 0x08,
+    stream_fin = 0x09,
+    stream_len = 0x0a,
+    stream_len_fin = 0x0b,
+    stream_off = 0x0c,
+    stream_off_fin = 0x0d,
+    stream_off_len = 0x0e,
+    stream_off_len_fin = 0x0f,
+    max_data = 0x10,
+    max_stream_data = 0x11,
+    max_streams_bidi = 0x12,
+    max_streams_uni = 0x13,
+    data_blocked = 0x14,
+    stream_data_blocked = 0x15,
+    streams_blocked_bidi = 0x16,
+    streams_blocked_uni = 0x17,
+    new_connection_id = 0x18,
+    retire_connection_id = 0x19,
+    path_challenge = 0x1a,
+    path_response = 0x1b,
     connection_close = 0x1c,
     connection_close_app = 0x1d,
+    handshake_done = 0x1e,
     _,
+};
+
+/// The low three bits of a STREAM frame type. `off` and `len` say which fields
+/// are present; without `len` the data runs to the end of the packet.
+/// Source: RFC 9000 s19.8.
+pub const StreamFlags = packed struct(u3) {
+    fin: bool,
+    len: bool,
+    off: bool,
+
+    pub fn of(t: Type) StreamFlags {
+        return @bitCast(@as(u3, @truncate(@backingInt(t))));
+    }
 };
 
 /// Why a peer is closing. `frame_type` is absent on an application close.
@@ -31,6 +71,48 @@ pub const ConnectionClose = struct {
     frame_type: ?u64,
     reason: []const u8,
 };
+
+/// Transport error codes. QUIC v1 assigns 0x00 through 0x11, and reserves all
+/// of 0x0100-0x01ff for CRYPTO_ERROR.
+/// Source: RFC 9000 s20.1.
+pub const TransportError = enum(u64) {
+    no_error = 0x00,
+    internal_error = 0x01,
+    connection_refused = 0x02,
+    flow_control_error = 0x03,
+    stream_limit_error = 0x04,
+    stream_state_error = 0x05,
+    final_size_error = 0x06,
+    frame_encoding_error = 0x07,
+    transport_parameter_error = 0x08,
+    connection_id_limit_error = 0x09,
+    protocol_violation = 0x0a,
+    invalid_token = 0x0b,
+    application_error = 0x0c,
+    crypto_buffer_exceeded = 0x0d,
+    key_update_error = 0x0e,
+    aead_limit_reached = 0x0f,
+    no_viable_path = 0x10,
+    version_negotiation_error = 0x11,
+    _,
+};
+
+pub const crypto_error_base = 0x0100;
+
+/// The TLS alert a CRYPTO_ERROR carries, or null for any other code. The alert
+/// is the low byte, so the whole range maps one to one onto TLS's own.
+/// Source: RFC 9000 s20.1, RFC 8446 s6.
+pub fn cryptoAlert(error_code: u64) ?u8 {
+    if (error_code < crypto_error_base or error_code > crypto_error_base + 0xff) return null;
+    return @intCast(error_code - crypto_error_base);
+}
+
+/// A name for `error_code`, or null when it is outside what QUIC v1 assigns.
+/// CRYPTO_ERROR is excluded: `cryptoAlert` carries the detail there.
+pub fn transportErrorName(error_code: u64) ?[]const u8 {
+    if (error_code > 0x11) return null;
+    return @tagName(@as(TransportError, @enumFromInt(error_code)));
+}
 
 pub const Ecn = struct { ect0: u64, ect1: u64, ce: u64 };
 
@@ -95,6 +177,25 @@ pub const Crypto = struct {
     data: []const u8,
 };
 
+/// Application data. `fin` marks the last byte of the stream.
+/// Source: RFC 9000 s19.8.
+pub const Stream = struct {
+    id: u64,
+    offset: u64,
+    data: []const u8,
+    fin: bool,
+};
+
+/// A connection id the peer is offering for future use, with the token that
+/// would let us prove a stateless reset.
+/// Source: RFC 9000 s19.15.
+pub const NewConnectionId = struct {
+    sequence: u64,
+    retire_prior_to: u64,
+    id: []const u8,
+    stateless_reset_token: [16]u8,
+};
+
 pub const Frame = union(enum) {
     /// A run of padding, coalesced. Padding exists to inflate a datagram to
     /// the 1200 bytes an Initial must reach, which is how QUIC refuses to
@@ -104,7 +205,40 @@ pub const Frame = union(enum) {
     ack: Ack,
     crypto: Crypto,
     connection_close: ConnectionClose,
+    stream: Stream,
+    new_connection_id: NewConnectionId,
+    /// Must be echoed back as a PATH_RESPONSE carrying the same eight bytes, or
+    /// the peer concludes the path is unusable.
+    /// Source: RFC 9000 s8.2.
+    path_challenge: [8]u8,
+    path_response: [8]u8,
+    /// The server confirming the handshake is complete.
+    /// Source: RFC 9000 s19.20.
+    handshake_done,
+    /// Parsed so the payload can be walked, but carried no further. Flow
+    /// control and stream resets land here.
+    ignored: Type,
 };
+
+/// Frames whose whole body is varints, and how many. Flow control and stream
+/// resets are consumed so the payload can be walked; radish sends too little to
+/// reach a limit. Null means the type is not a QUIC v1 frame.
+/// Source: RFC 9000 s19.4-19.16.
+fn ignoredVarints(t: Type) ?usize {
+    return switch (t) {
+        .max_data,
+        .max_streams_bidi,
+        .max_streams_uni,
+        .data_blocked,
+        .streams_blocked_bidi,
+        .streams_blocked_uni,
+        .retire_connection_id,
+        => 1,
+        .max_stream_data, .stream_data_blocked, .stop_sending => 2,
+        .reset_stream => 3,
+        else => null,
+    };
+}
 
 /// Iterates the frames in a decrypted payload. Slices borrow from it.
 pub const Iterator = struct {
@@ -168,7 +302,57 @@ pub const Iterator = struct {
                     .reason = try self.r.take(@intCast(len)),
                 } };
             },
-            else => return error.UnsupportedFrame,
+            .stream,
+            .stream_fin,
+            .stream_len,
+            .stream_len_fin,
+            .stream_off,
+            .stream_off_fin,
+            .stream_off_len,
+            .stream_off_len_fin,
+            => |t| {
+                const flags = StreamFlags.of(t);
+                const id = try self.r.varint();
+                const offset = if (flags.off) try self.r.varint() else 0;
+                // Without an explicit length the frame owns the rest of the
+                // packet, which is also why it has to be the last one.
+                const len = if (flags.len)
+                    @as(usize, @intCast(try self.r.varint()))
+                else
+                    self.r.buf.len - self.r.pos;
+                return .{ .stream = .{
+                    .id = id,
+                    .offset = offset,
+                    .data = try self.r.take(len),
+                    .fin = flags.fin,
+                } };
+            },
+            .handshake_done => return .handshake_done,
+            .path_challenge => return .{ .path_challenge = (try self.r.take(8))[0..8].* },
+            .path_response => return .{ .path_response = (try self.r.take(8))[0..8].* },
+            .new_connection_id => {
+                const sequence = try self.r.varint();
+                const retire_prior_to = try self.r.varint();
+                if (retire_prior_to > sequence) return error.FrameEncoding;
+                const id_len = try self.r.readU8();
+                if (id_len == 0 or id_len > 20) return error.FrameEncoding;
+                const id = try self.r.take(id_len);
+                return .{ .new_connection_id = .{
+                    .sequence = sequence,
+                    .retire_prior_to = retire_prior_to,
+                    .id = id,
+                    .stateless_reset_token = (try self.r.take(16))[0..16].*,
+                } };
+            },
+            .new_token => |t| {
+                _ = try self.r.take(@intCast(try self.r.varint()));
+                return .{ .ignored = t };
+            },
+            else => |t| {
+                const n = ignoredVarints(t) orelse return error.UnsupportedFrame;
+                for (0..n) |_| _ = try self.r.varint();
+                return .{ .ignored = t };
+            },
         }
     }
 };
@@ -232,8 +416,79 @@ test "ack ranges that would go negative are rejected" {
     try testing.expectError(error.FrameEncoding, (try it2.next()).?.ack.firstRange());
 }
 
-// Skipping an unknown frame is impossible without knowing its length, so the
-// only safe response is to stop.
+// The flags live in the type code, so the same frame has eight spellings.
+test "parses a STREAM frame with and without its optional fields" {
+    // 0x0f is off|len|fin: id 4, offset 8, length 3.
+    var full = [_]u8{ 0x0f, 0x04, 0x08, 0x03, 0xaa, 0xbb, 0xcc };
+    var it = Iterator.init(&full);
+    const a = (try it.next()).?.stream;
+    try testing.expectEqual(@as(u64, 4), a.id);
+    try testing.expectEqual(@as(u64, 8), a.offset);
+    try testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb, 0xcc }, a.data);
+    try testing.expect(a.fin);
+    try testing.expectEqual(@as(?Frame, null), try it.next());
+
+    // 0x08 is none of them: offset 0, and the data runs to the end.
+    var bare = [_]u8{ 0x08, 0x04, 0xaa, 0xbb };
+    var it2 = Iterator.init(&bare);
+    const b = (try it2.next()).?.stream;
+    try testing.expectEqual(@as(u64, 0), b.offset);
+    try testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb }, b.data);
+    try testing.expect(!b.fin);
+    try testing.expectEqual(@as(?Frame, null), try it2.next());
+}
+
+test "parses the 1-RTT frames radish acts on" {
+    var payload = [_]u8{0x1e} ++ // HANDSHAKE_DONE
+        [_]u8{0x1a} ++ [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 } ++ // PATH_CHALLENGE
+        [_]u8{0x1b} ++ [_]u8{ 8, 7, 6, 5, 4, 3, 2, 1 }; // PATH_RESPONSE
+    var it = Iterator.init(&payload);
+
+    try testing.expectEqual(Frame.handshake_done, (try it.next()).?);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &(try it.next()).?.path_challenge);
+    try testing.expectEqualSlices(u8, &.{ 8, 7, 6, 5, 4, 3, 2, 1 }, &(try it.next()).?.path_response);
+    try testing.expectEqual(@as(?Frame, null), try it.next());
+}
+
+test "parses NEW_CONNECTION_ID and rejects a retire past its sequence" {
+    // type, sequence, retire_prior_to, id length, the id, then a 16-byte token.
+    var payload: [24]u8 = @splat(0x11);
+    @memcpy(payload[0..8], &[_]u8{ 0x18, 0x02, 0x01, 0x04, 0xaa, 0xbb, 0xcc, 0xdd });
+    var it = Iterator.init(&payload);
+    const n = (try it.next()).?.new_connection_id;
+    try testing.expectEqual(@as(u64, 2), n.sequence);
+    try testing.expectEqual(@as(u64, 1), n.retire_prior_to);
+    try testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb, 0xcc, 0xdd }, n.id);
+    try testing.expectEqualSlices(u8, &@as([16]u8, @splat(0x11)), &n.stateless_reset_token);
+    try testing.expectEqual(@as(?Frame, null), try it.next());
+
+    // Retiring more than has been issued.
+    var bad: [20]u8 = @splat(0);
+    @memcpy(bad[0..4], &[_]u8{ 0x18, 0x01, 0x02, 0x00 });
+    var it2 = Iterator.init(&bad);
+    try testing.expectError(error.FrameEncoding, it2.next());
+}
+
+// Consumed by shape so the walk reaches the frames that matter.
+test "flow control frames are consumed and reported as ignored" {
+    var payload = [_]u8{
+        0x10, 0x44, 0x00, // MAX_DATA, a two-byte varint
+        0x11, 0x04, 0x20, // MAX_STREAM_DATA, two varints
+        0x04, 0x04, 0x01, 0x08, // RESET_STREAM, three varints
+        0x07, 0x02, 0xaa, 0xbb, // NEW_TOKEN, a length-prefixed blob
+        0x01, // PING, to prove the walk arrived
+    };
+    var it = Iterator.init(&payload);
+    try testing.expectEqual(Type.max_data, (try it.next()).?.ignored);
+    try testing.expectEqual(Type.max_stream_data, (try it.next()).?.ignored);
+    try testing.expectEqual(Type.reset_stream, (try it.next()).?.ignored);
+    try testing.expectEqual(Type.new_token, (try it.next()).?.ignored);
+    try testing.expectEqual(Frame.ping, (try it.next()).?);
+    try testing.expectEqual(@as(?Frame, null), try it.next());
+}
+
+// QUIC v1 stops at 0x1e, so anything above it is another protocol's frame and
+// skipping is impossible without knowing its length.
 test "an unknown frame type is fatal" {
     var payload = [_]u8{0x1f};
     var it = Iterator.init(&payload);

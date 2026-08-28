@@ -422,7 +422,9 @@ test "identityRoot rejects a remote that publishes an unsigned refs/rad/root" {
 
     var repo = try storage.Repository.open(testing.io, alloc, bare);
     defer repo.deinit();
-    try testing.expectError(error.IdRootUnsigned, repo.identityRootOid(alloc));
+    // SigrefsMissing rather than IdRootUnsigned: the attacker published a root
+    // with no sigrefs at all, and saying which is missing is the diagnosis.
+    try testing.expectError(error.SigrefsMissing, repo.identityRootOid(alloc));
 }
 
 // The full substitution: attacker namespace carries the victim's real root, so
@@ -445,7 +447,7 @@ test "checkRepoId rejects a root published only by an unsigned remote" {
 
     // The RID would have matched; the unsigned root is what stops the clone.
     const want = try rid.RepoId.fromDoc(victim_doc);
-    try testing.expectError(error.IdRootUnsigned, repo.checkRepoId(alloc, want));
+    try testing.expectError(error.SigrefsMissing, repo.checkRepoId(alloc, want));
 }
 
 // Signature verification alone is not enough: an attacker signs their own

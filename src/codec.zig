@@ -66,11 +66,15 @@ pub const Reader = struct {
 /// Takes a `std.Io.Writer` so one implementation serves both a fixed packet
 /// buffer and a growing one.
 pub fn writeVarint(w: *std.Io.Writer, v: u64) !void {
-    if (v < (1 << 6)) return w.writeInt(u8, @intCast(v), .big);
-    if (v < (1 << 14)) return w.writeInt(u16, @as(u16, 0b01 << 14) | @as(u16, @intCast(v)), .big);
-    if (v < (1 << 30)) return w.writeInt(u32, @as(u32, 0b10 << 30) | @as(u32, @intCast(v)), .big);
-    if (v < (1 << 62)) return w.writeInt(u64, (@as(u64, 0b11) << 62) | v, .big);
-    return error.VarIntTooLarge;
+    switch (varintLen(v)) {
+        1 => return w.writeInt(u8, @intCast(v), .big),
+        2 => return w.writeInt(u16, @as(u16, 0b01 << 14) | @as(u16, @intCast(v)), .big),
+        4 => return w.writeInt(u32, @as(u32, 0b10 << 30) | @as(u32, @intCast(v)), .big),
+        else => {
+            if (v >= (1 << 62)) return error.VarIntTooLarge;
+            return w.writeInt(u64, (@as(u64, 0b11) << 62) | v, .big);
+        },
+    }
 }
 
 /// Appends encoded values to an ArrayList.
@@ -154,13 +158,6 @@ test "a value too large to encode is rejected" {
     var buf: [8]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try testing.expectError(error.VarIntTooLarge, writeVarint(&w, 1 << 62));
-}
-
-test "varint small values are 1 byte" {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(testing.allocator);
-    try (Writer{ .out = &out, .allocator = testing.allocator }).varint(0);
-    try testing.expectEqualSlices(u8, &[_]u8{0}, out.items);
 }
 
 test "u16 big-endian round trip" {

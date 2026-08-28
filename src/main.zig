@@ -116,7 +116,10 @@ fn usage() void {
         \\                                                          locating a seed over gossip
         \\  radish serve       <port> [sessions]                    answer inbound connections
         \\  radish quic-probe  <host> <port> [alpn] [sni]           send a QUIC Initial, read the
-        \\                                                          ServerHello (default alpn h3)
+        \\                                                          reply (default alpn h3). Only
+        \\                                                          raw public keys are offered, so
+        \\                                                          a public server closes on the
+        \\                                                          certificate
         \\
     , .{});
 }
@@ -422,14 +425,33 @@ fn quicProbe(init: std.process.Init, host: []const u8, port: u16, alpn: []const 
     if (r.accepted) |a| {
         std.debug.print("cipher suite 0x{x:0>4}\n", .{a.cipher_suite});
         std.debug.print("server connection id: {x}\n", .{a.scid()});
-        std.debug.print("client handshake secret: {x}\n", .{a.handshake.client});
-        std.debug.print("server handshake secret: {x}\n", .{a.handshake.server});
-    } else if (r.closed) |c| {
-        std.debug.print("peer closed: error 0x{x} frame {?d}\n  reason: {s}\n", .{
-            c.error_code, c.frame_type, c.reason,
-        });
-    } else if (r.err) |e| {
-        std.debug.print("could not read the reply: {s}\n", .{@errorName(e)});
+        if (a.handshake) |h| {
+            std.debug.print("client handshake secret: {x}\n", .{h.client});
+            std.debug.print("server handshake secret: {x}\n", .{h.server});
+        }
+        if (a.alpn_len > 0) std.debug.print("alpn: {s}\n", .{a.alpn()});
+        if (a.peer_key) |k| std.debug.print("peer public key: {x}\n", .{k});
+    }
+    // Not an else: a server commonly answers the ServerHello and then closes,
+    // which yields secrets and a reason both worth printing.
+    if (r.closed) |c| {
+        std.debug.print("peer closed: 0x{x}", .{c.error_code});
+        if (radish.quic.frame.cryptoAlert(c.error_code)) |alert| {
+            // A CRYPTO_ERROR carries the TLS alert in its low byte, which is
+            // the part that says what the peer objected to.
+            std.debug.print(" CRYPTO_ERROR, TLS alert {d}", .{alert});
+            if (std.enums.tagName(std.crypto.tls.Alert.Description, @enumFromInt(alert))) |name| {
+                std.debug.print(" ({s})", .{name});
+            }
+        } else if (radish.quic.frame.transportErrorName(c.error_code)) |name| {
+            std.debug.print(" {s}", .{name});
+        }
+        if (c.frame_type) |t| std.debug.print(", triggered by frame 0x{x}", .{t});
+        std.debug.print("\n", .{});
+        if (c.reason_len > 0) std.debug.print("  reason: {s}\n", .{c.reason()});
+    }
+    if (r.err) |e| {
+        std.debug.print("could not complete the handshake: {s}\n", .{@errorName(e)});
     }
     std.debug.print("\nreply datagram ({d} bytes):\n{x}\n", .{ r.reply.len, r.reply });
 }

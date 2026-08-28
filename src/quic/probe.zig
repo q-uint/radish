@@ -1,5 +1,9 @@
 //! One live QUIC first flight: send an Initial, read the reply, derive
 //! handshake secrets. Used by `radish quic-probe`, not by the test suite.
+//!
+//! Only raw public keys are offered, so a public server answers with a
+//! CRYPTO_ERROR rather than completing. Reaching that point still exercises the
+//! socket, the Initial, and decrypting the reply; completing needs an iroh peer.
 const std = @import("std");
 
 const dial = @import("../net/dial.zig");
@@ -18,7 +22,7 @@ pub const Result = struct {
     reply: []const u8,
     accepted: ?client.Accepted,
     err: ?anyerror,
-    closed: ?frame.ConnectionClose,
+    closed: ?client.Close,
 };
 
 pub const Options = struct {
@@ -72,41 +76,39 @@ pub fn run(
         .clock = .awake,
     } }) catch return error.NoReply;
 
-    // A server's first flight can span datagrams: the first is often an
-    // ACK-only Initial, with the ServerHello in a later one.
+    // A server's first flight spans datagrams, so the handshake accumulates
+    // across them.
+    var initial_crypto: [4096]u8 = undefined;
+    var handshake_crypto: [16384]u8 = undefined;
+    var hs = client.Handshaker.init(.{
+        .original_dcid = opts.dcid,
+        .our_scid = opts.dcid,
+        .client_hello = initial.client_hello,
+        .secret = opts.secret,
+        .initial_buf = &initial_crypto,
+        .handshake_buf = &handshake_crypto,
+    });
+
     var work: [2048]u8 = undefined;
     var received = msg.data.len;
     var datagrams: usize = 1;
     var current = msg.data;
-    var last_err: anyerror = error.NoReply;
-    var closed: frame.ConnectionClose = .{ .error_code = 0, .frame_type = null, .reason = "" };
+    var last_err: ?anyerror = null;
 
     while (true) {
         if (current.len > work.len) {
             last_err = error.ReplyTooLarge;
         } else {
             @memcpy(work[0..current.len], current);
-            if (client.acceptServerInitial(
-                plain_buf,
-                work[0..current.len],
-                opts.dcid,
-                initial.client_hello,
-                opts.secret,
-                &closed,
-            )) |accepted| {
-                return .{
-                    .sent = sent,
-                    .received = received,
-                    .datagrams = datagrams,
-                    .reply = current,
-                    .accepted = accepted,
-                    .err = null,
-                    .closed = null,
-                };
-            } else |e| last_err = e;
+            hs.push(plain_buf, work[0..current.len]) catch |e| {
+                last_err = e;
+                // A close is the end of the connection, so reading on would
+                // only overwrite the reason with the next datagram.
+                if (e == error.PeerClosed) break;
+            };
         }
 
-        if (datagrams >= opts.max_datagrams) break;
+        if (hs.done() or datagrams >= opts.max_datagrams) break;
         const next = sock.receiveTimeout(io, reply_buf, .{ .duration = .{
             .raw = .fromNanoseconds(@intCast(opts.timeout_ms * std.time.ns_per_ms)),
             .clock = .awake,
@@ -121,8 +123,11 @@ pub fn run(
         .received = received,
         .datagrams = datagrams,
         .reply = current,
-        .accepted = null,
+        // Partial progress is still worth reporting, so `accepted` is filled in
+        // whenever secrets exist. `closed` and `err` are what say whether the
+        // handshake actually finished.
+        .accepted = if (hs.accepted.handshake != null) hs.accepted else null,
         .err = last_err,
-        .closed = if (last_err == error.PeerClosed) closed else null,
+        .closed = hs.closed,
     };
 }

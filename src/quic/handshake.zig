@@ -14,6 +14,8 @@ pub const Error = error{
     BufferTooSmall,
     NotServerHello,
     Malformed,
+    CryptoStreamTooLong,
+    CryptoStreamGaps,
 } || codec.Error;
 
 /// TLS 1.3 pins this field at the TLS 1.2 value and negotiates the real
@@ -282,6 +284,190 @@ pub const TransportParamIterator = struct {
     }
 };
 
+/// The SubjectPublicKeyInfo prefix an ed25519 raw public key certificate always
+/// carries, ahead of the 32 key bytes: SEQUENCE, AlgorithmIdentifier holding
+/// the id-Ed25519 OID 1.3.101.112, then a 33-byte BIT STRING.
+/// Source: RFC 8410 s4 and Appendix A.
+pub const ed25519_spki_prefix = [_]u8{
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+};
+
+pub const spki_len = ed25519_spki_prefix.len + 32;
+
+/// Pulls the ed25519 key out of a Certificate body carrying a raw public key.
+/// The entry is a bare SubjectPublicKeyInfo rather than a chain.
+/// Source: RFC 7250 s3, RFC 8446 s4.4.2.
+pub fn rawPublicKey(body: []const u8) Error![32]u8 {
+    var r = codec.Reader{ .buf = body };
+    _ = try r.take(try r.readU8()); // certificate_request_context
+    if (std.mem.readInt(u24, (try r.take(3))[0..3], .big) == 0) return error.Malformed;
+
+    const entry = try r.take(std.mem.readInt(u24, (try r.take(3))[0..3], .big));
+    if (entry.len != spki_len) return error.Malformed;
+    if (!std.mem.eql(u8, entry[0..ed25519_spki_prefix.len], &ed25519_spki_prefix)) {
+        return error.Malformed;
+    }
+    return entry[ed25519_spki_prefix.len..][0..32].*;
+}
+
+/// Writes a Certificate whose one entry is an ed25519 raw public key.
+/// `context` is echoed from the peer's CertificateRequest.
+/// Source: RFC 7250 s3, RFC 8446 s4.4.2.
+pub fn writeRawPublicKeyCertificate(
+    w: *std.Io.Writer,
+    context: []const u8,
+    key: [32]u8,
+) !void {
+    var body: [256 + spki_len + 16]u8 = undefined;
+    var bw = std.Io.Writer.fixed(&body);
+    try bw.writeInt(u8, @intCast(context.len), .big);
+    try bw.writeAll(context);
+    try bw.writeInt(u24, 3 + spki_len + 2, .big); // certificate_list
+    try bw.writeInt(u24, spki_len, .big);
+    try bw.writeAll(&ed25519_spki_prefix);
+    try bw.writeAll(&key);
+    try bw.writeInt(u16, 0, .big); // per-entry extensions
+    try writeMessage(w, .certificate, bw.buffered());
+}
+
+pub fn writeCertificateVerify(w: *std.Io.Writer, scheme: u16, signature: []const u8) !void {
+    var body: [4 + 512]u8 = undefined;
+    var bw = std.Io.Writer.fixed(&body);
+    try bw.writeInt(u16, scheme, .big);
+    try bw.writeInt(u16, @intCast(signature.len), .big);
+    try bw.writeAll(signature);
+    try writeMessage(w, .certificate_verify, bw.buffered());
+}
+
+/// One handshake message: type, a three-byte length, then the body.
+pub fn writeMessage(w: *std.Io.Writer, t: HandshakeType, body: []const u8) !void {
+    try w.writeInt(u8, @backingInt(t), .big);
+    try w.writeInt(u24, @intCast(body.len), .big);
+    try w.writeAll(body);
+}
+
+pub const CertificateVerify = struct {
+    algorithm: u16,
+    signature: []const u8,
+};
+
+pub fn parseCertificateVerify(body: []const u8) Error!CertificateVerify {
+    var r = codec.Reader{ .buf = body };
+    const algorithm = try r.readU16();
+    return .{ .algorithm = algorithm, .signature = try r.take(try r.readU16()) };
+}
+
+/// Source: RFC 8446 s4.4.3.
+pub const server_verify_context = "TLS 1.3, server CertificateVerify";
+pub const client_verify_context = "TLS 1.3, client CertificateVerify";
+
+pub const max_verify_content = 64 + 64 + 1 + Sha256.digest_length;
+
+/// What a CertificateVerify signature covers: 64 spaces, a context string, a
+/// zero separator, then the transcript hash. The padding and context exist so a
+/// signature made for TLS cannot be replayed as one made for anything else.
+/// Source: RFC 8446 s4.4.3.
+pub fn verifyContent(
+    out: *[max_verify_content]u8,
+    context: []const u8,
+    transcript: [Sha256.digest_length]u8,
+) Error![]const u8 {
+    var w = std.Io.Writer.fixed(out);
+    w.splatByteAll(' ', 64) catch return error.BufferTooSmall;
+    w.writeAll(context) catch return error.BufferTooSmall;
+    w.writeByte(0) catch return error.BufferTooSmall;
+    w.writeAll(&transcript) catch return error.BufferTooSmall;
+    return w.buffered();
+}
+
+/// One handshake message. `raw` keeps the four-byte header, because that is
+/// what the transcript hashes.
+pub const Message = struct {
+    type: HandshakeType,
+    body: []const u8,
+    raw: []const u8,
+};
+
+/// Walks whole messages in a reassembled CRYPTO stream, stopping as soon as the
+/// remainder is a partial one.
+pub const MessageIterator = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    pub fn init(buf: []const u8) MessageIterator {
+        return .{ .buf = buf };
+    }
+
+    pub fn next(self: *MessageIterator) ?Message {
+        if (self.buf.len - self.pos < 4) return null;
+        const len = std.mem.readInt(u24, self.buf[self.pos + 1 ..][0..3], .big);
+        const total = 4 + @as(usize, len);
+        if (self.buf.len - self.pos < total) return null;
+
+        const raw = self.buf[self.pos..][0..total];
+        self.pos += total;
+        return .{ .type = @fromBackingInt(raw[0]), .body = raw[4..], .raw = raw };
+    }
+};
+
+/// Reassembles the CRYPTO stream. A handshake message can span packets and the
+/// pieces can arrive out of order, so every offset is tracked.
+/// Source: RFC 9000 s19.6.
+pub const Reassembler = struct {
+    buf: []u8,
+    ranges: [max_ranges]Range = undefined,
+    count: usize = 0,
+
+    /// A handshake needs a handful; more means the peer is fragmenting far
+    /// beyond anything useful.
+    pub const max_ranges = 8;
+
+    const Range = struct {
+        start: u64,
+        end: u64,
+
+        fn lessThan(_: void, a: Range, b: Range) bool {
+            return a.start < b.start;
+        }
+    };
+
+    pub fn init(buf: []u8) Reassembler {
+        return .{ .buf = buf };
+    }
+
+    /// Copies one CRYPTO frame's data into place.
+    pub fn push(self: *Reassembler, offset: u64, data: []const u8) Error!void {
+        if (data.len == 0) return;
+        const end = offset + data.len;
+        if (end > self.buf.len) return error.CryptoStreamTooLong;
+        @memcpy(self.buf[@intCast(offset)..][0..data.len], data);
+
+        // Merge into the disjoint set, so `contiguous` can trust range 0.
+        var new: Range = .{ .start = offset, .end = end };
+        var kept: usize = 0;
+        for (self.ranges[0..self.count]) |e| {
+            if (e.end < new.start or e.start > new.end) {
+                self.ranges[kept] = e;
+                kept += 1;
+            } else {
+                new.start = @min(new.start, e.start);
+                new.end = @max(new.end, e.end);
+            }
+        }
+        if (kept == max_ranges) return error.CryptoStreamGaps;
+        self.ranges[kept] = new;
+        self.count = kept + 1;
+        std.mem.sort(Range, self.ranges[0..self.count], {}, Range.lessThan);
+    }
+
+    /// Bytes available from offset 0. A gap at the front yields nothing, since
+    /// a parser cannot skip one.
+    pub fn contiguous(self: *const Reassembler) []const u8 {
+        if (self.count == 0 or self.ranges[0].start != 0) return &.{};
+        return self.buf[0..@intCast(self.ranges[0].end)];
+    }
+};
+
 /// Running hash over handshake messages, in the order they are sent. QUIC has
 /// no record layer, so the messages are hashed exactly as they go on the wire.
 pub const Transcript = struct {
@@ -396,6 +582,53 @@ test "transport parameters round trip" {
     try testing.expectEqual(TransportParam.initial_source_connection_id, cid.id);
     try testing.expectEqualSlices(u8, &hex("8394c8f03e515708"), cid.value);
     try testing.expectEqual(@as(usize, w.buffered().len), it.r.pos);
+}
+
+test "walks whole handshake messages and stops on a partial one" {
+    // encrypted_extensions(2 bytes), finished(1 byte), then a truncated header.
+    var buf = [_]u8{ 0x08, 0, 0, 2, 0xaa, 0xbb, 0x14, 0, 0, 1, 0xcc, 0x0b, 0, 0 };
+    var it = MessageIterator.init(&buf);
+
+    const ee = it.next().?;
+    try testing.expectEqual(HandshakeType.encrypted_extensions, ee.type);
+    try testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb }, ee.body);
+    try testing.expectEqual(@as(usize, 6), ee.raw.len); // header included
+
+    const fin = it.next().?;
+    try testing.expectEqual(HandshakeType.finished, fin.type);
+    try testing.expectEqualSlices(u8, &.{0xcc}, fin.body);
+
+    // The truncated header is not a whole message, and pos stays on the
+    // boundary so a later pass can retry it.
+    try testing.expectEqual(@as(?Message, null), it.next());
+    try testing.expectEqual(@as(usize, 11), it.pos);
+}
+
+test "reassembles crypto fragments in any order" {
+    var buf: [16]u8 = @splat(0);
+    var r = Reassembler.init(&buf);
+
+    // The tail first: nothing is readable until the gap at the front closes.
+    try r.push(4, &.{ 4, 5, 6, 7 });
+    try testing.expectEqual(@as(usize, 0), r.contiguous().len);
+
+    try r.push(0, &.{ 0, 1, 2, 3 });
+    try testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3, 4, 5, 6, 7 }, r.contiguous());
+
+    // A retransmit overlapping what we have changes nothing.
+    try r.push(2, &.{ 2, 3, 4 });
+    try testing.expectEqual(@as(usize, 8), r.contiguous().len);
+}
+
+test "a crypto stream past the buffer or too gappy is refused" {
+    var small: [4]u8 = @splat(0);
+    var r = Reassembler.init(&small);
+    try testing.expectError(error.CryptoStreamTooLong, r.push(2, &.{ 1, 2, 3 }));
+
+    var buf: [64]u8 = @splat(0);
+    var g = Reassembler.init(&buf);
+    for (0..Reassembler.max_ranges) |i| try g.push(i * 4, &.{0xaa});
+    try testing.expectError(error.CryptoStreamGaps, g.push(Reassembler.max_ranges * 4, &.{0xaa}));
 }
 
 test "extensions are type, length, body" {

@@ -15,9 +15,21 @@
       url = "git+https://codeberg.org/quint/zig-gpu?ref=git-index-crc32";
       flake = false;
     };
+    # Radicle 2.x, which replaces Noise/TCP with iroh over QUIC. The only peer
+    # that speaks what src/quic/ is built for: iroh 1.0.3, raw public keys, and
+    # the ALPNs radicle/gossip/1 and radicle/git/1. Kept out of the default
+    # devShell so a normal `zig build` never waits on a Rust toolchain; build it
+    # on demand with `nix build .#radicle-ng`.
+    #
+    # The ng branch lives in one remote's namespace rather than on master, hence
+    # the ref path. Its nixpkgs is deliberately not followed: it pins its own
+    # through crane and rust-overlay.
+    radicle-ng = {
+      url = "git+https://seed.radicle.dev/rad:z3gqcJUoA1n9HaHKufZs5FCSGazv5?ref=refs/namespaces/z6MkkPvBfjP4bQmco5Dm7UGsX2ruDBieEHi8n9DVJWX5sTEz/refs/heads/ng";
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, zig-overlay, zig-src }:
+  outputs = { self, nixpkgs, flake-utils, zig-overlay, zig-src, radicle-ng }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
@@ -46,5 +58,9 @@
           '';
           dontInstall = true;
         };
+
+        # A radicle 2.x node, to probe src/quic/ against something that actually
+        # speaks iroh. Not reached by packages.default.
+        packages.radicle-ng = radicle-ng.packages.${system}.default;
       });
 }

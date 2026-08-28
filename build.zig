@@ -9,6 +9,9 @@ pub fn build(b: *std.Build) void {
 
     const gitpack = gitpackModule(b, target, optimize);
 
+    const options = b.addOptions();
+    options.addOption([]const u8, "tmp_dir", tmpDir(b));
+
     const mod = b.addModule("radish", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -16,6 +19,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "zg_normalize", .module = normalize },
             .{ .name = "gitpack", .module = gitpack },
+            .{ .name = "build_options", .module = options.createModule() },
         },
     });
 
@@ -45,6 +49,22 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+}
+
+/// Where temporary checkouts go. Resolved at build time because
+/// `std.posix.getenv` is gone and radish does not link libc, so the process
+/// cannot read TMPDIR for itself.
+///
+/// Only `-Dtmpdir` overrides `/tmp`. The build environment's own TMPDIR must not
+/// leak in: under `nix build` it names a sandbox directory that is deleted before
+/// the binary ever runs.
+fn tmpDir(b: *std.Build) []const u8 {
+    const dir = b.option([]const u8, "tmpdir", "Directory for temporary checkouts") orelse "/tmp";
+    if (dir.len == 0) return "/tmp";
+    // A trailing slash is common in the variable this usually comes from.
+    var end = dir.len;
+    while (end > 1 and dir[end - 1] == '/') end -= 1;
+    return dir[0..end];
 }
 
 /// The toolchain's own git implementation (compiler internal, std only),

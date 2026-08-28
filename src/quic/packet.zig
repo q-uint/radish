@@ -15,6 +15,7 @@ const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 pub const Error = error{
     PacketTooShort,
     NotLongHeader,
+    NotShortHeader,
     UnsupportedPacket,
     ConnectionIdTooLong,
     InvalidPacketNumberLength,
@@ -359,6 +360,133 @@ pub fn seal(out: []u8, b: Build, payload: []const u8, keys: crypto.Keys) Error!u
     return end;
 }
 
+/// A 1-RTT packet's header. There is no version, no source id and no length:
+/// the receiver chose the destination id so it knows its own length, and the
+/// packet runs to the end of the datagram. That last part is why a short header
+/// can only ever be the final packet in one.
+/// Source: RFC 9000 s17.3.
+pub const ShortHeader = struct {
+    dcid: []const u8,
+    pn_offset: usize,
+};
+
+/// Bits 3-4 of a short header's first byte, which must be zero once unmasked.
+const short_reserved = 0x18;
+
+/// Bit 2, flipped when the peer rotates application keys.
+const key_phase_bit = 0x04;
+
+/// `dcid_len` cannot be read off the wire, so the caller supplies the length it
+/// issued for itself.
+/// Source: RFC 9000 s17.3.
+pub fn parseShortHeader(packet: []const u8, dcid_len: usize) Error!ShortHeader {
+    if (dcid_len > max_cid_len) return error.ConnectionIdTooLong;
+    if (packet.len < 1 + dcid_len) return error.PacketTooShort;
+    if (isLongHeader(packet[0])) return error.NotShortHeader;
+    if (packet[0] & 0x40 == 0) return error.NotShortHeader;
+
+    return .{ .dcid = packet[1..][0..dcid_len], .pn_offset = 1 + dcid_len };
+}
+
+pub const OpenedShort = struct {
+    dcid: []const u8,
+    /// Only meaningful once the first byte is unprotected.
+    key_phase: bool,
+    pn: u64,
+    payload: []const u8,
+};
+
+/// Unprotects and decrypts one 1-RTT packet in place. `packet` must be exactly
+/// the packet, since nothing on the wire says where it ends.
+pub fn openShort(
+    out: []u8,
+    packet: []u8,
+    dcid_len: usize,
+    keys: crypto.Keys,
+    largest_pn: ?u64,
+) Error!OpenedShort {
+    const hdr = try parseShortHeader(packet, dcid_len);
+
+    const so = sampleOffset(hdr.pn_offset);
+    if (packet.len < so + crypto.sample_len) return error.PacketTooShort;
+    const mask = crypto.headerMask(keys.hp, packet[so..][0..crypto.sample_len].*);
+
+    const pn_len = try unprotectHeader(packet, hdr.pn_offset, mask);
+    errdefer protectHeader(packet[0 .. hdr.pn_offset + pn_len], hdr.pn_offset, mask) catch unreachable;
+
+    if (packet[0] & short_reserved != 0) return error.ProtocolViolation;
+
+    const truncated = std.mem.readVarInt(u64, packet[hdr.pn_offset..][0..pn_len], .big);
+    const pn = decodePacketNumber(largest_pn, truncated, pn_len);
+
+    const aad = packet[0 .. hdr.pn_offset + pn_len];
+    const body = packet[hdr.pn_offset + pn_len ..];
+    if (body.len < Aes128Gcm.tag_length) return error.PacketTooShort;
+
+    const ct = body[0 .. body.len - Aes128Gcm.tag_length];
+    const tag = body[body.len - Aes128Gcm.tag_length ..][0..Aes128Gcm.tag_length].*;
+    if (out.len < ct.len) return error.BufferTooSmall;
+
+    Aes128Gcm.decrypt(out[0..ct.len], ct, tag, aad, nonce(keys.iv, pn), keys.key) catch {
+        return error.AuthenticationFailed;
+    };
+    return .{
+        .dcid = hdr.dcid,
+        .key_phase = packet[0] & key_phase_bit != 0,
+        .pn = pn,
+        .payload = out[0..ct.len],
+    };
+}
+
+pub const ShortBuild = struct {
+    dcid: []const u8,
+    pn: u64,
+    pn_len: usize,
+    key_phase: bool = false,
+    /// Toggled once per round trip so observers can measure latency; carries no
+    /// protocol meaning and is not header-protected.
+    /// Source: RFC 9000 s17.4.
+    spin: bool = false,
+};
+
+/// Writes a complete protected 1-RTT packet into `out` and returns its length.
+pub fn sealShort(out: []u8, b: ShortBuild, payload: []const u8, keys: crypto.Keys) Error!usize {
+    if (b.pn_len < 1 or b.pn_len > 4) return error.InvalidPacketNumberLength;
+    if (b.dcid.len > max_cid_len) return error.ConnectionIdTooLong;
+    if (b.pn >> @intCast(8 * b.pn_len) != 0) return error.PacketNumberTooLarge;
+    if (payload.len < minPayloadLen(b.pn_len)) return error.PayloadTooShortToSample;
+
+    const pn_offset = 1 + b.dcid.len;
+    const header_len = pn_offset + b.pn_len;
+    const end = header_len + payload.len + Aes128Gcm.tag_length;
+    if (out.len < end) return error.BufferTooSmall;
+
+    out[0] = 0x40 | @as(u8, @intCast(b.pn_len - 1));
+    if (b.spin) out[0] |= 0x20;
+    if (b.key_phase) out[0] |= key_phase_bit;
+    @memcpy(out[1..][0..b.dcid.len], b.dcid);
+
+    var pn_be: [8]u8 = undefined;
+    std.mem.writeInt(u64, &pn_be, b.pn, .big);
+    @memcpy(out[pn_offset..][0..b.pn_len], pn_be[8 - b.pn_len ..]);
+
+    var tag: [Aes128Gcm.tag_length]u8 = undefined;
+    Aes128Gcm.encrypt(
+        out[header_len..][0..payload.len],
+        &tag,
+        payload,
+        out[0..header_len],
+        nonce(keys.iv, b.pn),
+        keys.key,
+    );
+    @memcpy(out[header_len + payload.len ..][0..Aes128Gcm.tag_length], &tag);
+
+    const so = sampleOffset(pn_offset);
+    try protectHeader(out[0..header_len], pn_offset, crypto.headerMask(keys.hp, out[so..][0..crypto.sample_len].*));
+
+    return end;
+}
+
 const testing = std.testing;
 const hex = testdata.hex;
 
@@ -514,23 +642,6 @@ test "seals the RFC 9001 A.2 client Initial byte for byte" {
     try testing.expectEqualSlices(u8, &expected, out[0..n]);
 }
 
-test "seal and open round trip" {
-    const dcid = hex(testdata.other_dcid);
-    const keys = crypto.keysFromSecret(crypto.initialSecrets(&dcid).server);
-
-    var payload: [64]u8 = @splat(0);
-    payload[0] = 0x01; // a PING frame, then padding
-
-    var out: [256]u8 = undefined;
-    const n = try seal(&out, .{ .kind = .handshake, .dcid = &dcid, .pn = 7, .pn_len = 2 }, &payload, keys);
-
-    var plain: [256]u8 = undefined;
-    const opened = try open(&plain, out[0..n], keys, 6);
-    try testing.expectEqual(@as(u64, 7), opened.pn);
-    try testing.expectEqual(n, opened.len);
-    try testing.expectEqualSlices(u8, &payload, opened.payload);
-}
-
 // Several packets per UDP datagram is normal, so `len` has to reach the next.
 test "walks a coalesced datagram" {
     const dcid = hex(testdata.other_dcid);
@@ -542,7 +653,9 @@ test "walks a coalesced datagram" {
 
     var buf: [512]u8 = undefined;
     const a = try seal(&buf, .{ .kind = .initial, .dcid = &dcid, .pn = 1, .pn_len = 4 }, &one_payload, keys);
-    const b = try seal(buf[a..], .{ .kind = .handshake, .dcid = &dcid, .pn = 2, .pn_len = 4 }, &two_payload, keys);
+    // A narrower packet number on the second, so the truncated form has to be
+    // recovered against the first packet rather than read whole.
+    const b = try seal(buf[a..], .{ .kind = .handshake, .dcid = &dcid, .pn = 2, .pn_len = 2 }, &two_payload, keys);
 
     var out: [512]u8 = undefined;
     const one = try open(&out, buf[0 .. a + b], keys, null);
@@ -552,6 +665,8 @@ test "walks a coalesced datagram" {
 
     const two = try open(&out, buf[one.len .. a + b], keys, one.pn);
     try testing.expectEqual(Kind.handshake, two.header.kind);
+    try testing.expectEqual(@as(u64, 2), two.pn);
+    try testing.expectEqual(b, two.len);
     try testing.expectEqualSlices(u8, &two_payload, two.payload);
 }
 
@@ -610,6 +725,57 @@ test "a failed open reports the tamper and restores the packet" {
 // Masking is XOR, so flipping a reserved bit in the protected byte flips it in
 // the unprotected one. Reported ahead of the authentication failure it also
 // causes.
+// The five masked bits and the missing length field are what separate this from
+// the long header path, so both directions get walked.
+test "seals and opens a 1-RTT packet" {
+    const dcid = hex(testdata.other_dcid);
+    const keys = clientKeys(testdata.other_dcid);
+    var payload: [32]u8 = @splat(0);
+    payload[0] = 0x01; // PING, then padding
+
+    var buf: [256]u8 = undefined;
+    const n = try sealShort(&buf, .{
+        .dcid = &dcid,
+        .pn = 5,
+        .pn_len = 2,
+        .key_phase = true,
+        .spin = true,
+    }, &payload, keys);
+    try testing.expectEqual(@as(usize, 1 + dcid.len + 2 + payload.len + 16), n);
+
+    // Nothing declares the length, so the packet is exactly what arrived.
+    var out: [256]u8 = undefined;
+    const opened = try openShort(&out, buf[0..n], dcid.len, keys, 4);
+    try testing.expectEqual(@as(u64, 5), opened.pn);
+    try testing.expect(opened.key_phase);
+    try testing.expectEqualSlices(u8, &dcid, opened.dcid);
+    try testing.expectEqualSlices(u8, &payload, opened.payload);
+}
+
+test "1-RTT headers are refused when they are not one" {
+    const dcid = hex(testdata.other_dcid);
+    const keys = clientKeys(testdata.other_dcid);
+
+    // A long header, which the top bit gives away.
+    var long: [64]u8 = @splat(0);
+    _ = try writeLongHeader(&long, .{ .kind = .handshake, .dcid = &dcid, .pn = 1, .pn_len = 4 }, 0);
+    try testing.expectError(error.NotShortHeader, parseShortHeader(&long, dcid.len));
+
+    // Fixed bit clear.
+    try testing.expectError(error.NotShortHeader, parseShortHeader(&[_]u8{ 0x00, 0, 0 }, 2));
+    try testing.expectError(error.ConnectionIdTooLong, parseShortHeader(&[_]u8{0x40}, 21));
+    try testing.expectError(error.PacketTooShort, parseShortHeader(&[_]u8{0x40}, 8));
+
+    // Reserved bits are 0x18 here, one bit over from the long header's 0x0c.
+    var payload: [32]u8 = @splat(0);
+    payload[0] = 0x01;
+    var buf: [256]u8 = undefined;
+    const n = try sealShort(&buf, .{ .dcid = &dcid, .pn = 1, .pn_len = 4 }, &payload, keys);
+    buf[0] ^= 0x10;
+    var out: [256]u8 = undefined;
+    try testing.expectError(error.ProtocolViolation, openShort(&out, buf[0..n], dcid.len, keys, null));
+}
+
 test "reserved bits set is a protocol violation" {
     const dcid = hex(testdata.other_dcid);
     const keys = clientKeys(testdata.other_dcid);

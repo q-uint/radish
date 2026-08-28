@@ -6,6 +6,7 @@
 //! Source: heartwood crates/radicle/src/identity/doc.rs (Doc::load_at),
 //! storage/refs.rs (SignedRefs); layout confirmed against rad 1.9.1.
 const std = @import("std");
+const build_options = @import("build_options");
 const gitpack = @import("gitpack");
 const doc = @import("../identity/doc.zig");
 const rid = @import("../identity/rid.zig");
@@ -112,9 +113,9 @@ const TmpDir = struct {
         var name: [24]u8 = undefined;
         _ = std.base64.url_safe.Encoder.encode(&name, &random_bytes);
 
-        // /tmp rather than $TMPDIR: reading the environment would mean
+        // Resolved at build time: reading the environment here would mean
         // threading process.Init through every caller of Repository.open.
-        var parent = try std.Io.Dir.openDirAbsolute(io, "/tmp", .{});
+        var parent = try std.Io.Dir.openDirAbsolute(io, build_options.tmp_dir, .{});
         errdefer parent.close(io);
         const dir = try parent.createDirPathOpen(io, &name, .{});
         return .{ .dir = dir, .parent = parent, .name = name };
@@ -308,7 +309,9 @@ pub const Repository = struct {
 
         // verifyRemote already requires every on-disk ref to be signed at its
         // real oid; the explicit match below keeps this honest if that changes.
-        var signed = self.verifyRemote(scratch, scratch, nid) catch return error.IdRootUnsigned;
+        // Its error propagates: IdRootUnsigned would say only that no root was
+        // established, and not every cause is tampering.
+        var signed = try self.verifyRemote(scratch, scratch, nid);
         defer signed.deinit(scratch);
         for (signed.signed.refs.entries) |entry| {
             if (!std.mem.eql(u8, entry.name, ROOT_REF)) continue;

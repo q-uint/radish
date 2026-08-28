@@ -64,6 +64,21 @@ pub const Directions = struct {
     server: Secret,
 };
 
+const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
+
+/// The key that authenticates a Finished, from one direction's traffic secret.
+/// Source: RFC 8446 s4.4.4.
+pub fn finishedKey(secret: Secret) Secret {
+    return expandLabel(Hkdf, secret, "finished", "", secret_len);
+}
+
+/// verify_data: an HMAC over the transcript as it stood *before* the Finished
+/// being checked.
+/// Source: RFC 8446 s4.4.4.
+pub fn verifyData(secret: Secret, transcript: Transcript) [Hmac.mac_length]u8 {
+    return std.crypto.tls.hmac(Hmac, &transcript, finishedKey(secret));
+}
+
 const X25519 = std.crypto.dh.X25519;
 
 pub const PublicKey = [X25519.public_length]u8;
