@@ -36,6 +36,8 @@ pub const Options = struct {
     server_name: ?[]const u8 = null,
     timeout_ms: u64 = 3000,
     max_datagrams: usize = 6,
+    /// Resends of the first flight before giving up.
+    max_retries: usize = 2,
 };
 
 /// `reply_buf` keeps the datagram as it arrived, so `reply` stays recordable;
@@ -71,10 +73,6 @@ pub fn run(
     defer sock.close(io);
 
     try sock.send(io, &addr, datagram[0..sent]);
-    const msg = sock.receiveTimeout(io, reply_buf, .{ .duration = .{
-        .raw = .fromNanoseconds(@intCast(opts.timeout_ms * std.time.ns_per_ms)),
-        .clock = .awake,
-    } }) catch return error.NoReply;
 
     // A server's first flight spans datagrams, so the handshake accumulates
     // across them.
@@ -90,12 +88,38 @@ pub fn run(
     });
 
     var work: [2048]u8 = undefined;
-    var received = msg.data.len;
-    var datagrams: usize = 1;
-    var current = msg.data;
+    var received: usize = 0;
+    var datagrams: usize = 0;
+    var current: []const u8 = &.{};
     var last_err: ?anyerror = null;
+    var retries: usize = 0;
 
     while (true) {
+        // Resend the first flight while it goes unacknowledged. Not RFC 9002
+        // loss recovery: nothing measures a round trip or backs off, which is
+        // enough to survive a dropped Initial and no more.
+        var arrived: ?[]const u8 = null;
+        while (true) {
+            if (sock.receiveTimeout(io, reply_buf, .{ .duration = .{
+                .raw = .fromNanoseconds(@intCast(opts.timeout_ms * std.time.ns_per_ms)),
+                .clock = .awake,
+            } })) |got| {
+                arrived = got.data;
+                break;
+            } else |_| {
+                // An acknowledged Initial arrived, so silence is about
+                // something else and resending would only add noise.
+                if (retries >= opts.max_retries or hs.acked(.initial).contains(0)) break;
+                retries += 1;
+                var again: [client.max_initial_datagram]u8 = undefined;
+                const n = hs.sealInitialRetransmit(&again, initial.client_hello) catch break;
+                sock.send(io, &addr, again[0..n]) catch break;
+            }
+        }
+        current = arrived orelse break;
+        datagrams += 1;
+        received += current.len;
+
         if (current.len > work.len) {
             last_err = error.ReplyTooLarge;
         } else {
@@ -108,15 +132,18 @@ pub fn run(
             };
         }
 
+        // Acknowledge before reading on: an unacknowledged flight makes the
+        // server retransmit it, and the ACK is what ends that.
+        var ack: [client.max_initial_datagram]u8 = undefined;
+        for ([_]client.Handshaker.Space{ .initial, .handshake, .application }) |space| {
+            const n = hs.sealAck(&ack, space) catch continue orelse continue;
+            sock.send(io, &addr, ack[0..n]) catch {};
+        }
+
         if (hs.done() or datagrams >= opts.max_datagrams) break;
-        const next = sock.receiveTimeout(io, reply_buf, .{ .duration = .{
-            .raw = .fromNanoseconds(@intCast(opts.timeout_ms * std.time.ns_per_ms)),
-            .clock = .awake,
-        } }) catch break;
-        datagrams += 1;
-        received += next.data.len;
-        current = next.data;
     }
+
+    if (datagrams == 0) return error.NoReply;
 
     return .{
         .sent = sent,

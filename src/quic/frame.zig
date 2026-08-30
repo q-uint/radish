@@ -11,7 +11,7 @@
 const std = @import("std");
 const codec = @import("../codec.zig");
 
-pub const Error = error{ UnsupportedFrame, FrameEncoding } || codec.Error;
+pub const Error = error{ UnsupportedFrame, FrameEncoding, NothingToAck } || codec.Error;
 
 /// Every frame type QUIC v1 defines.
 /// Source: RFC 9000 s19, Table 3.
@@ -111,7 +111,7 @@ pub fn cryptoAlert(error_code: u64) ?u8 {
 /// CRYPTO_ERROR is excluded: `cryptoAlert` carries the detail there.
 pub fn transportErrorName(error_code: u64) ?[]const u8 {
     if (error_code > 0x11) return null;
-    return @tagName(@as(TransportError, @enumFromInt(error_code)));
+    return @tagName(@as(TransportError, @fromBackingInt(@intCast(error_code))));
 }
 
 pub const Ecn = struct { ect0: u64, ect1: u64, ce: u64 };
@@ -172,6 +172,115 @@ pub const RangeIterator = struct {
     }
 };
 
+/// A set of packet numbers, kept as descending disjoint ranges. Used for both
+/// directions: what has arrived, and what the peer has acknowledged.
+pub const NumberSet = struct {
+    ranges: [max_ranges]AckRange = undefined,
+    count: usize = 0,
+
+    /// Older ranges are dropped once full: the peer only needs the recent ones
+    /// to make progress, and an ACK has to fit in a packet.
+    pub const max_ranges = 8;
+
+    /// The largest number in the set, or null while it is empty. This is what
+    /// `decodePacketNumber` expects.
+    pub fn largest(self: *const NumberSet) ?u64 {
+        return if (self.count == 0) null else self.ranges[0].largest;
+    }
+
+    pub fn contains(self: *const NumberSet, pn: u64) bool {
+        for (self.ranges[0..self.count]) |r| {
+            if (pn >= r.smallest and pn <= r.largest) return true;
+        }
+        return false;
+    }
+
+    pub fn record(self: *NumberSet, pn: u64) void {
+        // Extend a range this touches, then merge any that meet as a result.
+        for (self.ranges[0..self.count], 0..) |*r, i| {
+            if (pn >= r.smallest and pn <= r.largest) return;
+            if (pn == r.largest + 1) {
+                r.largest = pn;
+                return self.mergeDown(i);
+            }
+            if (r.smallest > 0 and pn == r.smallest - 1) {
+                r.smallest = pn;
+                return self.mergeDown(i + 1);
+            }
+        }
+        self.insert(pn);
+    }
+
+    /// Joins range `i - 1` with range `i` when they have become adjacent.
+    /// `i == count` means the extended range was already the lowest, so there
+    /// is nothing under it to join.
+    fn mergeDown(self: *NumberSet, i: usize) void {
+        if (i == 0 or i >= self.count) return;
+        const above = &self.ranges[i - 1];
+        const below = self.ranges[i];
+        if (above.smallest != below.largest + 1) return;
+        above.smallest = below.smallest;
+        for (i..self.count - 1) |j| self.ranges[j] = self.ranges[j + 1];
+        self.count -= 1;
+    }
+
+    fn insert(self: *NumberSet, pn: u64) void {
+        var at: usize = 0;
+        while (at < self.count and self.ranges[at].largest > pn) at += 1;
+        if (at == max_ranges) return; // older than everything kept
+
+        const end = @min(self.count, max_ranges - 1);
+        var j = end;
+        while (j > at) : (j -= 1) self.ranges[j] = self.ranges[j - 1];
+        self.ranges[at] = .{ .largest = pn, .smallest = pn };
+        self.count = @min(self.count + 1, max_ranges);
+    }
+
+    /// Writes an ACK for everything in the set. `delay` is already scaled by
+    /// the ack_delay_exponent we advertised.
+    /// Source: RFC 9000 s19.3.
+    pub fn writeAck(self: *const NumberSet, w: *std.Io.Writer, delay: u64) !void {
+        if (self.count == 0) return error.NothingToAck;
+
+        try codec.writeVarint(w, @backingInt(Type.ack));
+        try codec.writeVarint(w, self.ranges[0].largest);
+        try codec.writeVarint(w, delay);
+        try codec.writeVarint(w, self.count - 1);
+        try codec.writeVarint(w, self.ranges[0].largest - self.ranges[0].smallest);
+
+        // Each later range is encoded as the distance down from the previous
+        // one, which is why they have to be descending and disjoint.
+        for (self.ranges[1..self.count], 0..) |r, i| {
+            const prev = self.ranges[i];
+            try codec.writeVarint(w, prev.smallest - r.largest - 2);
+            try codec.writeVarint(w, r.largest - r.smallest);
+        }
+    }
+};
+
+/// What has arrived in one packet number space. Each space acknowledges
+/// separately and numbers restart in each, so one of these belongs to each.
+/// Source: RFC 9000 s13.2.
+pub const Received = struct {
+    numbers: NumberSet = .{},
+    /// Set when a packet arrives that must be acknowledged. PADDING, ACK and
+    /// CONNECTION_CLOSE alone do not elicit one.
+    /// Source: RFC 9000 s13.2.1.
+    ack_eliciting: bool = false,
+
+    pub fn record(self: *Received, pn: u64) void {
+        self.numbers.record(pn);
+    }
+
+    pub fn largest(self: *const Received) ?u64 {
+        return self.numbers.largest();
+    }
+
+    pub fn writeAck(self: *const Received, w: *std.Io.Writer, delay: u64) !void {
+        return self.numbers.writeAck(w, delay);
+    }
+};
+
 pub const Crypto = struct {
     offset: u64,
     data: []const u8,
@@ -219,6 +328,17 @@ pub const Frame = union(enum) {
     /// control and stream resets land here.
     ignored: Type,
 };
+
+/// Whether receiving `f` obliges us to acknowledge the packet carrying it.
+/// Everything but ACK, PADDING and CONNECTION_CLOSE does, which is what stops
+/// two peers acknowledging each other's acknowledgements forever.
+/// Source: RFC 9000 s13.2.1.
+pub fn isAckEliciting(f: Frame) bool {
+    return switch (f) {
+        .padding, .ack, .connection_close => false,
+        else => true,
+    };
+}
 
 /// Frames whose whole body is varints, and how many. Flow control and stream
 /// resets are consumed so the payload can be walked; radish sends too little to
@@ -500,4 +620,73 @@ test "an overlong frame type encoding is rejected" {
     var payload = [_]u8{ 0x40, 0x01 };
     var it = Iterator.init(&payload);
     try testing.expectError(error.VarIntNotCanonical, it.next());
+}
+
+test "records packet numbers into ranges regardless of arrival order" {
+    var a: NumberSet = .{};
+    for ([_]u64{ 0, 1, 2, 5, 6, 9 }) |pn| a.record(pn);
+
+    var b: NumberSet = .{};
+    for ([_]u64{ 9, 5, 1, 6, 0, 2 }) |pn| b.record(pn);
+
+    try testing.expectEqual(@as(usize, 3), a.count);
+    try testing.expectEqualSlices(AckRange, a.ranges[0..a.count], b.ranges[0..b.count]);
+    try testing.expectEqual(@as(?u64, 9), a.largest());
+    // Largest first, with the gaps at 3-4 and 7-8 keeping them apart.
+    try testing.expectEqual(AckRange{ .largest = 9, .smallest = 9 }, a.ranges[0]);
+    try testing.expectEqual(AckRange{ .largest = 6, .smallest = 5 }, a.ranges[1]);
+    try testing.expectEqual(AckRange{ .largest = 2, .smallest = 0 }, a.ranges[2]);
+
+    a.record(6);
+    try testing.expectEqual(@as(usize, 3), a.count);
+}
+
+test "filling a gap merges the ranges around it" {
+    var r: NumberSet = .{};
+    for ([_]u64{ 0, 2 }) |pn| r.record(pn);
+    try testing.expectEqual(@as(usize, 2), r.count);
+
+    r.record(1);
+    try testing.expectEqual(@as(usize, 1), r.count);
+    try testing.expectEqual(AckRange{ .largest = 2, .smallest = 0 }, r.ranges[0]);
+}
+
+test "an ACK we write reads back as the ranges we recorded" {
+    var r: NumberSet = .{};
+    for ([_]u64{ 50, 52, 53, 54, 55, 58, 59, 60 }) |pn| r.record(pn);
+
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try r.writeAck(&w, 0);
+
+    var it = Iterator.init(w.buffered());
+    const ack = (try it.next()).?.ack;
+    try testing.expectEqual(@as(u64, 60), ack.largest);
+    try testing.expectEqual(@as(u64, 2), ack.range_count);
+    try testing.expectEqual(AckRange{ .largest = 60, .smallest = 58 }, try ack.firstRange());
+
+    var ranges = try ack.ranges();
+    try testing.expectEqual(AckRange{ .largest = 55, .smallest = 52 }, (try ranges.next()).?);
+    try testing.expectEqual(AckRange{ .largest = 50, .smallest = 50 }, (try ranges.next()).?);
+    try testing.expectEqual(@as(?AckRange, null), try ranges.next());
+    try testing.expectEqual(@as(?Frame, null), try it.next());
+}
+
+// Extending the lowest range downward has nothing beneath it to merge with. On
+// a full set that index is one past the array, not just one past the count.
+test "extending the lowest of a full set of ranges" {
+    var r: NumberSet = .{};
+    for (0..NumberSet.max_ranges) |i| r.record((i + 1) * 4);
+    try testing.expectEqual(NumberSet.max_ranges, r.count);
+
+    r.record(3);
+    try testing.expect(r.contains(3));
+    try testing.expectEqual(AckRange{ .largest = 4, .smallest = 3 }, r.ranges[r.count - 1]);
+}
+
+test "acking nothing is refused" {
+    const r: NumberSet = .{};
+    var buf: [16]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try testing.expectError(error.NothingToAck, r.writeAck(&w, 0));
 }

@@ -440,7 +440,7 @@ fn quicProbe(init: std.process.Init, host: []const u8, port: u16, alpn: []const 
             // A CRYPTO_ERROR carries the TLS alert in its low byte, which is
             // the part that says what the peer objected to.
             std.debug.print(" CRYPTO_ERROR, TLS alert {d}", .{alert});
-            if (std.enums.tagName(std.crypto.tls.Alert.Description, @enumFromInt(alert))) |name| {
+            if (std.enums.tagName(std.crypto.tls.Alert.Description, @fromBackingInt(@intCast(alert)))) |name| {
                 std.debug.print(" ({s})", .{name});
             }
         } else if (radish.quic.frame.transportErrorName(c.error_code)) |name| {
