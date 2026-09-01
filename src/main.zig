@@ -399,14 +399,19 @@ const ServePrinter = struct {
 /// forward secrecy, which is fine for a probe of public traffic.
 fn quicProbe(init: std.process.Init, host: []const u8, port: u16, alpn: []const u8, sni: ?[]const u8) !void {
     const quic = radish.quic;
+    const arena = init.arena.allocator();
     var secret: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&secret, quic.testdata.fixed_x25519_secret);
     var random: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&random, quic.testdata.fixed_hello_random);
+    var seed: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&seed, quic.testdata.fixed_identity_seed);
+    const identity = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
 
     var reply: [2048]u8 = undefined;
     var plain: [2048]u8 = undefined;
-    std.debug.print("quic-probe {s}:{d} alpn={s}\n", .{ host, port, alpn });
+    const our_nid = try radish.NodeId.fromPublicKey(identity.public_key.toBytes()).encode(arena);
+    std.debug.print("quic-probe {s}:{d} alpn={s} as {s}\n", .{ host, port, alpn, our_nid });
 
     const r = quic.probe.run(init.io, .{
         .host = host,
@@ -415,6 +420,7 @@ fn quicProbe(init: std.process.Init, host: []const u8, port: u16, alpn: []const 
         .secret = secret,
         .random = random,
         .dcid = &[_]u8{ 0xc0, 0xff, 0xee, 0x00, 0xc0, 0xff, 0xee, 0x01 },
+        .identity = identity,
         .server_name = sni,
     }, &reply, &plain) catch |e| {
         std.debug.print("probe failed: {s}\n", .{@errorName(e)});
@@ -430,7 +436,15 @@ fn quicProbe(init: std.process.Init, host: []const u8, port: u16, alpn: []const 
             std.debug.print("server handshake secret: {x}\n", .{h.server});
         }
         if (a.alpn_len > 0) std.debug.print("alpn: {s}\n", .{a.alpn()});
-        if (a.peer_key) |k| std.debug.print("peer public key: {x}\n", .{k});
+        if (a.peer_key) |k| std.debug.print("peer node id: {s}{s}\n", .{
+            try radish.NodeId.fromPublicKey(k).encode(arena),
+            if (a.peer_verified) "" else " (unverified)",
+        });
+    }
+    if (r.confirmed) {
+        std.debug.print("handshake confirmed\n", .{});
+    } else if (r.flight_sent) {
+        std.debug.print("our flight sent, no HANDSHAKE_DONE\n", .{});
     }
     // Not an else: a server commonly answers the ServerHello and then closes,
     // which yields secrets and a reason both worth printing.

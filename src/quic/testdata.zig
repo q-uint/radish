@@ -30,6 +30,11 @@ pub const fixed_x25519_secret = "49af42ba7f7994852d713ef2784bcbcaa7911de26adc564
 /// Paired with `fixed_x25519_secret`, so the ClientHello never varies.
 pub const fixed_hello_random = "0303030303030303030303030303030303030303030303030303030303030303";
 
+/// The ed25519 seed a probe authenticates with, fixed so the peer sees the same
+/// node id every run and can be told about it in advance. Published, so tests
+/// and probes only.
+pub const fixed_identity_seed = "0404040404040404040404040404040404040404040404040404040404040404";
+
 /// The client Initial packet as it appears on the wire: header protected,
 /// payload encrypted, 1200 bytes.
 pub const rfc9001_client_initial_hex =

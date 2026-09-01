@@ -118,15 +118,13 @@ Prefer `.node` or `--from` to point at a seed you run, and do not put
 ## QUIC (2.x)
 
 Independent of `src/net/`, and pinned to RFC 9001 Appendix A and RFC 8448
-vectors. Working today:
+vectors, and completed against a live radicle 2.x node: packet protection, long
+and short headers, the frames a handshake needs, and mutual authentication with
+raw public keys, through to HANDSHAKE_DONE. A public server refuses raw public
+keys, so the peer has to be iroh; `nix build .#radicle-ng` provides one.
 
-- Initial packet protection: HKDF key derivation, header protection, AES-GCM
-- Long header parse and serialize, packet number encode/decode, coalesced datagrams
-- PADDING, PING, CRYPTO, ACK and CONNECTION_CLOSE frames
-- TLS 1.3 key schedule, ClientHello construction, ServerHello parse
-
-Not started: the handshake state machine, short headers, streams, flow control,
-loss recovery, congestion control.
+Not started: streams, flow control, loss recovery, congestion control, and the
+server side.
 
 ## Build
 

@@ -1,5 +1,5 @@
-//! One live QUIC first flight: send an Initial, read the reply, derive
-//! handshake secrets. Used by `radish quic-probe`, not by the test suite.
+//! One live QUIC handshake, driven over a socket. Used by `radish quic-probe`,
+//! not by the test suite.
 //!
 //! Only raw public keys are offered, so a public server answers with a
 //! CRYPTO_ERROR rather than completing. Reaching that point still exercises the
@@ -10,6 +10,8 @@ const dial = @import("../net/dial.zig");
 const client = @import("client.zig");
 const frame = @import("frame.zig");
 const tls = @import("tls.zig");
+
+const Ed25519 = std.crypto.sign.Ed25519;
 
 pub const Error = error{ NoReply, ReplyTooLarge } || client.Error;
 
@@ -23,6 +25,10 @@ pub const Result = struct {
     accepted: ?client.Accepted,
     err: ?anyerror,
     closed: ?client.Close,
+    /// Our own flight went out, so the peer had everything it needed.
+    flight_sent: bool,
+    /// HANDSHAKE_DONE arrived, so the peer accepted it.
+    confirmed: bool,
 };
 
 pub const Options = struct {
@@ -33,10 +39,14 @@ pub const Options = struct {
     secret: tls.SecretKey,
     random: [32]u8,
     dcid: []const u8,
+    /// Signs our half of mutual authentication, and is the node id the peer
+    /// sees us as.
+    identity: Ed25519.KeyPair,
     server_name: ?[]const u8 = null,
     timeout_ms: u64 = 3000,
     max_datagrams: usize = 6,
-    /// Resends of the first flight before giving up.
+    /// Resends of an unacknowledged flight before giving up. Each flight has
+    /// its own budget.
     max_retries: usize = 2,
 };
 
@@ -92,12 +102,17 @@ pub fn run(
     var datagrams: usize = 0;
     var current: []const u8 = &.{};
     var last_err: ?anyerror = null;
-    var retries: usize = 0;
+    var initial_retries: usize = 0;
+    var flight_retries: usize = 0;
+    // Our flight, kept because resending it means sealing the same bytes again.
+    var messages: [1024]u8 = undefined;
+    var flight: ?[]const u8 = null;
+    var flight_out = false;
 
     while (true) {
-        // Resend the first flight while it goes unacknowledged. Not RFC 9002
-        // loss recovery: nothing measures a round trip or backs off, which is
-        // enough to survive a dropped Initial and no more.
+        // Resend whatever is outstanding while it goes unacknowledged. Not RFC
+        // 9002 loss recovery: nothing measures a round trip or backs off, which
+        // is enough to survive a dropped flight and no more.
         var arrived: ?[]const u8 = null;
         while (true) {
             if (sock.receiveTimeout(io, reply_buf, .{ .duration = .{
@@ -107,12 +122,19 @@ pub fn run(
                 arrived = got.data;
                 break;
             } else |_| {
-                // An acknowledged Initial arrived, so silence is about
-                // something else and resending would only add noise.
-                if (retries >= opts.max_retries or hs.acked(.initial).contains(0)) break;
-                retries += 1;
                 var again: [client.max_initial_datagram]u8 = undefined;
-                const n = hs.sealInitialRetransmit(&again, initial.client_hello) catch break;
+                const n = if (flight) |f| n: {
+                    if (flight_retries >= opts.max_retries) break;
+                    flight_retries += 1;
+                    break :n hs.sealFlight(&again, f) catch break;
+                } else n: {
+                    // An acknowledged Initial arrived, so silence is about
+                    // something else and resending would only add noise.
+                    if (initial_retries >= opts.max_retries) break;
+                    if (hs.acked(.initial).contains(0)) break;
+                    initial_retries += 1;
+                    break :n hs.sealInitialRetransmit(&again, initial.client_hello) catch break;
+                };
                 sock.send(io, &addr, again[0..n]) catch break;
             }
         }
@@ -140,7 +162,28 @@ pub fn run(
             sock.send(io, &addr, ack[0..n]) catch {};
         }
 
-        if (hs.done() or datagrams >= opts.max_datagrams) break;
+        // The server's Finished checks out, so our own flight can go: it waits
+        // for that before confirming the handshake.
+        // Writing the flight advances the transcript, so there is one attempt
+        // at it and no more, whatever happens to the packet.
+        if (hs.done() and !hs.flight_sent) send: {
+            flight = hs.writeFlight(&messages, opts.identity) catch |e| {
+                last_err = e;
+                break :send;
+            };
+            var out: [client.max_initial_datagram]u8 = undefined;
+            const n = hs.sealFlight(&out, flight.?) catch |e| {
+                last_err = e;
+                break :send;
+            };
+            sock.send(io, &addr, out[0..n]) catch |e| {
+                last_err = e;
+                break :send;
+            };
+            flight_out = true;
+        }
+
+        if (hs.confirmed or datagrams >= opts.max_datagrams) break;
     }
 
     if (datagrams == 0) return error.NoReply;
@@ -155,6 +198,8 @@ pub fn run(
         // handshake actually finished.
         .accepted = if (hs.accepted.handshake != null) hs.accepted else null,
         .err = last_err,
+        .flight_sent = flight_out,
+        .confirmed = hs.confirmed,
         .closed = hs.closed,
     };
 }

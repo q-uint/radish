@@ -1,5 +1,4 @@
-//! Assembling a QUIC client's first flight: a ClientHello in a CRYPTO frame,
-//! padded and sealed into an Initial packet.
+//! The client side of a QUIC handshake, from the first flight through 1-RTT.
 const std = @import("std");
 
 const codec = @import("../codec.zig");
@@ -362,7 +361,6 @@ pub const Handshaker = struct {
     requested: bool = false,
 
     accepted: Accepted = .{},
-    /// Set alongside `error.PeerClosed`.
     /// Set alongside `error.PeerClosed`.
     closed: ?Close = null,
     phase: Phase = .wait_server_hello,
@@ -804,16 +802,10 @@ pub const Handshaker = struct {
         return w.buffered();
     }
 
-    /// `writeFlight` sealed into a Handshake packet, addressed to the id the
-    /// server gave us.
-    pub fn sealFlight(
-        self: *Handshaker,
-        out: []u8,
-        our_scid: []const u8,
-        key: Ed25519.KeyPair,
-    ) Error!usize {
-        var messages: [1024]u8 = undefined;
-        const stream = try self.writeFlight(&messages, key);
+    /// A `writeFlight` stream sealed into a Handshake packet, addressed to the
+    /// id the server gave us. The packet number is fresh each time, so resending
+    /// is calling this again with the same bytes.
+    pub fn sealFlight(self: *Handshaker, out: []u8, stream: []const u8) Error!usize {
         const hs = self.accepted.handshake orelse return error.HandshakeIncomplete;
         const pn = self.takePacketNumber(.handshake);
 
@@ -824,7 +816,7 @@ pub const Handshaker = struct {
         return packet.seal(out, .{
             .kind = .handshake,
             .dcid = self.accepted.scid(),
-            .scid = our_scid,
+            .scid = self.our_scid[0..self.our_cid_len],
             .pn = pn,
             .pn_len = 4,
         }, fw.buffered(), crypto.keysFromSecret(hs.client));
@@ -1108,8 +1100,9 @@ test "walks a coalesced flight and reads a raw public key certificate" {
     // Certificate echoing the request context, CertificateVerify over the
     // transcript through it, then Finished under the client secret.
     const our_key = try Ed25519.KeyPair.generateDeterministic(@splat(9));
+    var messages_buf: [1024]u8 = undefined;
     var flight: [1024]u8 = undefined;
-    const sent = try h.sealFlight(&flight, &dcid, our_key);
+    const sent = try h.sealFlight(&flight, try h.writeFlight(&messages_buf, our_key));
 
     var mirror: handshake.Transcript = .{};
     mirror.update(initial.client_hello);
