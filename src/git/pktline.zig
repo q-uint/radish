@@ -3,7 +3,16 @@
 //! 0001 delimiter, 0002 response-end. Data lines carry 4..65516 payload bytes.
 const std = @import("std");
 
-pub const MAX_DATA = 65516; // 65520 - 4
+/// The 4-hex length prefix, which counts itself.
+pub const LENGTH_LEN = 4;
+
+/// The longest a whole line may be, prefix included. Not 0xffff, which the
+/// four hex digits could express: the spec stops here.
+/// Source: gitprotocol-common, "Implementations MUST NOT send pkt-line whose
+/// length exceeds 65520".
+pub const MAX_LINE = 65520;
+
+pub const MAX_DATA = MAX_LINE - LENGTH_LEN;
 
 /// The three special zero-payload pkt-lines, by their length-field value.
 pub const Marker = enum(u16) {

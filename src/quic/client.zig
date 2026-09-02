@@ -1579,7 +1579,8 @@ test "sending stops at the limit the peer gave" {
     const dcid = hex(testdata.other_dcid);
     var initial_crypto: [1024]u8 = undefined;
     var handshake_crypto: [1024]u8 = undefined;
-    var send_buf: [64]u8 = undefined;
+    // Two full packets' worth, since the test fills the sender.
+    var send_buf: [2 * max_stream_chunk]u8 = undefined;
     var stream_buf: [64]u8 = undefined;
     var h = Handshaker.init(.{
         .original_dcid = &dcid,
@@ -1612,6 +1613,20 @@ test "sending stops at the limit the peer gave" {
     // A MAX_STREAM_DATA for our stream reopens it, up to the connection limit.
     try h.appFrames(&[_]u8{ 0x11, 0x00, 0x40, 0x40 });
     try testing.expectEqual(@as(u64, 2), h.sendRoom());
+
+    // One packet holds only so much, whatever the window says: more than that
+    // is the caller's to split.
+    h.send_data.extend(4 * max_stream_chunk);
+    h.send_stream.extend(4 * max_stream_chunk);
+    var big: [max_stream_chunk + 1]u8 = @splat(0xab);
+    try testing.expectError(error.StreamChunkTooLong, h.sealStream(&out, &big, false));
+
+    var full: [max_stream_chunk]u8 = @splat(0xab);
+    var packet_buf: [max_initial_datagram]u8 = undefined;
+    _ = try h.sealStream(&packet_buf, &full, false);
+    // A send continues the stream rather than restarting it: the two bytes
+    // above, then a full packet.
+    try testing.expectEqual(2 + max_stream_chunk, h.sender.next());
 }
 
 test "a handshake message out of turn is refused" {

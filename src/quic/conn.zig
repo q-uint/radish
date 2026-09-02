@@ -52,6 +52,9 @@ pub const Conn = struct {
     /// connection that lives on needs a budget that refills, unlike the
     /// handshake's one-shot ones.
     stream_retries: usize = 0,
+    /// How long the connection has been quiet, counted in receive timeouts,
+    /// which is the only clock this has.
+    quiet_ms: u64 = 0,
 
     /// Bytes in the Initial datagram, and what has come back since.
     sent: usize = 0,
@@ -130,24 +133,34 @@ pub const Conn = struct {
         self.sock.close(self.io);
     }
 
+    /// What one turn of the connection produced.
+    pub const Serviced = enum {
+        /// A datagram arrived and was handled.
+        arrived,
+        /// The peer sent CONNECTION_CLOSE; `hs.closed` says why.
+        closed,
+        /// Nothing arrived, and there is nothing left to resend.
+        silent,
+    };
+
     /// Reads datagrams until the handshake is confirmed, the peer closes, or
     /// the datagram budget runs out.
     pub fn handshake(self: *Conn) !void {
         while (self.datagrams < self.opts.max_datagrams) {
-            if (!try self.service()) break;
+            if (try self.service() != .arrived) break;
             if (self.hs.confirmed) return;
         }
         if (self.datagrams == 0) return error.NoReply;
     }
 
-    /// One datagram in, and whatever it obliges us to send back out. False when
-    /// nothing arrived before the retries ran out.
-    pub fn service(self: *Conn) !bool {
-        const arrived = self.receive() orelse return false;
+    /// One datagram in, and whatever it obliges us to send back out.
+    pub fn service(self: *Conn) !Serviced {
+        const arrived = self.receive() orelse return .silent;
         self.datagrams += 1;
         self.received += arrived.len;
         self.last = arrived;
         self.stream_retries = 0;
+        self.quiet_ms = 0;
 
         if (arrived.len > self.work.len) {
             self.last_err = error.DatagramTooLarge;
@@ -157,7 +170,7 @@ pub const Conn = struct {
                 self.last_err = e;
                 // A close is the end of the connection, so reading on would
                 // only overwrite the reason with the next datagram.
-                if (e == error.PeerClosed) return false;
+                if (e == error.PeerClosed) return .closed;
             };
         }
 
@@ -198,7 +211,7 @@ pub const Conn = struct {
             };
             self.flight_out = true;
         }
-        return true;
+        return .arrived;
     }
 
     /// Waits for a datagram, resending whatever is outstanding while nothing
@@ -224,9 +237,18 @@ pub const Conn = struct {
     fn retransmit(self: *Conn, out: []u8) ?usize {
         if (self.hs.confirmed) {
             if (self.stream_retries >= self.opts.max_retries) return null;
-            const n = self.hs.resendStream(out) catch null orelse return null;
+            if (self.hs.resendStream(out) catch null) |n| {
+                self.stream_retries += 1;
+                return n;
+            }
+            // Nothing outstanding, so the silence is just a quiet connection.
+            // Each timeout is one clock tick we have; past half the idle
+            // timeout, a PING keeps the peer from dropping us.
+            self.quiet_ms += self.opts.timeout_ms;
+            if (self.quiet_ms < self.hs.idleTimeoutMs() / 2) return null;
+            self.quiet_ms = 0;
             self.stream_retries += 1;
-            return n;
+            return self.hs.sealPing(out) catch null;
         }
         if (self.flight) |f| {
             if (self.flight_retries >= self.opts.max_retries) return null;
@@ -255,7 +277,7 @@ pub const Conn = struct {
                 @min(self.hs.sendRoom(), self.hs.sender.room()),
             );
             if (room == 0) {
-                if (!try self.service()) return error.SendStalled;
+                if (try self.service() != .arrived) return error.SendStalled;
                 continue;
             }
 
@@ -267,13 +289,6 @@ pub const Conn = struct {
             rest = rest[take..];
             if (rest.len == 0) return;
         }
-    }
-
-    /// Holds the connection open while it is quiet.
-    pub fn ping(self: *Conn) !void {
-        var out: [client.max_initial_datagram]u8 = undefined;
-        const n = try self.hs.sealPing(&out);
-        try self.sock.send(self.io, &self.addr, out[0..n]);
     }
 
     /// Stream bytes in order and not yet consumed.
@@ -288,6 +303,7 @@ pub const Conn = struct {
 
 const testing = std.testing;
 const testdata = @import("testdata.zig");
+
 
 test "opening sets every field, whatever the memory held" {
     const c = try testing.allocator.create(Conn);

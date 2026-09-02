@@ -218,6 +218,8 @@ fn formatAddress(allocator: std.mem.Allocator, addr: protocol.Address) ![]u8 {
             onionName(addr.host, &name);
             break :blk std.fmt.allocPrint(allocator, "{s}.onion:{d}", .{ name, addr.port });
         },
+        // An iroh peer is reached by node id, so there is no host to render.
+        .iroh => allocator.dupe(u8, "iroh"),
         _ => std.fmt.allocPrint(allocator, "<unknown kind {d}>:{d}", .{ @backingInt(addr.kind), addr.port }),
     };
 }

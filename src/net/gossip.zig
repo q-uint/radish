@@ -8,7 +8,7 @@ const codec = @import("../codec.zig");
 const protocol = @import("protocol.zig");
 const quic = @import("../quic/mod.zig");
 
-pub const Error = error{ MessageTooLong, NoAnswer, HandshakeUnconfirmed } ||
+pub const Error = error{ MessageTooLong, Malformed, NoAnswer, HandshakeUnconfirmed } ||
     quic.conn.Error;
 
 /// The gossip ALPN. A connection carrying anything else is a different
@@ -33,14 +33,14 @@ pub fn frame(out: []u8, message: []const u8) ![]u8 {
 
 /// Reads the first whole message out of `buf`, or null while it is still
 /// arriving. A length past what a message may be is fatal: the stream is
-/// misframed from here on.
-pub fn next(buf: []const u8) Error!?Framed {
+/// misframed from here on. `oid_buf` receives an inventory's oids.
+pub fn next(buf: []const u8, oid_buf: [][20]u8) Error!?Framed {
     var r = codec.Reader{ .buf = buf };
     const len = r.varint() catch return null;
     if (len > protocol.MAX_MESSAGE_SIZE) return error.MessageTooLong;
     const payload = r.take(@intCast(len)) catch return null;
     return .{
-        .message = protocol.decodeMessage(payload) catch return error.MessageTooLong,
+        .message = protocol.decodeMessage(payload, oid_buf) catch return error.Malformed,
         .consumed = r.pos,
     };
 }
@@ -66,8 +66,13 @@ pub fn ping(
 
     // The node answers on the same stream; anything else it sends first is
     // still gossip and gets skipped past.
-    while (try c.service()) {
-        while (try next(c.readable())) |got| {
+    while (true) {
+        switch (try c.service()) {
+            .arrived => {},
+            .closed => return error.PeerClosed,
+            .silent => return error.NoAnswer,
+        }
+        while (try next(c.readable(), &.{})) |got| {
             c.consume(got.consumed);
             switch (got.message) {
                 .pong => |p| return p,
@@ -75,7 +80,6 @@ pub fn ping(
             }
         }
     }
-    return error.NoAnswer;
 }
 
 const testing = std.testing;
@@ -89,12 +93,12 @@ test "a framed message reads back" {
     // One length byte for a message this short, then the message itself.
     try testing.expectEqual(message.len + 1, framed.len);
 
-    const got = (try next(framed)).?;
+    const got = (try next(framed, &.{})).?;
     try testing.expectEqual(framed.len, got.consumed);
     try testing.expectEqual(@as(u16, 3), got.message.ping.ponglen);
 }
 
-test "a message still arriving reads as nothing yet" {
+test "a message arriving in pieces reads once it is whole" {
     const message = try protocol.encodePong(testing.allocator, 2);
     defer testing.allocator.free(message);
 
@@ -103,9 +107,24 @@ test "a message still arriving reads as nothing yet" {
 
     // Every prefix of a whole message is incomplete, including an empty one.
     for (0..framed.len) |n| {
-        try testing.expectEqual(@as(?Framed, null), try next(framed[0..n]));
+        try testing.expectEqual(@as(?Framed, null), try next(framed[0..n], &.{}));
     }
-    try testing.expectEqual(@as(u16, 2), (try next(framed)).?.message.pong.zeroes);
+
+    // Through the receiver a connection reads from, split the way two
+    // datagrams would arrive.
+    var stream_buf: [64]u8 = undefined;
+    var r = quic.stream.Receiver.init(&stream_buf, stream_buf.len);
+    const half = framed.len / 2;
+    try r.push(.{ .id = 0, .offset = 0, .data = framed[0..half], .fin = false });
+    try testing.expectEqual(@as(?Framed, null), try next(r.readable(), &.{}));
+
+    try r.push(.{ .id = 0, .offset = half, .data = framed[half..], .fin = false });
+    const got = (try next(r.readable(), &.{})).?;
+    try testing.expectEqual(@as(u16, 2), got.message.pong.zeroes);
+
+    // Consuming it leaves the stream empty, ready for the next one.
+    r.consume(got.consumed);
+    try testing.expectEqual(@as(?Framed, null), try next(r.readable(), &.{}));
 }
 
 test "a length no message could have is fatal" {
@@ -113,5 +132,5 @@ test "a length no message could have is fatal" {
     var buf: [8]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try codec.writeVarint(&w, 1 << 20);
-    try testing.expectError(error.MessageTooLong, next(w.buffered()));
+    try testing.expectError(error.MessageTooLong, next(w.buffered(), &.{}));
 }

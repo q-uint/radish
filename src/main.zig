@@ -426,10 +426,10 @@ fn quicPing(init: std.process.Init, host: []const u8, port: u16) !void {
     std.debug.print("quic ping {s}:{d} as {s}\n", .{ host, port, our_nid });
 
     const c = try arena.create(quic.conn.Conn);
-    const pong = radish.net.v2.ping(init.io, arena, c, .{
+    const pong = radish.net.gossip.ping(init.io, arena, c, .{
         .host = host,
         .port = port,
-        .alpn = radish.net.v2.alpn_gossip,
+        .alpn = radish.net.gossip.alpn_gossip,
         .secret = secret,
         .random = random,
         .dcid = &dcid,
