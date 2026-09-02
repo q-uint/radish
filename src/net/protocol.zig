@@ -154,32 +154,46 @@ pub fn gitUploadPackLine(allocator: std.mem.Allocator, rid: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{x:0>4}{s}", .{ total, payload });
 }
 
-/// Encodes a gossip `Ping` as a full frame. Caller owns the result.
-pub fn encodePingFrame(allocator: std.mem.Allocator, ping: Ping) ![]u8 {
+/// Encodes a `Ping` message, with no transport framing around it. 1.x wraps
+/// this in a gossip frame; 2.x length-prefixes it on a QUIC stream. Caller owns
+/// the result.
+pub fn encodePing(allocator: std.mem.Allocator, ping: Ping) ![]u8 {
     var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(allocator);
+    errdefer msg.deinit(allocator);
     const mw = codec.Writer{ .out = &msg, .allocator = allocator };
-    // Message: type_id ++ ponglen ++ zeroes(len ++ zero bytes).
+    // type_id ++ ponglen ++ zeroes(len ++ zero bytes).
     try mw.writeU16(@backingInt(MessageType.ping));
     try mw.writeU16(ping.ponglen);
     try mw.writeU16(ping.zeroes);
     var i: u16 = 0;
     while (i < ping.zeroes) : (i += 1) try mw.writeU8(0);
-
-    return wrapGossip(allocator, msg.items);
+    return msg.toOwnedSlice(allocator);
 }
 
-/// Encodes a gossip `Pong` as a full frame. Caller owns the result.
-pub fn encodePongFrame(allocator: std.mem.Allocator, zeroes: u16) ![]u8 {
+/// Encodes a `Pong` message, with no transport framing. Caller owns the result.
+pub fn encodePong(allocator: std.mem.Allocator, zeroes: u16) ![]u8 {
     var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(allocator);
+    errdefer msg.deinit(allocator);
     const mw = codec.Writer{ .out = &msg, .allocator = allocator };
     try mw.writeU16(@backingInt(MessageType.pong));
     try mw.writeU16(zeroes);
     var i: u16 = 0;
     while (i < zeroes) : (i += 1) try mw.writeU8(0);
+    return msg.toOwnedSlice(allocator);
+}
 
-    return wrapGossip(allocator, msg.items);
+/// Encodes a gossip `Ping` as a full frame. Caller owns the result.
+pub fn encodePingFrame(allocator: std.mem.Allocator, ping: Ping) ![]u8 {
+    const msg = try encodePing(allocator, ping);
+    defer allocator.free(msg);
+    return wrapGossip(allocator, msg);
+}
+
+/// Encodes a gossip `Pong` as a full frame. Caller owns the result.
+pub fn encodePongFrame(allocator: std.mem.Allocator, zeroes: u16) ![]u8 {
+    const msg = try encodePong(allocator, zeroes);
+    defer allocator.free(msg);
+    return wrapGossip(allocator, msg);
 }
 
 /// Max addresses in a NodeAnnouncement (radicle service/message.rs).
@@ -242,10 +256,15 @@ pub fn decodeFrame(buf: []const u8) !DecodedFrame {
     _ = try r.varint(); // stream id
     const len = try r.varint();
     const payload = try r.take(@intCast(len));
+    return .{ .message = try decodeMessage(payload), .consumed = r.pos };
+}
 
+/// Decodes one message, with no transport framing around it. Shared by 1.x
+/// frames and 2.x streams, which differ only in how they delimit this.
+pub fn decodeMessage(payload: []const u8) !Message {
     var mr = codec.Reader{ .buf = payload };
     const type_id: MessageType = @fromBackingInt(@intCast(try mr.readU16()));
-    const message: Message = switch (type_id) {
+    return switch (type_id) {
         .ping => .{ .ping = .{
             .ponglen = try mr.readU16(),
             .zeroes = try readZeroBytes(&mr),
@@ -253,7 +272,6 @@ pub fn decodeFrame(buf: []const u8) !DecodedFrame {
         .pong => .{ .pong = .{ .zeroes = try readZeroBytes(&mr) } },
         else => .{ .other = type_id },
     };
-    return .{ .message = message, .consumed = r.pos };
 }
 
 fn readZeroBytes(r: *codec.Reader) !u16 {

@@ -14,8 +14,6 @@ pub const Error = error{
     BufferTooSmall,
     NotServerHello,
     Malformed,
-    CryptoStreamTooLong,
-    CryptoStreamGaps,
 } || codec.Error;
 
 /// TLS 1.3 pins this field at the TLS 1.2 value and negotiates the real
@@ -410,64 +408,6 @@ pub const MessageIterator = struct {
     }
 };
 
-/// Reassembles the CRYPTO stream. A handshake message can span packets and the
-/// pieces can arrive out of order, so every offset is tracked.
-/// Source: RFC 9000 s19.6.
-pub const Reassembler = struct {
-    buf: []u8,
-    ranges: [max_ranges]Range = undefined,
-    count: usize = 0,
-
-    /// A handshake needs a handful; more means the peer is fragmenting far
-    /// beyond anything useful.
-    pub const max_ranges = 8;
-
-    const Range = struct {
-        start: u64,
-        end: u64,
-
-        fn lessThan(_: void, a: Range, b: Range) bool {
-            return a.start < b.start;
-        }
-    };
-
-    pub fn init(buf: []u8) Reassembler {
-        return .{ .buf = buf };
-    }
-
-    /// Copies one CRYPTO frame's data into place.
-    pub fn push(self: *Reassembler, offset: u64, data: []const u8) Error!void {
-        if (data.len == 0) return;
-        const end = offset + data.len;
-        if (end > self.buf.len) return error.CryptoStreamTooLong;
-        @memcpy(self.buf[@intCast(offset)..][0..data.len], data);
-
-        // Merge into the disjoint set, so `contiguous` can trust range 0.
-        var new: Range = .{ .start = offset, .end = end };
-        var kept: usize = 0;
-        for (self.ranges[0..self.count]) |e| {
-            if (e.end < new.start or e.start > new.end) {
-                self.ranges[kept] = e;
-                kept += 1;
-            } else {
-                new.start = @min(new.start, e.start);
-                new.end = @max(new.end, e.end);
-            }
-        }
-        if (kept == max_ranges) return error.CryptoStreamGaps;
-        self.ranges[kept] = new;
-        self.count = kept + 1;
-        std.mem.sort(Range, self.ranges[0..self.count], {}, Range.lessThan);
-    }
-
-    /// Bytes available from offset 0. A gap at the front yields nothing, since
-    /// a parser cannot skip one.
-    pub fn contiguous(self: *const Reassembler) []const u8 {
-        if (self.count == 0 or self.ranges[0].start != 0) return &.{};
-        return self.buf[0..@intCast(self.ranges[0].end)];
-    }
-};
-
 /// Running hash over handshake messages, in the order they are sent. QUIC has
 /// no record layer, so the messages are hashed exactly as they go on the wire.
 pub const Transcript = struct {
@@ -602,33 +542,6 @@ test "walks whole handshake messages and stops on a partial one" {
     // boundary so a later pass can retry it.
     try testing.expectEqual(@as(?Message, null), it.next());
     try testing.expectEqual(@as(usize, 11), it.pos);
-}
-
-test "reassembles crypto fragments in any order" {
-    var buf: [16]u8 = @splat(0);
-    var r = Reassembler.init(&buf);
-
-    // The tail first: nothing is readable until the gap at the front closes.
-    try r.push(4, &.{ 4, 5, 6, 7 });
-    try testing.expectEqual(@as(usize, 0), r.contiguous().len);
-
-    try r.push(0, &.{ 0, 1, 2, 3 });
-    try testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3, 4, 5, 6, 7 }, r.contiguous());
-
-    // A retransmit overlapping what we have changes nothing.
-    try r.push(2, &.{ 2, 3, 4 });
-    try testing.expectEqual(@as(usize, 8), r.contiguous().len);
-}
-
-test "a crypto stream past the buffer or too gappy is refused" {
-    var small: [4]u8 = @splat(0);
-    var r = Reassembler.init(&small);
-    try testing.expectError(error.CryptoStreamTooLong, r.push(2, &.{ 1, 2, 3 }));
-
-    var buf: [64]u8 = @splat(0);
-    var g = Reassembler.init(&buf);
-    for (0..Reassembler.max_ranges) |i| try g.push(i * 4, &.{0xaa});
-    try testing.expectError(error.CryptoStreamGaps, g.push(Reassembler.max_ranges * 4, &.{0xaa}));
 }
 
 test "extensions are type, length, body" {

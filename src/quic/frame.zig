@@ -51,6 +51,10 @@ pub const Type = enum(u64) {
     _,
 };
 
+/// The payload PATH_CHALLENGE carries and PATH_RESPONSE echoes back.
+/// Source: RFC 9000 s19.17.
+pub const path_challenge_len = 8;
+
 /// The low three bits of a STREAM frame type. `off` and `len` say which fields
 /// are present; without `len` the data runs to the end of the packet.
 /// Source: RFC 9000 s19.8.
@@ -295,6 +299,11 @@ pub const Stream = struct {
     fin: bool,
 };
 
+pub const MaxStreamData = struct {
+    id: u64,
+    max: u64,
+};
+
 /// A connection id the peer is offering for future use, with the token that
 /// would let us prove a stateless reset.
 /// Source: RFC 9000 s19.15.
@@ -324,10 +333,43 @@ pub const Frame = union(enum) {
     /// The server confirming the handshake is complete.
     /// Source: RFC 9000 s19.20.
     handshake_done,
+    /// A raised limit on everything we may send, across all streams.
+    /// Source: RFC 9000 s19.9.
+    max_data: u64,
+    /// A raised limit on what we may send on one stream.
+    /// Source: RFC 9000 s19.10.
+    max_stream_data: MaxStreamData,
     /// Parsed so the payload can be walked, but carried no further. Flow
     /// control and stream resets land here.
     ignored: Type,
 };
+
+/// Writes a STREAM frame. The length is always explicit, so another frame can
+/// follow it in the same packet.
+/// Source: RFC 9000 s19.8.
+pub fn writeStream(w: *std.Io.Writer, s: Stream) !void {
+    const flags: StreamFlags = .{ .fin = s.fin, .len = true, .off = s.offset != 0 };
+    try codec.writeVarint(w, @backingInt(Type.stream) | @as(u64, @as(u3, @bitCast(flags))));
+    try codec.writeVarint(w, s.id);
+    if (flags.off) try codec.writeVarint(w, s.offset);
+    try codec.writeVarint(w, s.data.len);
+    try w.writeAll(s.data);
+}
+
+/// Writes MAX_DATA, raising the limit on everything the peer may send.
+/// Source: RFC 9000 s19.9.
+pub fn writeMaxData(w: *std.Io.Writer, max: u64) !void {
+    try codec.writeVarint(w, @backingInt(Type.max_data));
+    try codec.writeVarint(w, max);
+}
+
+/// Writes MAX_STREAM_DATA, raising the limit on one stream.
+/// Source: RFC 9000 s19.10.
+pub fn writeMaxStreamData(w: *std.Io.Writer, m: MaxStreamData) !void {
+    try codec.writeVarint(w, @backingInt(Type.max_stream_data));
+    try codec.writeVarint(w, m.id);
+    try codec.writeVarint(w, m.max);
+}
 
 /// Whether receiving `f` obliges us to acknowledge the packet carrying it.
 /// Everything but ACK, PADDING and CONNECTION_CLOSE does, which is what stops
@@ -340,13 +382,12 @@ pub fn isAckEliciting(f: Frame) bool {
     };
 }
 
-/// Frames whose whole body is varints, and how many. Flow control and stream
-/// resets are consumed so the payload can be walked; radish sends too little to
-/// reach a limit. Null means the type is not a QUIC v1 frame.
+/// Frames whose whole body is varints, and how many. Stream limits and resets
+/// are consumed so the payload can be walked. Null means the type is not a QUIC
+/// v1 frame.
 /// Source: RFC 9000 s19.4-19.16.
 fn ignoredVarints(t: Type) ?usize {
     return switch (t) {
-        .max_data,
         .max_streams_bidi,
         .max_streams_uni,
         .data_blocked,
@@ -354,7 +395,7 @@ fn ignoredVarints(t: Type) ?usize {
         .streams_blocked_uni,
         .retire_connection_id,
         => 1,
-        .max_stream_data, .stream_data_blocked, .stop_sending => 2,
+        .stream_data_blocked, .stop_sending => 2,
         .reset_stream => 3,
         else => null,
     };
@@ -448,6 +489,11 @@ pub const Iterator = struct {
                 } };
             },
             .handshake_done => return .handshake_done,
+            .max_data => return .{ .max_data = try self.r.varint() },
+            .max_stream_data => return .{ .max_stream_data = .{
+                .id = try self.r.varint(),
+                .max = try self.r.varint(),
+            } },
             .path_challenge => return .{ .path_challenge = (try self.r.take(8))[0..8].* },
             .path_response => return .{ .path_response = (try self.r.take(8))[0..8].* },
             .new_connection_id => {
@@ -478,6 +524,42 @@ pub const Iterator = struct {
 };
 
 const testing = std.testing;
+
+test "a written STREAM frame parses back" {
+    var buf: [32]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeStream(&w, .{ .id = 4, .offset = 7, .data = &.{ 0xaa, 0xbb }, .fin = true });
+    // OFF, LEN and FIN set, so the type is 0x0f.
+    try testing.expectEqual(@as(u8, 0x0f), w.buffered()[0]);
+
+    var it = Iterator.init(w.buffered());
+    const s = (try it.next()).?.stream;
+    try testing.expectEqual(@as(u64, 4), s.id);
+    try testing.expectEqual(@as(u64, 7), s.offset);
+    try testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb }, s.data);
+    try testing.expect(s.fin);
+    try testing.expectEqual(@as(?Frame, null), try it.next());
+}
+
+test "a STREAM frame at offset zero leaves the offset out" {
+    var buf: [32]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeStream(&w, .{ .id = 0, .offset = 0, .data = &.{0xcc}, .fin = false });
+    try testing.expectEqualSlices(u8, &.{ 0x0a, 0x00, 0x01, 0xcc }, w.buffered());
+}
+
+test "written limits parse back" {
+    var buf: [32]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeMaxData(&w, 1 << 20);
+    try writeMaxStreamData(&w, .{ .id = 0, .max = 4096 });
+
+    var it = Iterator.init(w.buffered());
+    try testing.expectEqual(@as(u64, 1 << 20), (try it.next()).?.max_data);
+    const m = (try it.next()).?.max_stream_data;
+    try testing.expectEqual(@as(u64, 0), m.id);
+    try testing.expectEqual(@as(u64, 4096), m.max);
+}
 
 test "parses a CRYPTO frame followed by padding" {
     // type(06) offset(00) length(0403) then 3 bytes, then 2 padding bytes.
@@ -589,8 +671,9 @@ test "parses NEW_CONNECTION_ID and rejects a retire past its sequence" {
     try testing.expectError(error.FrameEncoding, it2.next());
 }
 
-// Consumed by shape so the walk reaches the frames that matter.
-test "flow control frames are consumed and reported as ignored" {
+// The limits are read; the rest is consumed by shape so the walk reaches the
+// frames that matter.
+test "limit frames are read and the rest walked past" {
     var payload = [_]u8{
         0x10, 0x44, 0x00, // MAX_DATA, a two-byte varint
         0x11, 0x04, 0x20, // MAX_STREAM_DATA, two varints
@@ -599,8 +682,8 @@ test "flow control frames are consumed and reported as ignored" {
         0x01, // PING, to prove the walk arrived
     };
     var it = Iterator.init(&payload);
-    try testing.expectEqual(Type.max_data, (try it.next()).?.ignored);
-    try testing.expectEqual(Type.max_stream_data, (try it.next()).?.ignored);
+    try testing.expectEqual(@as(u64, 0x400), (try it.next()).?.max_data);
+    try testing.expectEqual(@as(u64, 0x20), (try it.next()).?.max_stream_data.max);
     try testing.expectEqual(Type.reset_stream, (try it.next()).?.ignored);
     try testing.expectEqual(Type.new_token, (try it.next()).?.ignored);
     try testing.expectEqual(Frame.ping, (try it.next()).?);

@@ -54,11 +54,18 @@ pub fn main(init: std.process.Init) !void {
         return serve(init, port, sessions);
     }
 
-    if (args.len >= 4 and std.mem.eql(u8, args[1], "quic-probe")) {
-        const port = std.fmt.parseInt(u16, args[3], 10) catch return usage();
-        const alpn = if (args.len >= 5) args[4] else "h3";
-        const sni = if (args.len >= 6) args[5] else null;
-        return quicProbe(init, args[2], port, alpn, sni);
+    // Radicle 2.x, which shares nothing with the commands above but storage.
+    if (args.len >= 5 and std.mem.eql(u8, args[1], "quic")) {
+        const port = std.fmt.parseInt(u16, args[4], 10) catch return usage();
+        if (std.mem.eql(u8, args[2], "ping")) {
+            return quicPing(init, args[3], port);
+        }
+        if (std.mem.eql(u8, args[2], "probe")) {
+            const alpn = if (args.len >= 6) args[5] else "h3";
+            const sni = if (args.len >= 7) args[6] else null;
+            return quicProbe(init, args[3], port, alpn, sni);
+        }
+        return usage();
     }
 
     if (args.len >= 3 and std.mem.eql(u8, args[1], "peers")) {
@@ -115,11 +122,13 @@ fn usage() void {
         \\    --from <host>:<port>:<node-id>                        fetch from this node instead of
         \\                                                          locating a seed over gossip
         \\  radish serve       <port> [sessions]                    answer inbound connections
-        \\  radish quic-probe  <host> <port> [alpn] [sni]           send a QUIC Initial, read the
-        \\                                                          reply (default alpn h3). Only
-        \\                                                          raw public keys are offered, so
-        \\                                                          a public server closes on the
-        \\                                                          certificate
+        \\
+        \\radicle 2.x, over QUIC:
+        \\  radish quic ping   <host> <port>                        handshake, then a gossip ping/pong
+        \\  radish quic probe  <host> <port> [alpn] [sni]           send an Initial, read the reply
+        \\                                                          (default alpn h3). Only raw public
+        \\                                                          keys are offered, so a public
+        \\                                                          server closes on the certificate
         \\
     , .{});
 }
@@ -394,6 +403,55 @@ const ServePrinter = struct {
     }
 };
 
+/// A radicle 2.x ping: the QUIC handshake, then one gossip message each way.
+fn quicPing(init: std.process.Init, host: []const u8, port: u16) !void {
+    const quic = radish.quic;
+    const arena = init.arena.allocator();
+
+    // A real exchange, so the key share and the connection id are fresh: the
+    // probe's fixed ones exist to make a capture replay, and cost the session
+    // its forward secrecy. Only the identity stays fixed, so the node keeps
+    // seeing the same peer.
+    var secret: [32]u8 = undefined;
+    try init.io.randomSecure(&secret);
+    var random: [32]u8 = undefined;
+    try init.io.randomSecure(&random);
+    var dcid: [8]u8 = undefined;
+    try init.io.randomSecure(&dcid);
+    var seed: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&seed, quic.testdata.fixed_identity_seed);
+    const identity = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+
+    const our_nid = try radish.NodeId.fromPublicKey(identity.public_key.toBytes()).encode(arena);
+    std.debug.print("quic ping {s}:{d} as {s}\n", .{ host, port, our_nid });
+
+    const c = try arena.create(quic.conn.Conn);
+    const pong = radish.net.v2.ping(init.io, arena, c, .{
+        .host = host,
+        .port = port,
+        .alpn = radish.net.v2.alpn_gossip,
+        .secret = secret,
+        .random = random,
+        .dcid = &dcid,
+        .identity = identity,
+    }, 8) catch |e| {
+        std.debug.print("quic ping failed: {s}\n", .{@errorName(e)});
+        if (c.hs.closed) |close| {
+            std.debug.print("  peer closed: 0x{x} {s}\n", .{ close.error_code, close.reason() });
+        }
+        if (c.last_err) |last| std.debug.print("  last error: {s}\n", .{@errorName(last)});
+        return e;
+    };
+    defer c.close();
+
+    if (c.hs.accepted.peer_key) |k| {
+        std.debug.print("peer node id: {s}\n", .{
+            try radish.NodeId.fromPublicKey(k).encode(arena),
+        });
+    }
+    std.debug.print("pong: {d} zeroes\n", .{pong.zeroes});
+}
+
 /// One QUIC first flight against a live server. The x25519 key is fixed, so a
 /// recorded reply replays byte for byte; that also means the exchange has no
 /// forward secrecy, which is fine for a probe of public traffic.
@@ -407,28 +465,37 @@ fn quicProbe(init: std.process.Init, host: []const u8, port: u16, alpn: []const 
     var seed: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&seed, quic.testdata.fixed_identity_seed);
     const identity = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const dcid = quic.testdata.hex(quic.testdata.fixed_dcid);
 
-    var reply: [2048]u8 = undefined;
-    var plain: [2048]u8 = undefined;
     const our_nid = try radish.NodeId.fromPublicKey(identity.public_key.toBytes()).encode(arena);
-    std.debug.print("quic-probe {s}:{d} alpn={s} as {s}\n", .{ host, port, alpn, our_nid });
+    std.debug.print("quic probe {s}:{d} alpn={s} as {s}\n", .{ host, port, alpn, our_nid });
 
-    const r = quic.probe.run(init.io, .{
+    // Every buffer the connection reports from lives in here, so it stays put.
+    const c = try arena.create(quic.conn.Conn);
+    c.open(init.io, .{
         .host = host,
         .port = port,
         .alpn = alpn,
         .secret = secret,
         .random = random,
-        .dcid = &[_]u8{ 0xc0, 0xff, 0xee, 0x00, 0xc0, 0xff, 0xee, 0x01 },
+        .dcid = &dcid,
         .identity = identity,
         .server_name = sni,
-    }, &reply, &plain) catch |e| {
+    }) catch |e| {
+        std.debug.print("probe failed: {s}\n", .{@errorName(e)});
+        return e;
+    };
+    defer c.close();
+    c.handshake() catch |e| {
         std.debug.print("probe failed: {s}\n", .{@errorName(e)});
         return e;
     };
 
-    std.debug.print("sent {d} bytes, received {d} in {d} datagram(s)\n", .{ r.sent, r.received, r.datagrams });
-    if (r.accepted) |a| {
+    std.debug.print("sent {d} bytes, received {d} in {d} datagram(s)\n", .{ c.sent, c.received, c.datagrams });
+    // Partial progress is worth printing: a peer that answers the ServerHello
+    // and then closes still yields secrets and a reason.
+    if (c.hs.accepted.handshake != null) {
+        const a = c.hs.accepted;
         std.debug.print("cipher suite 0x{x:0>4}\n", .{a.cipher_suite});
         std.debug.print("server connection id: {x}\n", .{a.scid()});
         if (a.handshake) |h| {
@@ -441,33 +508,31 @@ fn quicProbe(init: std.process.Init, host: []const u8, port: u16, alpn: []const 
             if (a.peer_verified) "" else " (unverified)",
         });
     }
-    if (r.confirmed) {
+    if (c.hs.confirmed) {
         std.debug.print("handshake confirmed\n", .{});
-    } else if (r.flight_sent) {
+    } else if (c.flight_out) {
         std.debug.print("our flight sent, no HANDSHAKE_DONE\n", .{});
     }
-    // Not an else: a server commonly answers the ServerHello and then closes,
-    // which yields secrets and a reason both worth printing.
-    if (r.closed) |c| {
-        std.debug.print("peer closed: 0x{x}", .{c.error_code});
-        if (radish.quic.frame.cryptoAlert(c.error_code)) |alert| {
+    if (c.hs.closed) |close| {
+        std.debug.print("peer closed: 0x{x}", .{close.error_code});
+        if (radish.quic.frame.cryptoAlert(close.error_code)) |alert| {
             // A CRYPTO_ERROR carries the TLS alert in its low byte, which is
             // the part that says what the peer objected to.
             std.debug.print(" CRYPTO_ERROR, TLS alert {d}", .{alert});
             if (std.enums.tagName(std.crypto.tls.Alert.Description, @fromBackingInt(@intCast(alert)))) |name| {
                 std.debug.print(" ({s})", .{name});
             }
-        } else if (radish.quic.frame.transportErrorName(c.error_code)) |name| {
+        } else if (radish.quic.frame.transportErrorName(close.error_code)) |name| {
             std.debug.print(" {s}", .{name});
         }
-        if (c.frame_type) |t| std.debug.print(", triggered by frame 0x{x}", .{t});
+        if (close.frame_type) |t| std.debug.print(", triggered by frame 0x{x}", .{t});
         std.debug.print("\n", .{});
-        if (c.reason_len > 0) std.debug.print("  reason: {s}\n", .{c.reason()});
+        if (close.reason_len > 0) std.debug.print("  reason: {s}\n", .{close.reason()});
     }
-    if (r.err) |e| {
+    if (c.last_err) |e| {
         std.debug.print("could not complete the handshake: {s}\n", .{@errorName(e)});
     }
-    std.debug.print("\nreply datagram ({d} bytes):\n{x}\n", .{ r.reply.len, r.reply });
+    std.debug.print("\nreply datagram ({d} bytes):\n{x}\n", .{ c.last.len, c.last });
 }
 
 /// Answers inbound connections. The identity is generated per run, so peers

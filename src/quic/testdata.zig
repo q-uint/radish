@@ -35,6 +35,11 @@ pub const fixed_hello_random = "030303030303030303030303030303030303030303030303
 /// and probes only.
 pub const fixed_identity_seed = "0404040404040404040404040404040404040404040404040404040404040404";
 
+/// The connection id a probe opens with. RFC 9000 s7.2 wants an unpredictable
+/// value, since it seeds the Initial keys; this is the opposite, so that a
+/// recorded exchange replays. Probes only.
+pub const fixed_dcid = "c0ffee00c0ffee01";
+
 /// The client Initial packet as it appears on the wire: header protected,
 /// payload encrypted, 1200 bytes.
 pub const rfc9001_client_initial_hex =

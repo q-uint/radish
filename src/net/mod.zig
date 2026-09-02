@@ -7,6 +7,7 @@ pub const announce = @import("announce.zig");
 pub const fetch = @import("fetch.zig");
 pub const seeds = @import("seeds.zig");
 pub const node = @import("node.zig");
+pub const v2 = @import("v2.zig");
 
 test {
     _ = codec;
@@ -17,4 +18,5 @@ test {
     _ = fetch;
     _ = seeds;
     _ = node;
+    _ = v2;
 }

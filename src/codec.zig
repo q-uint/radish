@@ -6,6 +6,9 @@ const std = @import("std");
 
 pub const Error = error{ UnexpectedEnd, VarIntTooLarge, VarIntNotCanonical };
 
+/// The widest a varint gets, for sizing a buffer that must hold any value.
+pub const max_varint_len = 8;
+
 /// Bytes the canonical encoding of `v` occupies.
 pub fn varintLen(v: u64) usize {
     if (v < (1 << 6)) return 1;

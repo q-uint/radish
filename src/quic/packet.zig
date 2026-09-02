@@ -97,6 +97,14 @@ pub const Kind = enum(u2) { initial = 0, zero_rtt = 1, handshake = 2, retry = 3 
 /// Largest connection id QUIC v1 allows.
 pub const max_cid_len = 20;
 
+/// The widest packet number a header can carry, and so what radish writes.
+/// Source: RFC 9000 s17.1.
+pub const max_pn_len = 4;
+
+/// A short header is the first byte, the connection id, and the packet number.
+/// Source: RFC 9000 s17.3.
+pub const max_short_header_len = 1 + max_cid_len + max_pn_len;
+
 /// The only version we speak. Version 0 marks a Version Negotiation packet,
 /// which carries a list of versions instead of a v1 header and so needs its
 /// own parser.

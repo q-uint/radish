@@ -38,7 +38,8 @@ radish peers       <host>:<port>:<node-id>              nodes seen announcing th
 radish fetch-deps  <manifest> [dir]                     resolve `.rad` dependencies (default .rad-deps)
   --from <host>:<port>:<node-id>                        fetch from this node instead of locating a seed
 radish serve       <port> [sessions]                    answer inbound connections (one at a time)
-radish quic-probe  <host> <port> [alpn] [sni]           send a QUIC Initial, read the ServerHello
+radish quic ping   <host> <port>                        2.x: handshake, then a gossip ping/pong
+radish quic probe  <host> <port> [alpn] [sni]           2.x: send an Initial, read the reply
 ```
 
 ## Zig packages over Radicle (proof of concept)
@@ -123,8 +124,9 @@ and short headers, the frames a handshake needs, and mutual authentication with
 raw public keys, through to HANDSHAKE_DONE. A public server refuses raw public
 keys, so the peer has to be iroh; `nix build .#radicle-ng` provides one.
 
-Not started: streams, flow control, loss recovery, congestion control, and the
-server side.
+One stream runs on top, with flow control and resends of what goes
+unacknowledged; 2.x gossip rides it, reusing the 1.x message codec. Not started:
+congestion control, RFC 9002 loss recovery, key update, and the server side.
 
 ## Build
 

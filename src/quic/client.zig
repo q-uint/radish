@@ -6,6 +6,8 @@ const crypto = @import("crypto.zig");
 const handshake = @import("handshake.zig");
 const frame = @import("frame.zig");
 const packet = @import("packet.zig");
+const reassembly = @import("reassembly.zig");
+const stream = @import("stream.zig");
 const tls = @import("tls.zig");
 
 const ExtensionType = std.crypto.tls.ExtensionType;
@@ -31,7 +33,9 @@ pub const Error = error{
     KeysUnavailable,
     FlightAlreadySent,
     TransportParameterError,
-} || packet.Error || handshake.Error || frame.Error;
+    UnsupportedStream,
+    StreamChunkTooLong,
+} || packet.Error || handshake.Error || frame.Error || stream.Error;
 
 /// A u16-length-prefixed list of u16s, the shape most TLS extensions take.
 fn u16List(comptime values: []const u16) [2 + 2 * values.len]u8 {
@@ -69,6 +73,38 @@ pub const max_initial_datagram = min_initial_datagram + 8;
 /// TLS_AES_128_GCM_SHA256, the only suite the Initial keys are sized for.
 pub const cipher_suite: u16 = 0x1301;
 
+/// How much the peer may send before we raise its limit, and so how big a
+/// stream buffer must be. A window under one whole message deadlocks the
+/// stream; this clears a 64 KiB message and its length prefix.
+pub const default_window: u64 = 1 << 17;
+
+/// How long we let a connection go quiet before treating it as dead. The peer
+/// advertises its own and the lower of the two applies.
+/// Source: RFC 9000 s10.1.
+pub const idle_timeout_ms: u64 = 30_000;
+
+/// A STREAM frame's fields ahead of the data: the type byte, then the stream
+/// id, offset and length as varints.
+/// Source: RFC 9000 s19.8.
+const stream_frame_overhead = 1 + 3 * codec.max_varint_len;
+
+/// The most stream data one packet carries: what is left of a datagram every
+/// path must accept, once the header, the frame's fields and the AEAD tag have
+/// their room. Anything longer is the caller's to split.
+pub const max_stream_chunk = min_initial_datagram -
+    packet.max_short_header_len -
+    Aes128Gcm.tag_length -
+    stream_frame_overhead;
+
+/// What a peer may send us. Above an Ethernet MTU, so a datagram that does not
+/// fit is a peer ignoring its own max_udp_payload_size.
+pub const max_receive_datagram = 2048;
+
+/// Room for our handshake flight. Certificate, CertificateVerify and Finished
+/// are all fixed size for a raw public key and ed25519, the largest part being
+/// the Certificate's request context.
+pub const max_flight = 512;
+
 pub const Config = struct {
     /// Chosen by the client and used to derive both sides' Initial keys.
     dcid: []const u8,
@@ -80,6 +116,9 @@ pub const Config = struct {
     /// disables SNI so the endpoint id stays out of the ClientHello, so leave it
     /// null there.
     server_name: ?[]const u8 = null,
+    /// The flow control limits to advertise. `Handshaker.Options.stream_buf`
+    /// has to be this long, since it is where the peer's bytes land.
+    window: u64 = default_window,
 };
 
 /// Writes the extensions a QUIC ClientHello carries. ALPN is mandatory, and so
@@ -118,11 +157,14 @@ fn writeExtensions(w: *std.Io.Writer, cfg: Config) !void {
 
     var params: [64]u8 = undefined;
     var pw = std.Io.Writer.fixed(&params);
-    try handshake.writeIntTransportParam(&pw, .initial_max_data, 1 << 20);
-    try handshake.writeIntTransportParam(&pw, .initial_max_stream_data_bidi_local, 1 << 20);
-    try handshake.writeIntTransportParam(&pw, .initial_max_stream_data_bidi_remote, 1 << 20);
-    try handshake.writeIntTransportParam(&pw, .initial_max_streams_bidi, 8);
-    try handshake.writeIntTransportParam(&pw, .max_idle_timeout, 30_000);
+    try handshake.writeIntTransportParam(&pw, .initial_max_data, cfg.window);
+    try handshake.writeIntTransportParam(&pw, .initial_max_stream_data_bidi_local, cfg.window);
+    try handshake.writeIntTransportParam(&pw, .initial_max_stream_data_bidi_remote, cfg.window);
+    // None: only the one stream we open ourselves is handled, and this limit
+    // covers the streams a peer opens toward us.
+    // Source: RFC 9000 s18.2.
+    try handshake.writeIntTransportParam(&pw, .initial_max_streams_bidi, 0);
+    try handshake.writeIntTransportParam(&pw, .max_idle_timeout, idle_timeout_ms);
     try handshake.writeTransportParam(&pw, .initial_source_connection_id, cfg.scid);
     try handshake.writeExtension(w, @backingInt(ExtensionType.quic_transport_parameters), pw.buffered());
 }
@@ -180,7 +222,7 @@ pub fn initialDatagram(out: []u8, hello_buf: []u8, cfg: Config) Error!Initial {
         .dcid = cfg.dcid,
         .scid = cfg.scid,
         .pn = 0,
-        .pn_len = 4,
+        .pn_len = packet.max_pn_len,
     };
 
     const payload_len = try paddedInitialLen(out, build, frames_len);
@@ -316,16 +358,32 @@ pub const Handshaker = struct {
     /// `writeFlight` has run, so the transcript now includes our flight.
     flight_sent: bool = false,
     /// Owed back to the peer as a PATH_RESPONSE.
-    path_challenge: ?[8]u8 = null,
+    path_challenge: ?[frame.path_challenge_len]u8 = null,
 
     transcript: handshake.Transcript = .{},
     /// Each packet number space carries its own CRYPTO stream, with its own
     /// offsets: the ServerHello arrives on the Initial one, everything from
     /// EncryptedExtensions onward on the Handshake one.
-    initial_crypto: handshake.Reassembler,
-    handshake_crypto: handshake.Reassembler,
+    initial_crypto: reassembly.Reassembler,
+    handshake_crypto: reassembly.Reassembler,
     initial_read: usize = 0,
     handshake_read: usize = 0,
+
+    /// The one stream radish opens, and what the peer has sent on it. Gossip
+    /// runs over a single bidirectional stream, so there is nothing to key by
+    /// id yet.
+    /// Source: RFC 9000 s2.1.
+    stream: stream.Receiver,
+    /// What we have sent on it and not seen acknowledged.
+    sender: stream.Sender,
+    /// The peer's max_idle_timeout, in milliseconds. Zero disables it.
+    /// Source: RFC 9000 s10.1.
+    peer_idle_ms: u64 = 0,
+    /// What the peer lets us send: across the connection, and on the stream.
+    /// Both start closed and open when its transport parameters arrive.
+    /// Source: RFC 9000 s4.1.
+    send_data: stream.Window = .{ .limit = 0 },
+    send_stream: stream.Window = .{ .limit = 0 },
 
     /// What has arrived in each space, for acknowledging it and for recovering
     /// the next truncated packet number.
@@ -383,6 +441,12 @@ pub const Handshaker = struct {
         /// life. One per packet number space.
         initial_buf: []u8,
         handshake_buf: []u8,
+        /// Holds what arrives on the stream, once the handshake is over. Its
+        /// length is the window we advertised, so it has to match
+        /// `Config.window`.
+        stream_buf: []u8 = &.{},
+        /// Holds what we send there until the peer acknowledges it.
+        send_buf: []u8 = &.{},
     };
 
     pub fn init(opts: Options) Handshaker {
@@ -394,8 +458,10 @@ pub const Handshaker = struct {
                 .recv = crypto.keysFromSecret(initial.server),
             },
             .our_cid_len = opts.our_scid.len,
-            .initial_crypto = handshake.Reassembler.init(opts.initial_buf),
-            .handshake_crypto = handshake.Reassembler.init(opts.handshake_buf),
+            .initial_crypto = reassembly.Reassembler.init(opts.initial_buf),
+            .handshake_crypto = reassembly.Reassembler.init(opts.handshake_buf),
+            .stream = stream.Receiver.init(opts.stream_buf, opts.stream_buf.len),
+            .sender = stream.Sender.init(opts.send_buf),
         };
         self.original_dcid_len = opts.original_dcid.len;
         @memcpy(self.original_dcid[0..self.original_dcid_len], opts.original_dcid);
@@ -454,14 +520,21 @@ pub const Handshaker = struct {
         }
     }
 
-    /// Frames from a 1-RTT packet. STREAM data is parsed but not kept: nothing
-    /// above this consumes application data yet.
+    /// Frames from a 1-RTT packet.
     fn appFrames(self: *Handshaker, payload: []const u8) Error!void {
         var it = frame.Iterator.init(payload);
         while (try it.next()) |f| {
             if (frame.isAckEliciting(f)) self.app_received.ack_eliciting = true;
             switch (f) {
                 .ack => |a| try self.recordAck(.application, a),
+                .stream => |s| {
+                    if (s.id != stream.first_client_bidi) return error.UnsupportedStream;
+                    try self.stream.push(s);
+                },
+                .max_data => |m| self.send_data.extend(m),
+                .max_stream_data => |m| {
+                    if (m.id == stream.first_client_bidi) self.send_stream.extend(m.max);
+                },
                 .handshake_done => self.confirmed = true,
                 .path_challenge => |c| self.path_challenge = c,
                 .connection_close => |c| {
@@ -473,6 +546,122 @@ pub const Handshaker = struct {
         }
     }
 
+    /// Sends `data` on the stream, sealed as 1-RTT. The offset advances by what
+    /// goes out, so successive calls continue the same stream.
+    /// Source: RFC 9000 s19.8.
+    pub fn sealStream(self: *Handshaker, out: []u8, data: []const u8, fin: bool) Error!usize {
+        if (data.len > max_stream_chunk) return error.StreamChunkTooLong;
+        // Both limits bind, and neither is spent until the packet is built.
+        if (data.len > self.sendRoom()) return error.FlowControlBlocked;
+
+        const pn = self.takePacketNumber(.application);
+        const n = try self.sealStreamAt(out, pn, self.sender.next(), data, fin);
+        try self.sender.sent(pn, data, fin);
+        try self.send_data.take(data.len);
+        try self.send_stream.take(data.len);
+        return n;
+    }
+
+    /// Sends the oldest unacknowledged chunk again, under a fresh packet
+    /// number, or null when the peer has acknowledged everything.
+    /// Source: RFC 9000 s13.3.
+    pub fn resendStream(self: *Handshaker, out: []u8) Error!?usize {
+        self.sender.ack(&self.app_acked);
+        const chunk = self.sender.unacked() orelse return null;
+
+        const pn = self.takePacketNumber(.application);
+        const n = try self.sealStreamAt(
+            out,
+            pn,
+            chunk.offset,
+            self.sender.bytes(chunk.*),
+            chunk.fin,
+        );
+        chunk.pn = pn;
+        return n;
+    }
+
+    fn sealStreamAt(
+        self: *Handshaker,
+        out: []u8,
+        pn: u64,
+        offset: u64,
+        data: []const u8,
+        fin: bool,
+    ) Error!usize {
+        const keys = (self.app_keys orelse return error.HandshakeIncomplete).send;
+        var payload: [max_stream_chunk + stream_frame_overhead]u8 = undefined;
+        var pw = std.Io.Writer.fixed(&payload);
+        frame.writeStream(&pw, .{
+            .id = stream.first_client_bidi,
+            .offset = offset,
+            .data = data,
+            .fin = fin,
+        }) catch return error.BufferTooSmall;
+
+        return packet.sealShort(out, .{
+            .dcid = self.accepted.scid(),
+            .pn = pn,
+            .pn_len = packet.max_pn_len,
+        }, pw.buffered(), keys);
+    }
+
+    /// A PING, which carries nothing and only asks to be acknowledged. Sent
+    /// before the idle timeout to hold a quiet connection open.
+    /// Source: RFC 9000 s19.2, s10.1.
+    pub fn sealPing(self: *Handshaker, out: []u8) Error!usize {
+        const keys = (self.app_keys orelse return error.HandshakeIncomplete).send;
+        var payload: [codec.max_varint_len]u8 = @splat(0);
+        var pw = std.Io.Writer.fixed(&payload);
+        codec.writeVarint(&pw, @backingInt(frame.Type.ping)) catch return error.BufferTooSmall;
+
+        return packet.sealShort(out, .{
+            .dcid = self.accepted.scid(),
+            .pn = self.takePacketNumber(.application),
+            .pn_len = packet.max_pn_len,
+        }, pw.buffered(), keys);
+    }
+
+    /// When the connection dies without traffic: the lower of the two
+    /// advertised timeouts, or zero when neither side set one.
+    /// Source: RFC 9000 s10.1.
+    pub fn idleTimeoutMs(self: *const Handshaker) u64 {
+        if (self.peer_idle_ms == 0) return idle_timeout_ms;
+        return @min(idle_timeout_ms, self.peer_idle_ms);
+    }
+
+    /// How much the peer will still take from us.
+    pub fn sendRoom(self: *const Handshaker) u64 {
+        return @min(self.send_data.room(), self.send_stream.room());
+    }
+
+    /// Raises the peer's limits once the reader has freed enough of the buffer,
+    /// or null when there is nothing worth sending. One stream, so the
+    /// connection limit and the stream limit move together.
+    /// Source: RFC 9000 s4.1.
+    pub fn sealMaxData(self: *Handshaker, out: []u8) Error!?usize {
+        const keys = (self.app_keys orelse return error.HandshakeIncomplete).send;
+        if (!self.stream.wantsGrant()) return null;
+        const grant = self.stream.grant();
+
+        // MAX_STREAM_DATA is a type and two varints, MAX_DATA a type and one.
+        var payload: [2 + 3 * codec.max_varint_len]u8 = undefined;
+        var pw = std.Io.Writer.fixed(&payload);
+        frame.writeMaxStreamData(&pw, .{
+            .id = stream.first_client_bidi,
+            .max = grant,
+        }) catch return error.BufferTooSmall;
+        frame.writeMaxData(&pw, grant) catch return error.BufferTooSmall;
+
+        const n = try packet.sealShort(out, .{
+            .dcid = self.accepted.scid(),
+            .pn = self.takePacketNumber(.application),
+            .pn_len = packet.max_pn_len,
+        }, pw.buffered(), keys);
+        self.stream.window.extend(grant);
+        return n;
+    }
+
     /// A PATH_RESPONSE echoing the challenge the peer sent, sealed as 1-RTT.
     /// Source: RFC 9000 s8.2.
     pub fn sealPathResponse(self: *Handshaker, out: []u8) Error!?usize {
@@ -480,7 +669,7 @@ pub const Handshaker = struct {
         const keys = (self.app_keys orelse return error.HandshakeIncomplete).send;
         const pn = self.takePacketNumber(.application);
 
-        var payload: [64]u8 = @splat(0);
+        var payload: [codec.max_varint_len + frame.path_challenge_len]u8 = @splat(0);
         var pw = std.Io.Writer.fixed(&payload);
         codec.writeVarint(&pw, @backingInt(frame.Type.path_response)) catch return error.BufferTooSmall;
         pw.writeAll(&challenge) catch return error.BufferTooSmall;
@@ -488,7 +677,7 @@ pub const Handshaker = struct {
         const n = try packet.sealShort(out, .{
             .dcid = self.accepted.scid(),
             .pn = pn,
-            .pn_len = 4,
+            .pn_len = packet.max_pn_len,
         }, pw.buffered(), keys);
         self.path_challenge = null;
         return n;
@@ -514,7 +703,7 @@ pub const Handshaker = struct {
                 self.original_dcid[0..self.original_dcid_len],
             .scid = self.our_scid[0..self.our_cid_len],
             .pn = self.takePacketNumber(.initial),
-            .pn_len = 4,
+            .pn_len = packet.max_pn_len,
         };
 
         const payload_len = try paddedInitialLen(out, build, frames_len);
@@ -597,7 +786,7 @@ pub const Handshaker = struct {
             .dcid = self.accepted.scid(),
             .scid = self.our_scid[0..self.our_cid_len],
             .pn = pn,
-            .pn_len = 4,
+            .pn_len = packet.max_pn_len,
         };
 
         // A client expands every datagram carrying an Initial to 1200 bytes,
@@ -616,7 +805,7 @@ pub const Handshaker = struct {
             .application => try packet.sealShort(out, .{
                 .dcid = self.accepted.scid(),
                 .pn = pn,
-                .pn_len = 4,
+                .pn_len = packet.max_pn_len,
             }, pw.buffered(), (self.app_keys orelse return error.KeysUnavailable).send),
         };
         tracker.ack_eliciting = false;
@@ -637,8 +826,8 @@ pub const Handshaker = struct {
             switch (f) {
                 .ack => |a| try self.recordAck(if (kind == .initial) .initial else .handshake, a),
                 .crypto => |c| {
-                    const stream = if (kind == .initial) &self.initial_crypto else &self.handshake_crypto;
-                    try stream.push(c.offset, c.data);
+                    const crypto_stream = if (kind == .initial) &self.initial_crypto else &self.handshake_crypto;
+                    try crypto_stream.push(c.offset, c.data);
                 },
                 .connection_close => |c| {
                     self.closed = .from(c);
@@ -651,8 +840,8 @@ pub const Handshaker = struct {
 
     /// Hands every newly complete message to `message`, advancing the stream's
     /// read watermark by whole messages so the next pass starts on a boundary.
-    fn drain(self: *Handshaker, stream: *const handshake.Reassembler, read: *usize) Error!void {
-        var it = handshake.MessageIterator.init(stream.contiguous()[read.*..]);
+    fn drain(self: *Handshaker, crypto_stream: *const reassembly.Reassembler, read: *usize) Error!void {
+        var it = handshake.MessageIterator.init(crypto_stream.contiguous()[read.*..]);
         while (it.next()) |msg| {
             // Consumed before dispatch: `message` hashes into the transcript
             // before it can fail, so a retry would hash it twice.
@@ -805,20 +994,21 @@ pub const Handshaker = struct {
     /// A `writeFlight` stream sealed into a Handshake packet, addressed to the
     /// id the server gave us. The packet number is fresh each time, so resending
     /// is calling this again with the same bytes.
-    pub fn sealFlight(self: *Handshaker, out: []u8, stream: []const u8) Error!usize {
+    pub fn sealFlight(self: *Handshaker, out: []u8, flight: []const u8) Error!usize {
         const hs = self.accepted.handshake orelse return error.HandshakeIncomplete;
         const pn = self.takePacketNumber(.handshake);
 
-        var frame_buf: [1200]u8 = undefined;
+        // A CRYPTO frame is a type byte then two varints, around the flight.
+        var frame_buf: [max_flight + 1 + 2 * codec.max_varint_len]u8 = undefined;
         var fw = std.Io.Writer.fixed(&frame_buf);
-        writeCryptoFrame(&fw, 0, stream) catch return error.BufferTooSmall;
+        writeCryptoFrame(&fw, 0, flight) catch return error.BufferTooSmall;
 
         return packet.seal(out, .{
             .kind = .handshake,
             .dcid = self.accepted.scid(),
             .scid = self.our_scid[0..self.our_cid_len],
             .pn = pn,
-            .pn_len = 4,
+            .pn_len = packet.max_pn_len,
         }, fw.buffered(), crypto.keysFromSecret(hs.client));
     }
 
@@ -881,6 +1071,14 @@ pub const Handshaker = struct {
         }
     }
 
+    /// A transport parameter whose value is a single varint.
+    fn varintParam(value: []const u8) Error!u64 {
+        var r = codec.Reader{ .buf = value };
+        const v = try r.varint();
+        if (r.pos != value.len) return error.TransportParameterError;
+        return v;
+    }
+
     /// Checks the connection ids the server claims against the ones actually on
     /// the packets. Nothing else authenticates them: they travel in cleartext
     /// headers, so only this comparison ties them to the handshake.
@@ -899,6 +1097,14 @@ pub const Handshaker = struct {
                     return error.TransportParameterError;
                 }
                 self.saw_original_dcid = true;
+            },
+            // The limits on what we may send. `bidi_remote` is the one that
+            // covers streams we open ourselves.
+            // Source: RFC 9000 s18.2.
+            .max_idle_timeout => self.peer_idle_ms = try varintParam(p.value),
+            .initial_max_data => self.send_data.extend(try varintParam(p.value)),
+            .initial_max_stream_data_bidi_remote => {
+                self.send_stream.extend(try varintParam(p.value));
             },
             else => {},
         };
@@ -975,8 +1181,8 @@ test "walks a coalesced flight and reads a raw public key certificate" {
     const peer_key = server_key.public_key.toBytes();
     // Hashed one message at a time: CertificateVerify and Finished each cover
     // the transcript up to but not including themselves.
-    var stream: [1024]u8 = undefined;
-    var stw = std.Io.Writer.fixed(&stream);
+    var server_flight: [1024]u8 = undefined;
+    var stw = std.Io.Writer.fixed(&server_flight);
     var st: handshake.Transcript = .{};
     st.update(initial.client_hello);
     st.update(&sh);
@@ -985,7 +1191,10 @@ test "walks a coalesced flight and reads a raw public key certificate" {
         var ext: [64]u8 = undefined;
         var ew = std.Io.Writer.fixed(&ext);
         try handshake.writeExtension(&ew, @backingInt(ExtensionType.server_certificate_type), &.{raw_public_key});
-        try handshake.writeExtension(&ew, @backingInt(ExtensionType.application_layer_protocol_negotiation), &.{ 0, 10, 9, 'r', 'a', 'd', 'i', 'c', 'l', 'e', '/', '2' });
+        // The list is one name, length-prefixed twice: the list, then the name.
+        const alpn = "radicle/2";
+        const alpn_ext = [_]u8{ 0, alpn.len + 1, alpn.len } ++ alpn.*;
+        try handshake.writeExtension(&ew, @backingInt(ExtensionType.application_layer_protocol_negotiation), &alpn_ext);
 
         // Both ids are mandatory and must echo what is on the packets.
         var params: [64]u8 = undefined;
@@ -1047,7 +1256,7 @@ test "walks a coalesced flight and reads a raw public key certificate" {
             .dcid = &dcid,
             .scid = &server_scid,
             .pn = 0,
-            .pn_len = 4,
+            .pn_len = packet.max_pn_len,
         }, fw.buffered(), crypto.keysFromSecret(crypto.initialSecrets(&dcid).server));
         @memcpy(buf[used..][0..n], pkt[0..n]);
         used += n;
@@ -1066,7 +1275,7 @@ test "walks a coalesced flight and reads a raw public key certificate" {
             .dcid = &dcid,
             .scid = &server_scid,
             .pn = 0,
-            .pn_len = 4,
+            .pn_len = packet.max_pn_len,
         }, fw.buffered(), crypto.keysFromSecret(hs.server));
         @memcpy(buf[used..][0..n], pkt[0..n]);
         used += n;
@@ -1155,7 +1364,7 @@ test "walks a coalesced flight and reads a raw public key certificate" {
     const m = try packet.sealShort(&sealed, .{
         .dcid = &dcid,
         .pn = 0,
-        .pn_len = 4,
+        .pn_len = packet.max_pn_len,
     }, ow.buffered(), crypto.keysFromSecret(app.server));
 
     try h.push(&plain, sealed[0..m]);
@@ -1250,7 +1459,7 @@ test "packets that cannot be opened are reported" {
         .kind = .handshake,
         .dcid = &dcid,
         .pn = 0,
-        .pn_len = 4,
+        .pn_len = packet.max_pn_len,
     }, &payload, crypto.keysFromSecret(crypto.initialSecrets(&dcid).server));
     try testing.expectError(error.KeysUnavailable, h.push(&scratch, early[0..n]));
 
@@ -1259,13 +1468,150 @@ test "packets that cannot be opened are reported" {
     const m = try packet.sealShort(&short, .{
         .dcid = &dcid,
         .pn = 0,
-        .pn_len = 4,
+        .pn_len = packet.max_pn_len,
     }, &payload, crypto.keysFromSecret(crypto.initialSecrets(&dcid).server));
     try testing.expectError(error.KeysUnavailable, h.push(&scratch, short[0..m]));
 
     // Version Negotiation, which is a rejection rather than a packet to open.
     var vn = hex("8000000000" ++ "00" ++ "00" ++ "00000001");
     try testing.expectError(error.VersionNegotiation, h.push(&scratch, &vn));
+}
+
+test "stream data survives a 1-RTT round trip" {
+    const dcid = hex(testdata.other_dcid);
+    var initial_crypto: [1024]u8 = undefined;
+    var handshake_crypto: [1024]u8 = undefined;
+    // Small, so reading one message crosses the half the grant waits for.
+    var stream_buf: [8]u8 = undefined;
+    var send_buf: [64]u8 = undefined;
+    var h = Handshaker.init(.{
+        .original_dcid = &dcid,
+        .our_scid = &dcid,
+        .client_hello = "",
+        .secret = hex(testdata.fixed_x25519_secret),
+        .initial_buf = &initial_crypto,
+        .handshake_buf = &handshake_crypto,
+        .stream_buf = &stream_buf,
+        .send_buf = &send_buf,
+    });
+
+    // One key both ways, so the packet we seal is one we can also open.
+    const keys = crypto.keysFromSecret(crypto.initialSecrets(&dcid).client);
+    h.app_keys = .{ .send = keys, .recv = keys };
+    h.accepted.scid_len = dcid.len;
+    @memcpy(h.accepted.scid_buf[0..dcid.len], &dcid);
+    // What the peer's transport parameters would have opened.
+    h.send_data.extend(32);
+    h.send_stream.extend(32);
+
+    var sealed: [256]u8 = undefined;
+    const n = try h.sealStream(&sealed, "gossip", false);
+    try testing.expectEqual(@as(u64, 6), h.sender.next());
+
+    var scratch: [256]u8 = undefined;
+    try h.push(&scratch, sealed[0..n]);
+    try testing.expectEqualSlices(u8, "gossip", h.stream.readable());
+
+    h.stream.consume(6);
+    try testing.expectEqual(@as(usize, 0), h.stream.readable().len);
+    try testing.expect(!h.stream.done());
+
+    // Reading freed most of the window, so the peer is owed a new limit.
+    var grant: [256]u8 = undefined;
+    const g = (try h.sealMaxData(&grant)).?;
+    try testing.expectEqual(@as(u64, 14), h.stream.window.limit);
+    try testing.expectEqual(@as(?usize, null), try h.sealMaxData(&grant));
+
+    var opened: [256]u8 = undefined;
+    var copy: [256]u8 = undefined;
+    @memcpy(copy[0..g], grant[0..g]);
+    const seen = try packet.openShort(&opened, copy[0..g], dcid.len, keys, null);
+    var it = frame.Iterator.init(seen.payload);
+    try testing.expectEqual(@as(u64, 14), (try it.next()).?.max_stream_data.max);
+    try testing.expectEqual(@as(u64, 14), (try it.next()).?.max_data);
+}
+
+test "unacknowledged stream data goes again under a new number" {
+    const dcid = hex(testdata.other_dcid);
+    var initial_crypto: [1024]u8 = undefined;
+    var handshake_crypto: [1024]u8 = undefined;
+    var stream_buf: [64]u8 = undefined;
+    var send_buf: [64]u8 = undefined;
+    var h = Handshaker.init(.{
+        .original_dcid = &dcid,
+        .our_scid = &dcid,
+        .client_hello = "",
+        .secret = hex(testdata.fixed_x25519_secret),
+        .initial_buf = &initial_crypto,
+        .handshake_buf = &handshake_crypto,
+        .stream_buf = &stream_buf,
+        .send_buf = &send_buf,
+    });
+    const keys = crypto.keysFromSecret(crypto.initialSecrets(&dcid).client);
+    h.app_keys = .{ .send = keys, .recv = keys };
+    h.accepted.scid_len = dcid.len;
+    @memcpy(h.accepted.scid_buf[0..dcid.len], &dcid);
+    h.send_data.extend(64);
+    h.send_stream.extend(64);
+
+    var out: [256]u8 = undefined;
+    _ = try h.sealStream(&out, "hello", false);
+    const again = (try h.resendStream(&out)).?;
+
+    // Same offset and bytes, a number the first packet did not use.
+    var opened: [256]u8 = undefined;
+    var copy: [256]u8 = undefined;
+    @memcpy(copy[0..again], out[0..again]);
+    const seen = try packet.openShort(&opened, copy[0..again], dcid.len, keys, null);
+    try testing.expectEqual(@as(u64, 1), seen.pn);
+    var it = frame.Iterator.init(seen.payload);
+    const s = (try it.next()).?.stream;
+    try testing.expectEqual(@as(u64, 0), s.offset);
+    try testing.expectEqualSlices(u8, "hello", s.data);
+
+    // Acknowledging the resend retires the chunk, so nothing is owed.
+    h.app_acked.record(1);
+    try testing.expectEqual(@as(?usize, null), try h.resendStream(&out));
+    try testing.expectEqual(@as(u64, 5), h.sender.base);
+}
+
+test "sending stops at the limit the peer gave" {
+    const dcid = hex(testdata.other_dcid);
+    var initial_crypto: [1024]u8 = undefined;
+    var handshake_crypto: [1024]u8 = undefined;
+    var send_buf: [64]u8 = undefined;
+    var stream_buf: [64]u8 = undefined;
+    var h = Handshaker.init(.{
+        .original_dcid = &dcid,
+        .our_scid = &dcid,
+        .client_hello = "",
+        .secret = hex(testdata.fixed_x25519_secret),
+        .initial_buf = &initial_crypto,
+        .handshake_buf = &handshake_crypto,
+        .stream_buf = &stream_buf,
+        .send_buf = &send_buf,
+    });
+    const keys = crypto.keysFromSecret(crypto.initialSecrets(&dcid).client);
+    h.app_keys = .{ .send = keys, .recv = keys };
+    h.accepted.scid_len = dcid.len;
+    @memcpy(h.accepted.scid_buf[0..dcid.len], &dcid);
+
+    var out: [256]u8 = undefined;
+    // Nothing may be sent until the peer's parameters open a window.
+    try testing.expectError(error.FlowControlBlocked, h.sealStream(&out, "x", false));
+
+    h.send_data.extend(4);
+    h.send_stream.extend(2);
+    // The stream limit binds first, since it is the lower of the two.
+    try testing.expectEqual(@as(u64, 2), h.sendRoom());
+    try testing.expectError(error.FlowControlBlocked, h.sealStream(&out, "abc", false));
+
+    _ = try h.sealStream(&out, "ab", false);
+    try testing.expectEqual(@as(u64, 0), h.sendRoom());
+
+    // A MAX_STREAM_DATA for our stream reopens it, up to the connection limit.
+    try h.appFrames(&[_]u8{ 0x11, 0x00, 0x40, 0x40 });
+    try testing.expectEqual(@as(u64, 2), h.sendRoom());
 }
 
 test "a handshake message out of turn is refused" {
@@ -1314,7 +1660,7 @@ test "acknowledges an Initial the server can open" {
         .dcid = &dcid,
         .scid = &server_scid,
         .pn = 3,
-        .pn_len = 4,
+        .pn_len = packet.max_pn_len,
     }, &payload, crypto.keysFromSecret(keys.server));
 
     var scratch: [512]u8 = undefined;

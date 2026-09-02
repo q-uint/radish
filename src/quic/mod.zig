@@ -5,20 +5,23 @@
 //! its own and is verified against the RFCs' published test vectors.
 pub const crypto = @import("crypto.zig");
 pub const packet = @import("packet.zig");
+pub const reassembly = @import("reassembly.zig");
+pub const stream = @import("stream.zig");
 pub const frame = @import("frame.zig");
 pub const tls = @import("tls.zig");
 pub const handshake = @import("handshake.zig");
 pub const client = @import("client.zig");
-pub const probe = @import("probe.zig");
+pub const conn = @import("conn.zig");
 pub const testdata = @import("testdata.zig");
 
 test {
     _ = crypto;
     _ = packet;
+    _ = reassembly;
+    _ = stream;
     _ = frame;
     _ = tls;
     _ = handshake;
     _ = client;
-    _ = probe;
-    _ = &probe.run;
+    _ = conn;
 }
