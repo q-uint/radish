@@ -290,11 +290,9 @@ test "pack is named after its sha1 trailer" {
     @memcpy(pack[12..], &trailer);
     const name = try packName(&pack);
     try testing.expectEqualStrings("pack-dd58e7fd2a280408d4414c3d72890ac973abb959", &name);
-}
 
-test "distinct packs get distinct names" {
-    var a: [20]u8 = @splat(0xaa);
-    var b: [20]u8 = @splat(0xbb);
+    const a: [20]u8 = @splat(0xaa);
+    const b: [20]u8 = @splat(0xbb);
     try testing.expect(!std.mem.eql(u8, &try packName(&a), &try packName(&b)));
     try testing.expectError(error.ShortPack, packName("short"));
 }

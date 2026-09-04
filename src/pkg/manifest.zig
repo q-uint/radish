@@ -95,7 +95,7 @@ fn freeDep(gpa: std.mem.Allocator, d: RadDep) void {
 
 const testing = std.testing;
 
-test "reads rad dependencies, ignoring zig's own fields" {
+test "reads rad dependencies with their pins, ignoring zig's own" {
     const src =
         \\.{
         \\    .name = .demo,
@@ -103,6 +103,13 @@ test "reads rad dependencies, ignoring zig's own fields" {
         \\    .dependencies = .{
         \\        .radish = .{
         \\            .rad = "z4VSyUhaBGUJQrFdS7nWULf1dJdos",
+        \\        },
+        \\        .lib = .{
+        \\            .rad = "z4VSyUhaBGUJQrFdS7nWULf1dJdos",
+        \\            .subdir = "packages/lib",
+        \\            .rev = "b8bd413c6c3adaad672f8700ba84cf0d1d3785c1",
+        \\            .rad_hash = "sha256-0000",
+        \\            .node = "rad.0x51.dev:8776:z6Mkhh3TfBZeGW4z4uufMp7caXoBf2wcpDWDrRsELqWqmT6Y",
         \\        },
         \\        .zg = .{
         \\            .url = "https://example.com/zg.tar.gz",
@@ -114,72 +121,25 @@ test "reads rad dependencies, ignoring zig's own fields" {
     const deps = try radDeps(testing.allocator, src);
     defer freeDeps(testing.allocator, deps);
 
-    try testing.expectEqual(@as(usize, 1), deps.len);
+    try testing.expectEqual(@as(usize, 2), deps.len);
     try testing.expectEqualStrings("radish", deps[0].name);
     try testing.expectEqualStrings("z4VSyUhaBGUJQrFdS7nWULf1dJdos", deps[0].rid);
+    // Naming only the repo leaves every pin unset.
     try testing.expectEqual(@as(?[]const u8, null), deps[0].subdir);
-}
+    try testing.expectEqual(@as(?[]const u8, null), deps[0].rev);
+    try testing.expectEqual(@as(?[]const u8, null), deps[0].rad_hash);
+    try testing.expectEqual(@as(?[]const u8, null), deps[0].node);
 
-// A repo whose build.zig is not at the top level still has to resolve to the
-// directory Zig would treat as the package root.
-test "subdir names the package root inside the repo" {
-    const src =
-        \\.{
-        \\    .dependencies = .{
-        \\        .lib = .{
-        \\            .rad = "z4VSyUhaBGUJQrFdS7nWULf1dJdos",
-        \\            .subdir = "packages/lib",
-        \\        },
-        \\    },
-        \\}
-    ;
-    const deps = try radDeps(testing.allocator, src);
-    defer freeDeps(testing.allocator, deps);
-
-    try testing.expectEqualStrings("packages/lib", deps[0].subdir.?);
-}
-
-// A branch head moves as the repo is pushed to, so a reproducible build has to
-// name the commit. The delegate check still applies: a pinned rev must be one
-// a delegate published.
-test "rev and rad_hash pin an exact tree" {
-    const src =
-        \\.{
-        \\    .dependencies = .{
-        \\        .radish = .{
-        \\            .rad = "z4VSyUhaBGUJQrFdS7nWULf1dJdos",
-        \\            .rev = "b8bd413c6c3adaad672f8700ba84cf0d1d3785c1",
-        \\            .rad_hash = "sha256-0000",
-        \\        },
-        \\    },
-        \\}
-    ;
-    const deps = try radDeps(testing.allocator, src);
-    defer freeDeps(testing.allocator, deps);
-
-    try testing.expectEqualStrings("b8bd413c6c3adaad672f8700ba84cf0d1d3785c1", deps[0].rev.?);
-    try testing.expectEqualStrings("sha256-0000", deps[0].rad_hash.?);
-}
-
-// A project can name the seed it runs, so resolving its own dependencies does
-// not fall on the public bootstrap nodes.
-test "node pins where to fetch from" {
-    const src =
-        \\.{
-        \\    .dependencies = .{
-        \\        .radish = .{
-        \\            .rad = "z4VSyUhaBGUJQrFdS7nWULf1dJdos",
-        \\            .node = "rad.0x51.dev:8776:z6Mkhh3TfBZeGW4z4uufMp7caXoBf2wcpDWDrRsELqWqmT6Y",
-        \\        },
-        \\    },
-        \\}
-    ;
-    const deps = try radDeps(testing.allocator, src);
-    defer freeDeps(testing.allocator, deps);
-
+    // subdir: the directory Zig treats as the package root, for a repo whose
+    // build.zig is not at the top level. rev and rad_hash: an exact tree, since
+    // a branch head moves as the repo is pushed to. node: the seed to fetch
+    // from, so resolving does not fall on the public bootstrap nodes.
+    try testing.expectEqualStrings("packages/lib", deps[1].subdir.?);
+    try testing.expectEqualStrings("b8bd413c6c3adaad672f8700ba84cf0d1d3785c1", deps[1].rev.?);
+    try testing.expectEqualStrings("sha256-0000", deps[1].rad_hash.?);
     try testing.expectEqualStrings(
         "rad.0x51.dev:8776:z6Mkhh3TfBZeGW4z4uufMp7caXoBf2wcpDWDrRsELqWqmT6Y",
-        deps[0].node.?,
+        deps[1].node.?,
     );
 }
 

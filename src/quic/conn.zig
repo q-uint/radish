@@ -12,7 +12,12 @@ const tls = @import("tls.zig");
 
 const Ed25519 = std.crypto.sign.Ed25519;
 
-pub const Error = error{ NoReply, DatagramTooLarge, SendStalled } || client.Error;
+pub const Error = error{
+    NoReply,
+    DatagramTooLarge,
+    SendStalled,
+    HandshakeUnconfirmed,
+} || client.Error;
 
 pub const Options = struct {
     host: []const u8,
@@ -32,6 +37,9 @@ pub const Options = struct {
     /// Resends of an unacknowledged flight before giving up. Each flight has
     /// its own budget.
     max_retries: usize = 2,
+    /// Where to write every datagram that arrives, as hex, one per line. For
+    /// recording an exchange as a test fixture.
+    capture: ?*std.Io.Writer = null,
 };
 
 pub const Conn = struct {
@@ -55,6 +63,9 @@ pub const Conn = struct {
     /// How long the connection has been quiet, counted in receive timeouts,
     /// which is the only clock this has.
     quiet_ms: u64 = 0,
+    /// `quiet_ms` as of the last keepalive, so sending one does not erase the
+    /// silence the idle timeout is measured against.
+    pinged_ms: u64 = 0,
 
     /// Bytes in the Initial datagram, and what has come back since.
     sent: usize = 0,
@@ -64,6 +75,12 @@ pub const Conn = struct {
     last: []const u8 = &.{},
     /// The most recent failure that did not end the connection.
     last_err: ?anyerror = null,
+    /// Whether `hs` holds anything: `open` leaves it undefined until it gets
+    /// that far, so nothing may read it before this says so. It stays set
+    /// through a close, since the reason the peer gave is still worth telling.
+    ready: bool = false,
+    /// Whether `sock` is still ours to send on and close.
+    sock_open: bool = false,
 
     /// The peer's CRYPTO stream in each space. A ServerHello is small; the
     /// handshake flight carries a certificate, so it gets room to spare.
@@ -125,12 +142,38 @@ pub const Conn = struct {
             .stream_buf = &self.stream_buf,
             .send_buf = &self.send_buf,
         });
+        // Both fields hold something from here on, whatever the send does.
+        self.ready = true;
+        self.sock_open = true;
 
         try self.sock.send(io, &self.addr, datagram[0..initial.len]);
     }
 
+    /// Says goodbye before dropping the socket, so the peer releases the state
+    /// it holds for us rather than waiting out its idle timeout. Best effort:
+    /// there is nothing to do about a close that does not arrive, and a
+    /// connection that never reached 1-RTT has no key to send one under.
+    ///
+    /// Safe to call on a connection that never opened, and safe to call twice,
+    /// so a caller can defer it before the connection exists.
     pub fn close(self: *Conn) void {
+        if (!self.sock_open) return;
+        self.sock_open = false;
+        if (self.hs.app_keys != null and self.hs.closed == null) {
+            var out: [client.max_initial_datagram]u8 = undefined;
+            if (self.hs.sealClose(&out, "done") catch null) |n| {
+                self.sock.send(self.io, &self.addr, out[0..n]) catch {};
+            }
+        }
         self.sock.close(self.io);
+    }
+
+    /// Why the peer closed, or null when it did not or the connection never got
+    /// far enough to hear it.
+    pub fn peerClose(self: *const Conn) ?*const client.Close {
+        if (!self.ready) return null;
+        if (self.hs.closed) |*reason| return reason;
+        return null;
     }
 
     /// What one turn of the connection produced.
@@ -142,6 +185,15 @@ pub const Conn = struct {
         /// Nothing arrived, and there is nothing left to resend.
         silent,
     };
+
+    /// Opens a connection and drives the handshake to confirmation, which is
+    /// where every exchange over it starts.
+    pub fn establish(self: *Conn, io: std.Io, opts: Options) !void {
+        try self.open(io, opts);
+        errdefer self.close();
+        try self.handshake();
+        if (!self.hs.confirmed) return error.HandshakeUnconfirmed;
+    }
 
     /// Reads datagrams until the handshake is confirmed, the peer closes, or
     /// the datagram budget runs out.
@@ -161,6 +213,11 @@ pub const Conn = struct {
         self.last = arrived;
         self.stream_retries = 0;
         self.quiet_ms = 0;
+        self.pinged_ms = 0;
+        if (self.opts.capture) |w| {
+            w.print("{x}\n", .{arrived}) catch {};
+            w.flush() catch {};
+        }
 
         if (arrived.len > self.work.len) {
             self.last_err = error.DatagramTooLarge;
@@ -236,18 +293,22 @@ pub const Conn = struct {
     /// outstanding or the budget is spent.
     fn retransmit(self: *Conn, out: []u8) ?usize {
         if (self.hs.confirmed) {
+            // Each timeout is one tick of the only clock we have, whatever we
+            // end up sending, so that the silence adds up.
+            self.quiet_ms += self.opts.timeout_ms;
+            // Past the idle timeout the peer has dropped us, so there is
+            // nothing left to resend to.
+            if (self.quiet_ms >= self.hs.idleTimeoutMs()) return null;
             if (self.stream_retries >= self.opts.max_retries) return null;
             if (self.hs.resendStream(out) catch null) |n| {
                 self.stream_retries += 1;
                 return n;
             }
             // Nothing outstanding, so the silence is just a quiet connection.
-            // Each timeout is one clock tick we have; past half the idle
-            // timeout, a PING keeps the peer from dropping us.
-            self.quiet_ms += self.opts.timeout_ms;
-            if (self.quiet_ms < self.hs.idleTimeoutMs() / 2) return null;
-            self.quiet_ms = 0;
-            self.stream_retries += 1;
+            // Past half the idle timeout, a PING keeps the peer from dropping
+            // us.
+            if (self.quiet_ms - self.pinged_ms < self.hs.idleTimeoutMs() / 2) return null;
+            self.pinged_ms = self.quiet_ms;
             return self.hs.sealPing(out) catch null;
         }
         if (self.flight) |f| {
@@ -277,7 +338,13 @@ pub const Conn = struct {
                 @min(self.hs.sendRoom(), self.hs.sender.room()),
             );
             if (room == 0) {
-                if (try self.service() != .arrived) return error.SendStalled;
+                switch (try self.service()) {
+                    .arrived => {},
+                    // A peer that has closed will never take more, so the room
+                    // we are waiting for is not coming.
+                    .closed => return error.PeerClosed,
+                    .silent => return error.SendStalled,
+                }
                 continue;
             }
 
@@ -296,14 +363,38 @@ pub const Conn = struct {
         return self.hs.stream.readable();
     }
 
+    /// Whether the peer has finished its half of the stream and all of it has
+    /// been read. Not `Handshaker.done`, which is about the handshake.
+    pub fn streamDone(self: *const Conn) bool {
+        return self.hs.stream.done();
+    }
+
+    /// Whether the silence has run past what the peer said it would wait, at
+    /// which point it has dropped us and nothing more is coming.
+    pub fn stalled(self: *const Conn) bool {
+        return self.ready and self.quiet_ms >= self.hs.idleTimeoutMs();
+    }
+
+    /// Whether the handshake got all the way to confirmation.
+    pub fn confirmed(self: *const Conn) bool {
+        return self.ready and self.hs.confirmed;
+    }
+
+    /// What the peer told us about itself, or null before there is a handshake
+    /// to have told us anything.
+    pub fn accepted(self: *const Conn) ?*const client.Accepted {
+        if (!self.ready) return null;
+        return &self.hs.accepted;
+    }
+
     pub fn consume(self: *Conn, n: usize) void {
         self.hs.stream.consume(n);
     }
 };
 
 const testing = std.testing;
+const crypto = @import("crypto.zig");
 const testdata = @import("testdata.zig");
-
 
 test "opening sets every field, whatever the memory held" {
     const c = try testing.allocator.create(Conn);
@@ -332,4 +423,88 @@ test "opening sets every field, whatever the memory held" {
     try testing.expectEqual(@as(usize, 0), c.last.len);
     try testing.expect(!c.flight_out);
     try testing.expect(!c.hs.confirmed);
+}
+
+test "closing is safe however far opening got, and sends one goodbye at most" {
+    const unopened = try testing.allocator.create(Conn);
+    defer testing.allocator.destroy(unopened);
+    @memset(std.mem.asBytes(unopened), 0xaa);
+
+    // Rejected before the socket or the handshaker exist, so both still hold
+    // whatever the allocator handed back.
+    try testing.expectError(error.InvalidHostName, unopened.open(testing.io, .{
+        .host = "not a host",
+        .port = 8776,
+        .alpn = "radicle/gossip/1",
+        .secret = testdata.hex(testdata.fixed_x25519_secret),
+        .random = testdata.hex(testdata.fixed_hello_random),
+        .dcid = &.{ 0xc0, 0xff, 0xee, 0x03 },
+        .identity = try Ed25519.KeyPair.generateDeterministic(@splat(4)),
+    }));
+    try testing.expect(!unopened.ready);
+    try testing.expectEqual(@as(?*const client.Close, null), unopened.peerClose());
+    unopened.close();
+
+    const c = try testing.allocator.create(Conn);
+    defer testing.allocator.destroy(c);
+    @memset(std.mem.asBytes(c), 0xaa);
+
+    try c.open(testing.io, .{
+        .host = "127.0.0.1",
+        .port = 9,
+        .alpn = "radicle/gossip/1",
+        .secret = testdata.hex(testdata.fixed_x25519_secret),
+        .random = testdata.hex(testdata.fixed_hello_random),
+        .dcid = &.{ 0xc0, 0xff, 0xee, 0x04 },
+        .identity = try Ed25519.KeyPair.generateDeterministic(@splat(4)),
+    });
+    try testing.expect(c.sock_open);
+
+    c.close();
+    try testing.expect(!c.sock_open);
+    // An `errdefer` inside the connection and a `defer` at the call site both
+    // fire on the same failure, so the second one has to be a no-op rather
+    // than a second goodbye on a closed socket.
+    c.close();
+    // Still readable afterwards: the reason a peer gave outlives the socket.
+    try testing.expect(c.ready);
+}
+
+test "silence on a confirmed connection adds up to the idle timeout" {
+    const dcid = [_]u8{ 0xc0, 0xff, 0xee, 0x02 };
+    const c = try testing.allocator.create(Conn);
+    defer testing.allocator.destroy(c);
+    @memset(std.mem.asBytes(c), 0xaa);
+
+    try c.open(testing.io, .{
+        .host = "127.0.0.1",
+        .port = 9,
+        .alpn = "radicle/git/1",
+        .secret = testdata.hex(testdata.fixed_x25519_secret),
+        .random = testdata.hex(testdata.fixed_hello_random),
+        .dcid = &dcid,
+        .identity = try Ed25519.KeyPair.generateDeterministic(@splat(4)),
+    });
+    defer c.close();
+
+    // Keys and confirmation are what `retransmit` needs to seal a keepalive,
+    // which is the branch that used to keep `quiet_ms` from ever adding up.
+    const keys = crypto.keysFromSecret(crypto.initialSecrets(&dcid).client);
+    c.hs.app_keys = .{ .send = keys, .recv = keys };
+    c.hs.confirmed = true;
+
+    var out: [client.max_initial_datagram]u8 = undefined;
+    var pings: usize = 0;
+    var ticks: usize = 0;
+    // One receive timeout per turn, with nothing arriving to reset the count.
+    while (c.quiet_ms < c.hs.idleTimeoutMs()) {
+        ticks += 1;
+        try testing.expect(ticks < 100);
+        if (c.retransmit(&out)) |_| pings += 1;
+    }
+    // A keepalive went out, and it did not pass for traffic.
+    try testing.expect(pings > 0);
+    // Past the timeout there is nothing to send, which is what a reader
+    // waiting on the stream gives up on.
+    try testing.expect(c.retransmit(&out) == null);
 }

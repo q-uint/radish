@@ -65,15 +65,7 @@ pub const NodeId = struct {
 
 const testing = std.testing;
 
-test "encode has z6Mk structure" {
-    // Multicodec 0xed01 in front of a 32-byte key always yields a `z6Mk` prefix.
-    const nid = NodeId.fromPublicKey(@splat(0));
-    const s = try nid.encode(testing.allocator);
-    defer testing.allocator.free(s);
-    try testing.expect(std.mem.startsWith(u8, s, "z6Mk"));
-}
-
-test "round trip" {
+test "round trip, always through a z6Mk prefix" {
     var key: [KEY_LEN]u8 = undefined;
     var prng = std.Random.DefaultPrng.init(0xc0ffee);
     prng.random().bytes(&key);
@@ -81,42 +73,33 @@ test "round trip" {
     const nid = NodeId.fromPublicKey(key);
     const s = try nid.encode(testing.allocator);
     defer testing.allocator.free(s);
+    // Multicodec 0xed01 in front of a 32-byte key always yields a `z6Mk` prefix.
+    try testing.expect(std.mem.startsWith(u8, s, "z6Mk"));
 
     const back = try NodeId.parse(s);
     try testing.expectEqualSlices(u8, &key, &back.key);
 }
 
-test "heartwood vectors decode" {
+test "heartwood did vectors re-encode to themselves" {
     // Source: heartwood crates/radicle/src/identity/did.rs test_did_vectors.
-    // https://codeberg.org/radicle/heartwood/blob/master/crates/radicle/src/identity/did.rs
     const vectors = [_][]const u8{
         "z6MkiTBz1ymuepAQ4HEHYSF1H8quG5GLVVQR3djdX3mDooWp",
         "z6MkjchhfUsD6mmvni8mCdXHw216Xrm9bQe2mBH1P5RDjVJG",
         "z6MknGc3ocHs3zdPiJbnaaqDi58NGb4pk1Sp9WxWufuXSdxf",
+        "z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
     };
     for (vectors) |v| {
-        _ = try NodeId.parse(v);
+        const s = try (try NodeId.parse(v)).encode(testing.allocator);
+        defer testing.allocator.free(s);
+        try testing.expectEqualStrings(v, s);
     }
 }
 
-test "heartwood encode-decode round trip" {
-    // Source: heartwood did.rs test_did_encode_decode: decode then re-encode
-    // must reproduce the input string exactly.
-    const input = "z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
-    const nid = try NodeId.parse(input);
-    const s = try nid.encode(testing.allocator);
-    defer testing.allocator.free(s);
-    try testing.expectEqualStrings(input, s);
-}
-
-test "parse rejects bad multibase" {
+test "parse rejects a bad multibase, or a legal-length string that decodes short" {
     try testing.expectError(error.InvalidMultibase, NodeId.parse("x6Mk"));
-}
 
-// Leading '1's decode 1:1 to zero bytes, so this is the longest decoding a
-// valid-length input can produce. It must be rejected as the wrong length, not
-// as a buffer that would not fit.
-test "parse rejects an all-ones string of legal length" {
+    // Leading '1's decode 1:1 to zero bytes, so this is the longest decoding a
+    // valid-length input can produce: the wrong length, not a buffer overrun.
     var ones: [1 + NodeId.max_encoded]u8 = @splat('1');
     ones[0] = MULTIBASE_BTC;
     try testing.expectError(error.InvalidLength, NodeId.parse(&ones));

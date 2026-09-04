@@ -66,9 +66,9 @@ fn scratchDir(io: std.Io, name: []const u8) !std.Io.Dir {
     return tmp.createDirPathOpen(io, name, .{});
 }
 
-test "hash is stable and covers content" {
+test "hash is stable, and covers paths as well as content" {
     const io = testing.io;
-    var dir = try scratchDir(io, "radish-treehash-a");
+    var dir = try scratchDir(io, "radish-treehash");
     defer dir.close(io);
 
     try dir.writeFile(io, .{ .sub_path = "a.txt", .data = "hello" });
@@ -86,23 +86,12 @@ test "hash is stable and covers content" {
     const changed = try hashDir(testing.allocator, io, dir);
     defer testing.allocator.free(changed);
     try testing.expect(!std.mem.eql(u8, first, changed));
-}
 
-// Content alone is not enough: renaming a file changes the tree, so the path
-// has to be in the digest too.
-test "hash covers paths, not just content" {
-    const io = testing.io;
-    var dir = try scratchDir(io, "radish-treehash-b");
-    defer dir.close(io);
-
-    try dir.writeFile(io, .{ .sub_path = "one", .data = "x" });
-    const before = try hashDir(testing.allocator, io, dir);
-    defer testing.allocator.free(before);
-
-    try dir.deleteFile(io, "one");
-    try dir.writeFile(io, .{ .sub_path = "two", .data = "x" });
-    const after = try hashDir(testing.allocator, io, dir);
-    defer testing.allocator.free(after);
-
-    try testing.expect(!std.mem.eql(u8, before, after));
+    // Content alone is not enough: renaming a file changes the tree, so the
+    // path has to be in the digest too.
+    try dir.deleteFile(io, "b.txt");
+    try dir.writeFile(io, .{ .sub_path = "c.txt", .data = "WORLD" });
+    const renamed = try hashDir(testing.allocator, io, dir);
+    defer testing.allocator.free(renamed);
+    try testing.expect(!std.mem.eql(u8, changed, renamed));
 }

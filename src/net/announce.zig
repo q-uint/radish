@@ -130,21 +130,20 @@ test "encodes the captured NodeAnnouncement message byte-for-byte" {
     try testing.expectEqualSlices(u8, &CAPTURED_MSG, out.items);
 }
 
-test "accepts an alias at the length limit" {
-    const alias = "radish-seed-node-abcdefghijklmno"; // exactly 32
-    try testing.expectEqual(@as(usize, MAX_ALIAS_LEN), alias.len);
-    const ann = NodeAnnouncement{ .timestamp = 0, .alias = alias };
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(testing.allocator);
-    try ann.encodeMessage(testing.allocator, &out);
-    try testing.expectEqual(@as(u8, MAX_ALIAS_LEN), out.items[17]); // the alias length prefix
-}
+test "an alias at the length limit is accepted, one byte over is not" {
+    const at_limit = "radish-seed-node-abcdefghijklmno"; // exactly 32
+    const over_limit = "seed-node-with-a-33-char-name-abc"; // one over
+    try testing.expectEqual(@as(usize, MAX_ALIAS_LEN), at_limit.len);
+    try testing.expectEqual(@as(usize, MAX_ALIAS_LEN + 1), over_limit.len);
 
-test "rejects an alias one byte over the limit" {
-    const alias = "seed-node-with-a-33-char-name-abc"; // exactly 33, one over
-    try testing.expectEqual(@as(usize, MAX_ALIAS_LEN + 1), alias.len);
-    const ann = NodeAnnouncement{ .timestamp = 0, .alias = alias };
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
-    try testing.expectError(error.AliasTooLong, ann.encodeMessage(testing.allocator, &out));
+    try (NodeAnnouncement{ .timestamp = 0, .alias = at_limit }).encodeMessage(testing.allocator, &out);
+    try testing.expectEqual(@as(u8, MAX_ALIAS_LEN), out.items[17]); // the alias length prefix
+
+    out.clearRetainingCapacity();
+    try testing.expectError(error.AliasTooLong, (NodeAnnouncement{
+        .timestamp = 0,
+        .alias = over_limit,
+    }).encodeMessage(testing.allocator, &out));
 }

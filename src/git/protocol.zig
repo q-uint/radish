@@ -195,13 +195,3 @@ pub fn fetchPack(
         }
     }
 }
-
-const testing = std.testing;
-
-test "ls-refs response line parsing" {
-    // Exercises the split logic used in lsRefs on a representative line.
-    const line = "a7e9a3b6fa679aa764f92b88139d4228cfd3d325 refs/rad/id";
-    const sp = std.mem.indexOfScalar(u8, line, ' ').?;
-    try testing.expectEqual(@as(usize, 40), sp);
-    try testing.expectEqualStrings("refs/rad/id", line[sp + 1 ..]);
-}

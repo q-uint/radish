@@ -291,22 +291,9 @@ const Recorder = struct {
     }
 };
 
-test "subscribe sends Subscribe-all before reading" {
-    var out_buf: [8192]u8 = undefined;
-    var w = std.Io.Writer.fixed(&out_buf);
-    var r = std.Io.Reader.fixed(&.{});
-
-    var rec = Recorder{ .alloc = testing.allocator };
-    const frames = try subscribeOver(&r, &w, 10, &rec);
-    try testing.expectEqual(@as(usize, 0), frames);
-
-    const want = &protocol.subscribe_all_frame;
-    try testing.expectEqualSlices(u8, want, w.buffered());
-}
-
-// An empty stream is the common case against a node with nothing stored, and
-// must end the loop rather than surface as an error.
-test "subscribe stops at end of stream" {
+// A stream that runs out is the common case against a node with nothing more
+// to say, and must end the loop rather than surface as an error.
+test "subscribe sends Subscribe-all, then reads to the end of the stream" {
     var out_buf: [8192]u8 = undefined;
     var w = std.Io.Writer.fixed(&out_buf);
 
@@ -323,6 +310,7 @@ test "subscribe stops at end of stream" {
     // Asks for more than the stream holds: the short read ends it.
     const read = try subscribeOver(&r, &w, 100, &rec);
     try testing.expectEqual(@as(usize, 3), read);
+    try testing.expectEqualSlices(u8, &protocol.subscribe_all_frame, w.buffered());
 }
 
 test "subscribe stops at max_frames with input left" {

@@ -88,21 +88,11 @@ const RFC_SIG = [_]u8{
     0x12, 0xbb, 0x0c, 0x00,
 };
 
-test "sign matches RFC 8032 TEST 2" {
+test "sign matches RFC 8032 TEST 2, and verify accepts only that message" {
     const sk = try SecretKey.fromSeed(RFC_SEED);
     const sig = try sk.sign(&RFC_MSG);
     try testing.expectEqualSlices(u8, &RFC_SIG, &sig.bytes);
-}
-
-test "verify accepts a valid signature" {
-    const sk = try SecretKey.fromSeed(RFC_SEED);
-    const sig = try sk.sign(&RFC_MSG);
     try verify(sk.nodeId(), &RFC_MSG, sig);
-}
-
-test "verify rejects a tampered message" {
-    const sk = try SecretKey.fromSeed(RFC_SEED);
-    const sig = try sk.sign(&RFC_MSG);
     try testing.expectError(error.SignatureVerificationFailed, verify(sk.nodeId(), "wrong", sig));
 }
 

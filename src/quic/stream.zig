@@ -86,14 +86,15 @@ pub const Receiver = struct {
         return self.data.contiguous();
     }
 
-    /// Drops `n` bytes from the front, freeing that much of the buffer.
+    /// Marks `n` bytes at the front as read. What `readable` handed back stays
+    /// valid until the next `push`, which is when the room is reclaimed.
     pub fn consume(self: *Receiver, n: usize) void {
-        self.data.shift(n);
+        self.data.drop(n);
     }
 
     /// How far the reader has got, which is where a new limit is measured from.
     pub fn read(self: *const Receiver) u64 {
-        return self.data.base;
+        return self.data.read();
     }
 
     /// The limit to grant now: everything read, plus a full buffer again.
@@ -213,47 +214,40 @@ test "sent data is held until acknowledged" {
 
     try s.sent(0, "abc", false);
     try s.sent(1, "de", false);
-    try testing.expectEqual(@as(u64, 5), s.next());
+    try s.sent(2, "fg", true);
+    try testing.expectEqual(@as(u64, 7), s.next());
 
     const first = s.unacked().?;
     try testing.expectEqual(@as(u64, 0), first.offset);
     try testing.expectEqualSlices(u8, "abc", s.bytes(first.*));
 
-    // Acknowledging the second alone frees nothing: the first is still owed.
+    // Acknowledging a later packet alone frees nothing: the first is still owed.
     var acked: frame.NumberSet = .{};
     acked.record(1);
     s.ack(&acked);
     try testing.expectEqual(@as(u64, 0), s.base);
     try testing.expectEqual(@as(u64, 0), s.unacked().?.offset);
 
+    // With the front acknowledged the run at the front goes. The tail slides
+    // down over the freed bytes; its stream offset does not.
     acked.record(0);
     s.ack(&acked);
     try testing.expectEqual(@as(u64, 5), s.base);
-    try testing.expectEqual(@as(?*Sender.Chunk, null), s.unacked());
-}
+    const tail = s.unacked().?;
+    try testing.expectEqual(@as(u64, 5), tail.offset);
+    try testing.expect(tail.fin);
+    try testing.expectEqualSlices(u8, "fg", s.bytes(tail.*));
 
-test "freeing the front leaves the rest at its own offset" {
-    var buf: [16]u8 = @splat(0);
-    var s = Sender.init(&buf);
-    try s.sent(0, "abc", false);
-    try s.sent(1, "de", true);
-
-    var acked: frame.NumberSet = .{};
-    acked.record(0);
+    acked.record(2);
     s.ack(&acked);
+    try testing.expectEqual(@as(u64, 7), s.base);
+    try testing.expectEqual(@as(?*Sender.Chunk, null), s.unacked());
 
-    // The tail slides down over the freed bytes; its stream offset does not.
-    const c = s.unacked().?;
-    try testing.expectEqual(@as(u64, 3), c.offset);
-    try testing.expect(c.fin);
-    try testing.expectEqualSlices(u8, "de", s.bytes(c.*));
-}
-
-test "sending past what is held is refused" {
-    var buf: [4]u8 = @splat(0);
-    var s = Sender.init(&buf);
-    try s.sent(0, "abcd", false);
-    try testing.expectError(error.SendBufferFull, s.sent(1, "e", false));
+    // Sending past what is held has to wait for an acknowledgement.
+    var small: [4]u8 = @splat(0);
+    var t = Sender.init(&small);
+    try t.sent(0, "abcd", false);
+    try testing.expectError(error.SendBufferFull, t.sent(1, "e", false));
 }
 
 test "reads a stream that arrives out of order" {
@@ -274,11 +268,12 @@ test "reads a stream that arrives out of order" {
     try testing.expect(r.done());
 }
 
-test "data past a FIN is refused" {
+test "a final size that disagrees with the stream is refused" {
     var buf: [16]u8 = @splat(0);
     var r = Receiver.init(&buf, 64);
     try r.push(.{ .id = 0, .offset = 0, .data = &.{ 0, 1 }, .fin = true });
 
+    // Data past a FIN.
     try testing.expectError(error.FinalSizeError, r.push(.{
         .id = 0,
         .offset = 2,
@@ -287,6 +282,17 @@ test "data past a FIN is refused" {
     }));
     // A second FIN has to agree with the first.
     try testing.expectError(error.FinalSizeError, r.push(.{
+        .id = 0,
+        .offset = 0,
+        .data = &.{0},
+        .fin = true,
+    }));
+
+    // A FIN below what has already arrived.
+    var other: [16]u8 = @splat(0);
+    var s = Receiver.init(&other, 64);
+    try s.push(.{ .id = 0, .offset = 0, .data = &.{ 0, 1, 2, 3 }, .fin = false });
+    try testing.expectError(error.FinalSizeError, s.push(.{
         .id = 0,
         .offset = 0,
         .data = &.{0},
@@ -325,28 +331,14 @@ test "consuming slides the buffer and earns a new limit" {
     r.window.extend(r.grant());
     try r.push(.{ .id = 0, .offset = 16, .data = &.{ 1, 2 }, .fin = false });
     try testing.expectEqual(@as(usize, 10), r.readable().len);
-}
 
-test "data past what we granted is refused" {
-    var buf: [16]u8 = @splat(0);
-    var r = Receiver.init(&buf, 4);
-    try testing.expectError(error.FlowControlError, r.push(.{
+    // Data past what we granted is a flow control violation, not a short read.
+    var other: [16]u8 = @splat(0);
+    var s = Receiver.init(&other, 4);
+    try testing.expectError(error.FlowControlError, s.push(.{
         .id = 0,
         .offset = 2,
         .data = &.{ 2, 3, 4 },
         .fin = false,
-    }));
-}
-
-test "a FIN below what has arrived is refused" {
-    var buf: [16]u8 = @splat(0);
-    var r = Receiver.init(&buf, 64);
-    try r.push(.{ .id = 0, .offset = 0, .data = &.{ 0, 1, 2, 3 }, .fin = false });
-
-    try testing.expectError(error.FinalSizeError, r.push(.{
-        .id = 0,
-        .offset = 0,
-        .data = &.{0},
-        .fin = true,
     }));
 }

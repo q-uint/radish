@@ -77,12 +77,13 @@ fn oidFromHex(comptime hex: *const [40]u8) git.Oid {
     return oid;
 }
 
-test "canonical is sorted by name, sigrefs branch excluded" {
+test "canonical is sorted by name, skipping the sigrefs branch and zero oids" {
     const a = oidFromHex("1111111111111111111111111111111111111111");
     const b = oidFromHex("2222222222222222222222222222222222222222");
     const refs = Refs{ .entries = &.{
         .{ .name = "refs/heads/master", .oid = b },
         .{ .name = "refs/rad/sigrefs", .oid = a },
+        .{ .name = "refs/heads/gone", .oid = @splat(0) },
         .{ .name = "refs/heads/dev", .oid = a },
     } };
     const c = try refs.canonical(testing.allocator);
@@ -94,38 +95,14 @@ test "canonical is sorted by name, sigrefs branch excluded" {
     , c);
 }
 
-test "zero oid entries are skipped" {
-    const zero: git.Oid = @splat(0);
-    const a = oidFromHex("1111111111111111111111111111111111111111");
-    const refs = Refs{ .entries = &.{
-        .{ .name = "refs/heads/gone", .oid = zero },
-        .{ .name = "refs/heads/here", .oid = a },
-    } };
-    const c = try refs.canonical(testing.allocator);
-    defer testing.allocator.free(c);
-    try testing.expectEqualStrings(
-        \\1111111111111111111111111111111111111111 refs/heads/here
-        \\
-    , c);
-}
-
-test "sign then verify round trip" {
-    const seed: [32]u8 = @splat(7);
-    const key = try signature.SecretKey.fromSeed(seed);
-    const a = oidFromHex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    const refs = Refs{ .entries = &.{.{ .name = "refs/heads/master", .oid = a }} };
-
-    const signed = try refs.sign(testing.allocator, key);
-    try signed.verify(testing.allocator);
-}
-
-test "verify rejects a tampered ref set" {
-    const seed: [32]u8 = @splat(7);
-    const key = try signature.SecretKey.fromSeed(seed);
+test "verify accepts a signed ref set, and rejects a tampered one" {
+    const key = try signature.SecretKey.fromSeed(@splat(7));
     const a = oidFromHex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     const b = oidFromHex("0000000000000000000000000000000000000001");
     const refs = Refs{ .entries = &.{.{ .name = "refs/heads/master", .oid = a }} };
+
     var signed = try refs.sign(testing.allocator, key);
+    try signed.verify(testing.allocator);
 
     // Swap the refs out from under the signature.
     signed.refs = Refs{ .entries = &.{.{ .name = "refs/heads/master", .oid = b }} };

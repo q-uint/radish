@@ -105,64 +105,43 @@ fn expectEncode(expected: []const u8, v: Value) !void {
     try testing.expectEqualStrings(expected, got);
 }
 
-test "primitives" {
+test "primitives encode compactly" {
     try expectEncode("null", .null);
     try expectEncode("true", .{ .bool = true });
     try expectEncode("false", .{ .bool = false });
     try expectEncode("42", .{ .int = 42 });
     try expectEncode("-7", .{ .int = -7 });
     try expectEncode("\"hi\"", .{ .string = "hi" });
-}
-
-test "object keys are sorted by bytes" {
-    const v = Value{ .object = &.{
-        .{ .key = "threshold", .value = .{ .int = 1 } },
-        .{ .key = "delegates", .value = .{ .array = &.{} } },
-        .{ .key = "payload", .value = .{ .object = &.{} } },
-    } };
-    try expectEncode("{\"delegates\":[],\"payload\":{},\"threshold\":1}", v);
-}
-
-test "compact array" {
     try expectEncode("[1,2,3]", .{ .array = &.{
         .{ .int = 1 }, .{ .int = 2 }, .{ .int = 3 },
     } });
-}
-
-test "control char escaping lower-case hex" {
-    try expectEncode("\"a\\u0001b\"", .{ .string = "a\x01b" });
-    try expectEncode("\"\\n\\t\"", .{ .string = "\n\t" });
-}
-
-test "nfc normalization in strings" {
-    // "e" + combining acute -> precomposed e-acute.
-    try expectEncode("\"\u{00E9}\"", .{ .string = "e\u{0301}" });
-}
-
-// Golden vectors produced by Radicle Heartwood's own CanonicalFormatter,
-// crates/radicle/src/canonical/formatter.rs (serde_json + NFC + control-char
-// escaping). These pin our output byte-for-byte against upstream.
-test "heartwood: nfc value" {
-    try expectEncode("{\"k\":\"\u{00E9}\"}", .{ .object = &.{
-        .{ .key = "k", .value = .{ .string = "e\u{0301}" } },
+    try expectEncode("{\"delegates\":[],\"payload\":{},\"threshold\":1}", .{ .object = &.{
+        .{ .key = "threshold", .value = .{ .int = 1 } },
+        .{ .key = "delegates", .value = .{ .array = &.{} } },
+        .{ .key = "payload", .value = .{ .object = &.{} } },
     } });
 }
 
-test "heartwood: keys are nfc-normalized then sorted" {
-    // key "e"+acute normalizes to U+00E9 (0xC3 0xA9), which sorts AFTER "z" (0x7A).
+test "strings are nfc-normalized and control chars escaped in lower-case hex" {
+    try expectEncode("{\"k\":\"\u{00E9}\"}", .{ .object = &.{
+        .{ .key = "k", .value = .{ .string = "e\u{0301}" } },
+    } });
+    try expectEncode("{\"k\":\"a\\u0001\\n\\t\"}", .{ .object = &.{
+        .{ .key = "k", .value = .{ .string = "a\x01\n\t" } },
+    } });
+}
+
+test "keys are nfc-normalized then sorted" {
+    // "e"+acute normalizes to U+00E9 (0xC3 0xA9), which sorts AFTER "z" (0x7A).
     try expectEncode("{\"z\":2,\"\u{00E9}\":1}", .{ .object = &.{
         .{ .key = "e\u{0301}", .value = .{ .int = 1 } },
         .{ .key = "z", .value = .{ .int = 2 } },
     } });
 }
 
-test "heartwood: control chars" {
-    try expectEncode("{\"k\":\"a\\u0001\\n\\t\"}", .{ .object = &.{
-        .{ .key = "k", .value = .{ .string = "a\x01\n\t" } },
-    } });
-}
-
-test "heartwood: realistic doc with unicode payload" {
+// Golden vector from heartwood's own CanonicalFormatter,
+// crates/radicle/src/canonical/formatter.rs.
+test "realistic doc with unicode payload hashes to the expected git oid" {
     const expected =
         "{\"delegates\":[\"did:key:z6Mkt\"]," ++
         "\"payload\":{\"xyz.radicle.project\":{\"description\":\"\u{017A}a\",\"name\":\"caf\u{00E9}\"}}," ++
@@ -179,7 +158,7 @@ test "heartwood: realistic doc with unicode payload" {
     } };
     try expectEncode(expected, doc);
 
-    // git oid of the canonical bytes: printf '%s' <bytes> | git hash-object --stdin
+    // printf '%s' <bytes> | git hash-object --stdin
     const git = @import("../git/git.zig");
     const bytes = try encode(testing.allocator, doc);
     defer testing.allocator.free(bytes);
@@ -187,26 +166,4 @@ test "heartwood: realistic doc with unicode payload" {
     var hex: [40]u8 = undefined;
     _ = std.fmt.bufPrint(&hex, "{x}", .{oid}) catch unreachable;
     try testing.expectEqualStrings("4aad12ef5b9691de8eb7c05e1f264a30838eb4ac", &hex);
-}
-
-test "canonical doc bytes hash to expected git oid" {
-    // Placeholder doc shape (not the full identity schema, a later slice):
-    // encode with unsorted keys, expect sorted canonical bytes, and confirm
-    // git.hashBlob of those bytes matches
-    //   printf '%s' '{"delegates":[],"payload":{},"threshold":1}' | git hash-object --stdin
-    //   -> ae590f21977f49291526fc97460553ea72439da1
-    const git = @import("../git/git.zig");
-    const doc = Value{ .object = &.{
-        .{ .key = "payload", .value = .{ .object = &.{} } },
-        .{ .key = "delegates", .value = .{ .array = &.{} } },
-        .{ .key = "threshold", .value = .{ .int = 1 } },
-    } };
-    const bytes = try encode(testing.allocator, doc);
-    defer testing.allocator.free(bytes);
-    try testing.expectEqualStrings("{\"delegates\":[],\"payload\":{},\"threshold\":1}", bytes);
-
-    const oid = try git.hashBlob(bytes);
-    var hex: [40]u8 = undefined;
-    _ = std.fmt.bufPrint(&hex, "{x}", .{oid}) catch unreachable;
-    try testing.expectEqualStrings("ae590f21977f49291526fc97460553ea72439da1", &hex);
 }

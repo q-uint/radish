@@ -26,10 +26,3 @@ test {
     _ = quic;
     _ = pkg;
 }
-
-test "gitpack module is importable from the toolchain" {
-    const gitpack = @import("gitpack");
-    _ = gitpack.Oid;
-    _ = gitpack.indexPack;
-    _ = gitpack.Repository;
-}

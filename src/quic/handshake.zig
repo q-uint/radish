@@ -479,15 +479,18 @@ test "parses the RFC 8448 ServerHello" {
         &hex("c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f"),
         ks.key,
     );
-}
 
-test "rejects a message that is not a ServerHello" {
     var ch: [196]u8 = undefined;
     _ = try std.fmt.hexToBytes(&ch, testdata.rfc8448_client_hello_hex);
     try testing.expectError(error.NotServerHello, parseServerHello(&ch));
 }
 
-test "key_share and supported_versions round trip" {
+test "extensions are type, length, body, and key_share and supported_versions round trip" {
+    var ext_buf: [16]u8 = undefined;
+    var ext_w = std.Io.Writer.fixed(&ext_buf);
+    try writeExtension(&ext_w, 0x002b, &.{ 0x02, 0x03, 0x04 });
+    try testing.expectEqualSlices(u8, &hex("002b0003020304"), ext_w.buffered());
+
     const public = hex("99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c");
     var buf: [64]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -542,11 +545,4 @@ test "walks whole handshake messages and stops on a partial one" {
     // boundary so a later pass can retry it.
     try testing.expectEqual(@as(?Message, null), it.next());
     try testing.expectEqual(@as(usize, 11), it.pos);
-}
-
-test "extensions are type, length, body" {
-    var buf: [16]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    try writeExtension(&w, 0x002b, &.{ 0x02, 0x03, 0x04 });
-    try testing.expectEqualSlices(u8, &hex("002b0003020304"), w.buffered());
 }

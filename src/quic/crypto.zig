@@ -108,11 +108,13 @@ test "RFC 9001 A.1 key schedule" {
         try testing.expectEqualSlices(u8, &hex(c[3]), &k.iv);
         try testing.expectEqualSlices(u8, &hex(c[4]), &k.hp);
     }
-}
 
-test "RFC 9001 A.2 header protection mask" {
-    const hp = keysFromSecret(initialSecrets(&hex(testdata.rfc9001_dcid)).client).hp;
-    try testing.expectEqualSlices(u8, &hex("437b9aec36"), &headerMask(hp, hex("d1b1c98dd7689fb8ec11d242b123dc9b")));
+    // A.2's header protection mask, from the client hp key above.
+    try testing.expectEqualSlices(
+        u8,
+        &hex("437b9aec36"),
+        &headerMask(keysFromSecret(s.client).hp, hex("d1b1c98dd7689fb8ec11d242b123dc9b")),
+    );
 }
 
 // Keys must depend on the connection id and on the direction, or the salt is

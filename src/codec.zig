@@ -132,8 +132,7 @@ test "varint RFC 9000 A.1 vectors" {
         try (Writer{ .out = &out, .allocator = testing.allocator }).varint(c[0]);
         try testing.expectEqualSlices(u8, c[1], out.items);
 
-        // The same vectors through the allocation-free path, so both sinks are
-        // pinned rather than one relying on the other.
+        // The same vectors through the allocation-free path.
         var buf: [8]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
         try writeVarint(&w, c[0]);
@@ -155,9 +154,7 @@ test "varintLen agrees with what writeVarint emits" {
         var r = Reader{ .buf = w.buffered() };
         try testing.expectEqual(v, try r.varintCanonical());
     }
-}
 
-test "a value too large to encode is rejected" {
     var buf: [8]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try testing.expectError(error.VarIntTooLarge, writeVarint(&w, 1 << 62));

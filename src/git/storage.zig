@@ -396,18 +396,12 @@ pub const Repository = struct {
         return found orelse error.BranchMissing;
     }
 
-    /// Whether `want` is a commit a delegate published, either as a signed ref
-    /// tip or somewhere in the history behind one.
+    /// Whether `want` is a commit a delegate published, as a signed ref tip or
+    /// behind one. Ancestry is pack membership, not a parent walk: the pack
+    /// holds exactly what the fetched tips reach.
     ///
-    /// Ancestry is established by the pack rather than by walking parents,
-    /// which gitpack exposes no way to do: the clone asks for whole refs, so
-    /// the pack holds exactly the objects reachable from the tips it fetched.
-    /// A commit is in it only if some fetched tip reaches it, and every tip is
-    /// checked against a delegate's sigrefs before this returns true. A
-    /// contributor's unreferenced commit is therefore not in the pack at all.
-    ///
-    /// Requires that the caller verified the remotes first, since the argument
-    /// rests on every tip in the pack being signed.
+    /// Requires verified remotes, since that argument rests on every tip in
+    /// the pack being signed.
     pub fn revPublishedByDelegate(
         self: *Repository,
         scratch: std.mem.Allocator,
@@ -654,10 +648,7 @@ test "parseSigrefs round-trips the canonical encoding" {
     const canon = try (sigrefs.Refs{ .entries = entries }).canonical(alloc);
     defer alloc.free(canon);
     try testing.expectEqualStrings(SAMPLE_SIGREFS, canon);
-}
 
-test "parseSigrefs rejects malformed lines" {
-    const alloc = testing.allocator;
     try testing.expectError(error.SigrefsMalformed, parseSigrefs(alloc, "too short\n"));
     try testing.expectError(error.SigrefsMalformed, parseSigrefs(alloc, "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz refs/heads/main\n"));
 }

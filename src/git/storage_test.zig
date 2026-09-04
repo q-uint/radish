@@ -5,7 +5,6 @@ const std = @import("std");
 const gitpack = @import("gitpack");
 const storage = @import("storage.zig");
 const fixture = @import("testfixture.zig");
-const sigrefs = @import("../identity/sigrefs.zig");
 const rid = @import("../identity/rid.zig");
 const signature = @import("../crypto/signature.zig");
 
@@ -35,10 +34,14 @@ fn hex(comptime s: *const [128:0]u8) [64]u8 {
 /// A valid key that did not sign anything in these fixtures.
 const OTHER_NID = "z6MkkfM3tPXNPrPevKr3uSiQtHPuwnNhu2yUVjgd2jXVsVz5";
 
-test "reads and verifies a namespace's sigrefs" {
+test "reads a namespace's sigrefs, and the namespaces on disk" {
     var s = try fixture.scratch(alloc);
     defer fixture.destroy(alloc, s);
     try s.repo.sigrefs(REAL_SIGREFS_NID, REAL_SIGREFS, &REAL_SIGREFS_SIG);
+    // The same genuine signature, filed under a namespace that did not sign it.
+    const foreign = try nidForSeed(SEED_SORTS_FIRST);
+    defer alloc.free(foreign);
+    try s.repo.sigrefs(foreign, REAL_SIGREFS, &REAL_SIGREFS_SIG);
     const bare = try s.repo.finish();
 
     var repo = try storage.Repository.open(testing.io, alloc, bare);
@@ -49,36 +52,26 @@ test "reads and verifies a namespace's sigrefs" {
     try testing.expectEqualStrings(REAL_SIGREFS, signed.message);
     try testing.expectEqualSlices(u8, &REAL_SIGREFS_SIG, &signed.signed.sig.bytes);
     try signed.signed.verify(alloc);
-}
 
-// The namespace name is the only thing binding a ref set to its signer, so a
-// genuine signature filed under the wrong namespace must be rejected.
-test "sigrefs signed by another node are rejected" {
-    var s = try fixture.scratch(alloc);
-    defer fixture.destroy(alloc, s);
-    try s.repo.sigrefs(OTHER_NID, REAL_SIGREFS, &REAL_SIGREFS_SIG);
-    const bare = try s.repo.finish();
-
-    var repo = try storage.Repository.open(testing.io, alloc, bare);
-    defer repo.deinit();
+    // The namespace name is the only thing binding a ref set to its signer.
     try testing.expectError(
         error.SignatureVerificationFailed,
-        repo.readSigrefs(alloc, alloc, OTHER_NID),
+        repo.readSigrefs(alloc, alloc, foreign),
     );
-}
-
-test "a namespace with no sigrefs reports SigrefsMissing" {
-    var s = try fixture.scratch(alloc);
-    defer fixture.destroy(alloc, s);
-    try s.repo.sigrefs(REAL_SIGREFS_NID, REAL_SIGREFS, &REAL_SIGREFS_SIG);
-    const bare = try s.repo.finish();
-
-    var repo = try storage.Repository.open(testing.io, alloc, bare);
-    defer repo.deinit();
     try testing.expectError(
         error.SigrefsMissing,
         repo.readSigrefs(alloc, alloc, OTHER_NID),
     );
+
+    const found = try repo.remotes(alloc);
+    defer {
+        for (found) |n| alloc.free(n);
+        alloc.free(found);
+    }
+    try testing.expectEqual(@as(usize, 2), found.len);
+    var saw_real = false;
+    for (found) |n| saw_real = saw_real or std.mem.eql(u8, n, REAL_SIGREFS_NID);
+    try testing.expect(saw_real);
 }
 
 test "hasObject finds exactly the oids in the pack" {
@@ -99,51 +92,7 @@ test "hasObject finds exactly the oids in the pack" {
     try testing.expect(!try repo.hasObject(absent));
 }
 
-// The signature is genuine, so only the pack check can catch this.
-test "verifyRemote rejects signed refs whose objects are absent" {
-    var s = try fixture.scratch(alloc);
-    defer fixture.destroy(alloc, s);
-    try s.repo.sigrefs(REAL_SIGREFS_NID, REAL_SIGREFS, &REAL_SIGREFS_SIG);
-    const id = try s.repo.commit("main", "embeds/radicle.json", docWithDelegates("\"did:key:" ++ REAL_SIGREFS_NID ++ "\""));
-    try s.repo.radId(id);
-    const bare = try s.repo.finish();
-
-    var repo = try storage.Repository.open(testing.io, alloc, bare);
-    defer repo.deinit();
-
-    // readSigrefs is satisfied: the signature is real.
-    var signed = try repo.readSigrefs(alloc, alloc, REAL_SIGREFS_NID);
-    signed.deinit(alloc);
-
-    // verifyRemote is not: nothing packed the objects those refs name.
-    try testing.expectError(
-        error.MissingObject,
-        repo.verifyRemote(alloc, alloc, REAL_SIGREFS_NID),
-    );
-}
-
-test "verifyRemote accepts a remote whose objects are all present" {
-    var s = try fixture.scratch(alloc);
-    defer fixture.destroy(alloc, s);
-    const head = try s.repo.commit("main", "f", "hi");
-    const nid = try s.repo.signedRefs(3, &.{.{ .oid = head, .name = "refs/heads/main" }});
-    defer alloc.free(nid);
-    const doc_bytes = try docDelegating(&.{nid});
-    defer alloc.free(doc_bytes);
-    const id = try s.repo.commit("main", "embeds/radicle.json", doc_bytes);
-    try s.repo.radId(id);
-    const bare = try s.repo.finish();
-
-    var repo = try storage.Repository.open(testing.io, alloc, bare);
-    defer repo.deinit();
-
-    var signed = try repo.verifyRemote(alloc, alloc, nid);
-    defer signed.deinit(alloc);
-    try testing.expectEqual(@as(usize, 1), signed.signed.refs.entries.len);
-    try testing.expectEqualStrings("refs/heads/main", signed.signed.refs.entries[0].name);
-}
-
-test "verifyAll reports each remote independently" {
+test "verification turns on whether the signed objects are in the pack" {
     var s = try fixture.scratch(alloc);
     defer fixture.destroy(alloc, s);
     const head = try s.repo.commit("main", "f", "hi");
@@ -160,6 +109,20 @@ test "verifyAll reports each remote independently" {
 
     var repo = try storage.Repository.open(testing.io, alloc, bare);
     defer repo.deinit();
+
+    var ok = try repo.verifyRemote(alloc, alloc, good);
+    defer ok.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), ok.signed.refs.entries.len);
+    try testing.expectEqualStrings("refs/heads/main", ok.signed.refs.entries[0].name);
+
+    // readSigrefs is satisfied by the other one: the signature is real, so only
+    // the pack check can catch it.
+    var signed = try repo.readSigrefs(alloc, alloc, REAL_SIGREFS_NID);
+    signed.deinit(alloc);
+    try testing.expectError(
+        error.MissingObject,
+        repo.verifyRemote(alloc, alloc, REAL_SIGREFS_NID),
+    );
 
     var report = try repo.verifyAll(alloc, alloc);
     defer report.deinit(alloc);
@@ -182,23 +145,6 @@ test "verifyAll on a repo with no remotes reports nothing" {
     defer report.deinit(alloc);
     try testing.expectEqual(@as(usize, 0), report.verified.len);
     try testing.expectEqual(@as(usize, 0), report.failed.len);
-}
-
-test "remotes lists the namespaces on disk" {
-    var s = try fixture.scratch(alloc);
-    defer fixture.destroy(alloc, s);
-    try s.repo.sigrefs(REAL_SIGREFS_NID, REAL_SIGREFS, &REAL_SIGREFS_SIG);
-    const bare = try s.repo.finish();
-
-    var repo = try storage.Repository.open(testing.io, alloc, bare);
-    defer repo.deinit();
-    const found = try repo.remotes(alloc);
-    defer {
-        for (found) |n| alloc.free(n);
-        alloc.free(found);
-    }
-    try testing.expectEqual(@as(usize, 1), found.len);
-    try testing.expectEqualStrings(REAL_SIGREFS_NID, found[0]);
 }
 
 // Delegates are `did:key:z6Mk...` in the doc but namespaces on disk are bare
@@ -259,7 +205,7 @@ test "a verified remote need not be a delegate" {
 // The zine repo on rad.0x51.dev has an amended doc: refs/rad/id points at a
 // revision that added an `xyz.radicle.crefs` payload, while the RID is still
 // the hash of the root revision. Hashing the head would break every such repo.
-test "repoId follows the root, not an amended identity head" {
+test "repoId follows the root, not an amended identity head, and checkRepoId agrees" {
     var s = try fixture.scratch(alloc);
     defer fixture.destroy(alloc, s);
     const signer = try nidForSeed(SEED_SORTS_SECOND);
@@ -280,24 +226,8 @@ test "repoId follows the root, not an amended identity head" {
     const got = try repo.repoId(alloc);
     const want = try rid.RepoId.fromDoc(root_doc);
     try testing.expectEqualSlices(u8, &want.oid, &got.oid);
-}
 
-test "checkRepoId rejects a doc that hashes to a different RID" {
-    var s = try fixture.scratch(alloc);
-    defer fixture.destroy(alloc, s);
-    const signer = try nidForSeed(SEED_SORTS_SECOND);
-    defer alloc.free(signer);
-    const doc_bytes = try docDelegating(&.{signer});
-    defer alloc.free(doc_bytes);
-    const root = try s.repo.commit("main", "embeds/radicle.json", doc_bytes);
-    try s.repo.radId(root);
-    alloc.free(try s.repo.signedRefs(SEED_SORTS_SECOND, &.{.{ .oid = root, .name = "refs/rad/root" }}));
-    try s.repo.radRoot(signer, root);
-    const bare = try s.repo.finish();
-
-    var repo = try storage.Repository.open(testing.io, alloc, bare);
-    defer repo.deinit();
-
+    try repo.checkRepoId(alloc, want);
     const wrong = try rid.RepoId.parse("rad:z3WukSjzicL8WaZHFALbBwb2r8W52");
     try testing.expectError(error.RepoIdMismatch, repo.checkRepoId(alloc, wrong));
 }
@@ -305,56 +235,28 @@ test "checkRepoId rejects a doc that hashes to a different RID" {
 // heartwood walks the refs actually present under the namespace and requires
 // each to appear in sigrefs at the same oid (storage/git.rs validate_remote).
 // Checking only the signed->disk direction misses refs the peer smuggled in.
-test "verifyRemote rejects an on-disk ref that sigrefs does not cover" {
-    var s = try fixture.scratch(alloc);
-    defer fixture.destroy(alloc, s);
-    const head = try s.repo.commit("main", "f", "hi");
-    const nid = try s.repo.signedRefs(3, &.{.{ .oid = head, .name = "refs/heads/main" }});
-    defer alloc.free(nid);
-    try s.repo.namespaceRef(nid, "refs/heads/main", head);
-    // Signed by nobody: present on disk, absent from the signed set.
-    try s.repo.namespaceRef(nid, "refs/heads/smuggled", head);
-    const bare = try s.repo.finish();
-
-    var repo = try storage.Repository.open(testing.io, alloc, bare);
-    defer repo.deinit();
-    try testing.expectError(error.UnsignedRef, repo.verifyRemote(alloc, alloc, nid));
-}
-
-test "verifyRemote rejects an on-disk ref at a different oid than signed" {
+test "verifyRemote rejects an on-disk ref sigrefs does not cover, or covers at another oid" {
     var s = try fixture.scratch(alloc);
     defer fixture.destroy(alloc, s);
     const head = try s.repo.commit("main", "f", "hi");
     const other = try s.repo.commit("side", "g", "bye");
-    const nid = try s.repo.signedRefs(3, &.{.{ .oid = head, .name = "refs/heads/main" }});
-    defer alloc.free(nid);
+
+    const smuggler = try s.repo.signedRefs(SEED_SORTS_FIRST, &.{.{ .oid = head, .name = "refs/heads/main" }});
+    defer alloc.free(smuggler);
+    try s.repo.namespaceRef(smuggler, "refs/heads/main", head);
+    // Signed by nobody: present on disk, absent from the signed set.
+    try s.repo.namespaceRef(smuggler, "refs/heads/smuggled", head);
+
+    const mismatcher = try s.repo.signedRefs(SEED_SORTS_SECOND, &.{.{ .oid = head, .name = "refs/heads/main" }});
+    defer alloc.free(mismatcher);
     // Signed at `head`, but on disk it points at `other`.
-    try s.repo.namespaceRef(nid, "refs/heads/main", other);
+    try s.repo.namespaceRef(mismatcher, "refs/heads/main", other);
     const bare = try s.repo.finish();
 
     var repo = try storage.Repository.open(testing.io, alloc, bare);
     defer repo.deinit();
-    try testing.expectError(error.MismatchedRef, repo.verifyRemote(alloc, alloc, nid));
-}
-
-test "reads the identity doc from a clone-layout repo" {
-    var s = try fixture.scratch(alloc);
-    defer fixture.destroy(alloc, s);
-    const signer = try nidForSeed(SEED_SORTS_SECOND);
-    defer alloc.free(signer);
-    const doc_bytes = try docDelegating(&.{signer});
-    defer alloc.free(doc_bytes);
-    const id = try s.repo.commit("main", "embeds/radicle.json", doc_bytes);
-    alloc.free(try s.repo.signedRefs(SEED_SORTS_SECOND, &.{.{ .oid = id, .name = "refs/rad/root" }}));
-    try s.repo.radRoot(signer, id);
-    try s.repo.radId(id);
-    const bare = try s.repo.finish();
-
-    var repo = try storage.Repository.open(testing.io, alloc, bare);
-    defer repo.deinit();
-    const got = try repo.readDocBytes(alloc, alloc);
-    defer alloc.free(got);
-    try testing.expectEqualStrings(doc_bytes, got);
+    try testing.expectError(error.UnsignedRef, repo.verifyRemote(alloc, alloc, smuggler));
+    try testing.expectError(error.MismatchedRef, repo.verifyRemote(alloc, alloc, mismatcher));
 }
 
 // `refs/rad/id` is written from whatever the peer sent, so reading the doc there
@@ -397,8 +299,9 @@ const SEED_SORTS_SECOND = 3;
 // Publishing refs/rad/root without signing it is not a state any honest remote
 // reaches: rad writes the ref and its sigrefs entry together. Skipping such a
 // namespace would leave its refs in the clone, so the whole repository is
-// rejected instead; a valid delegate signature elsewhere does not excuse it.
-test "identityRoot rejects a remote that publishes an unsigned refs/rad/root" {
+// rejected instead. Neither a valid delegate signature elsewhere nor a RID that
+// matches excuses it.
+test "an unsigned refs/rad/root rejects the repository" {
     var s = try fixture.scratch(alloc);
     defer fixture.destroy(alloc, s);
 
@@ -425,28 +328,9 @@ test "identityRoot rejects a remote that publishes an unsigned refs/rad/root" {
     // SigrefsMissing rather than IdRootUnsigned: the attacker published a root
     // with no sigrefs at all, and saying which is missing is the diagnosis.
     try testing.expectError(error.SigrefsMissing, repo.identityRootOid(alloc));
-}
 
-// The full substitution: attacker namespace carries the victim's real root, so
-// the RID matches, while the repo's actual content is the attacker's.
-test "checkRepoId rejects a root published only by an unsigned remote" {
-    var s = try fixture.scratch(alloc);
-    defer fixture.destroy(alloc, s);
-
-    const victim_doc = docWithDelegates("\"did:key:" ++ OTHER_NID ++ "\"");
-    const root = try s.repo.commit("main", "embeds/radicle.json", victim_doc);
-
-    const attacker = try nidForSeed(SEED_SORTS_FIRST);
-    defer alloc.free(attacker);
-    try s.repo.radRoot(attacker, root);
-    try s.repo.radId(root);
-    const bare = try s.repo.finish();
-
-    var repo = try storage.Repository.open(testing.io, alloc, bare);
-    defer repo.deinit();
-
-    // The RID would have matched; the unsigned root is what stops the clone.
-    const want = try rid.RepoId.fromDoc(victim_doc);
+    // The RID the honest root hashes to would have matched, and does not help.
+    const want = try rid.RepoId.fromDoc(honest_doc);
     try testing.expectError(error.SigrefsMissing, repo.checkRepoId(alloc, want));
 }
 
@@ -510,7 +394,7 @@ test "identityRoot rejects delegates that disagree on the root" {
 // A dependency has to resolve to one commit, but every remote has its own
 // namespace. The doc's defaultBranch names the branch and delegate status says
 // whose namespace to read it from, so a contributor cannot steer the result.
-test "canonicalHead reads defaultBranch from a delegate namespace" {
+test "canonicalHead reads defaultBranch, and the doc, from a delegate namespace" {
     var s = try fixture.scratch(alloc);
     defer fixture.destroy(alloc, s);
 
@@ -548,6 +432,10 @@ test "canonicalHead reads defaultBranch from a delegate namespace" {
     const got = try repo.canonicalHead(alloc);
     const want = try gitpack.Oid.parse(.sha1, head);
     try testing.expectEqualSlices(u8, want.slice(), got.slice());
+
+    const doc = try repo.readDocBytes(alloc, alloc);
+    defer alloc.free(doc);
+    try testing.expectEqualStrings(doc_bytes, doc);
 }
 
 test "canonicalHead rejects delegates that disagree" {

@@ -9,7 +9,6 @@
 //!   - threshold: signature threshold
 const std = @import("std");
 const canonical = @import("../crypto/canonical.zig");
-const git = @import("../git/git.zig");
 const rid = @import("rid.zig");
 
 pub const PROJECT_PAYLOAD = "xyz.radicle.project";
@@ -170,7 +169,7 @@ const HEARTWOOD_DOC = Doc{
     .delegates = &.{"did:key:z6MknSLrJoTcukLrE435hVNQT4JUhbvWLX4kUzqkEStBU8Vi"},
 };
 
-test "encode matches heartwood canonical bytes" {
+test "encode matches heartwood canonical bytes, whose oid is the RID" {
     const bytes = try HEARTWOOD_DOC.encode(testing.allocator);
     defer testing.allocator.free(bytes);
     try testing.expectEqualStrings(
@@ -178,24 +177,12 @@ test "encode matches heartwood canonical bytes" {
     ,
         bytes,
     );
-}
 
-test "doc bytes hash to expected git oid" {
-    const bytes = try HEARTWOOD_DOC.encode(testing.allocator);
-    defer testing.allocator.free(bytes);
     // printf '%s' <bytes> | git hash-object --stdin
-    const oid = try git.hashBlob(bytes);
-    var hex: [40]u8 = undefined;
-    _ = std.fmt.bufPrint(&hex, "{x}", .{oid}) catch unreachable;
-    try testing.expectEqualStrings("d96f425412c9f8ad5d9a9a05c9831d0728e2338d", &hex);
-}
-
-test "repoId round trips through rad: string" {
     const repo = try HEARTWOOD_DOC.repoId(testing.allocator);
-    const s = try repo.encode(testing.allocator);
-    defer testing.allocator.free(s);
-    const back = try rid.RepoId.parse(s);
-    try testing.expectEqualSlices(u8, &repo.oid, &back.oid);
+    var hex: [40]u8 = undefined;
+    _ = std.fmt.bufPrint(&hex, "{x}", .{repo.oid}) catch unreachable;
+    try testing.expectEqualStrings("d96f425412c9f8ad5d9a9a05c9831d0728e2338d", &hex);
 }
 
 const A = "did:key:z6MkA";
@@ -206,32 +193,17 @@ fn docWith(delegates: []const []const u8, threshold: i64) Doc {
     return .{ .project = HEARTWOOD_DOC.project, .delegates = delegates, .threshold = threshold };
 }
 
-test "verify accepts the initial doc" {
+test "verify accepts a threshold within a unique delegate set" {
     try HEARTWOOD_DOC.verify();
-}
-
-test "verify accepts multi-delegate with valid threshold" {
     try docWith(&.{ A, B, C }, 2).verify();
     try docWith(&.{ A, B, C }, 3).verify();
 }
 
-test "verify rejects empty delegates" {
+test "verify rejects every structural violation" {
     try testing.expectError(error.NoDelegates, docWith(&.{}, 1).verify());
-}
-
-test "verify rejects duplicate delegate" {
     try testing.expectError(error.DuplicateDelegate, docWith(&.{ A, B, A }, 1).verify());
-}
-
-test "verify rejects zero threshold" {
     try testing.expectError(error.ThresholdZero, docWith(&.{A}, 0).verify());
-}
-
-test "verify rejects threshold exceeding delegate count" {
     try testing.expectError(error.ThresholdExceedsDelegates, docWith(&.{ A, B }, 3).verify());
-}
-
-test "verify rejects threshold over max" {
     try testing.expectError(error.ThresholdTooLarge, docWith(&.{A}, 256).verify());
 }
 

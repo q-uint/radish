@@ -242,7 +242,9 @@ fn oidOf(b: u8) [20]u8 {
     return @splat(b);
 }
 
-test "collects only nodes announcing the wanted rid" {
+// Nodes re-announce periodically, so the same seed arrives many times in one
+// subscribe window. Counting those as distinct seeds would inflate the answer.
+test "collects each node announcing the wanted rid once, and nothing else" {
     const want = rid.RepoId.fromOid(oidOf(1));
     var c = Collector.init(testing.allocator, want);
     defer c.deinit();
@@ -250,40 +252,30 @@ test "collects only nodes announcing the wanted rid" {
     const node_a: [32]u8 = @splat(0xAA);
     const node_b: [32]u8 = @splat(0xBB);
 
-    c.onMessage(.{ .inventory_announced = .{
+    const inv_a: protocol.Message = .{ .inventory_announced = .{
         .node = node_a,
         .inventory = &.{ oidOf(9), oidOf(1) },
         .timestamp = 0,
-    } });
+    } };
+    c.onMessage(inv_a);
+    c.onMessage(inv_a);
     // Holds other repos, but not the one asked for.
     c.onMessage(.{ .inventory_announced = .{
         .node = node_b,
         .inventory = &.{oidOf(9)},
         .timestamp = 0,
     } });
+    // A node announcement says nothing about who holds what.
+    c.onMessage(.{ .node_announced = .{
+        .node = @splat(0xCC),
+        .alias = "a",
+        .agent = "b",
+        .timestamp = 0,
+    } });
 
     try testing.expectEqual(@as(usize, 1), c.seeds().len);
     try testing.expectEqualSlices(u8, &node_a, &c.seeds()[0]);
-    try testing.expectEqual(@as(usize, 2), c.inventories);
-}
-
-// Nodes re-announce periodically, so the same seed arrives many times in one
-// subscribe window. Counting those as distinct seeds would inflate the answer.
-test "a node re-announcing is counted once" {
-    const want = rid.RepoId.fromOid(oidOf(1));
-    var c = Collector.init(testing.allocator, want);
-    defer c.deinit();
-
-    const node: [32]u8 = @splat(0xAA);
-    const inv: protocol.Message = .{ .inventory_announced = .{
-        .node = node,
-        .inventory = &.{oidOf(1)},
-        .timestamp = 0,
-    } };
-    c.onMessage(inv);
-    c.onMessage(inv);
-
-    try testing.expectEqual(@as(usize, 1), c.seeds().len);
+    try testing.expectEqual(@as(usize, 3), c.inventories);
 }
 
 fn announcement(node: [32]u8, alias: []const u8, addrs: []const protocol.Address) protocol.Message {
@@ -313,14 +305,20 @@ test "onion addresses render as their v3 name" {
     );
 }
 
-test "collects peers with their advertised addresses" {
+// Addresses borrow the decode scratch buffer, which the next frame overwrites,
+// so a peer that outlives one frame must own its strings.
+test "collects each peer once, owning the addresses it advertised" {
     var c = PeerCollector.init(testing.allocator);
     defer c.deinit();
 
-    c.onMessage(announcement(@splat(0xAA), "one", &.{
-        .{ .kind = .dns, .host = "seed.example", .port = 8776 },
+    var host = "seed.example".*;
+    const msg = announcement(@splat(0xAA), "one", &.{
+        .{ .kind = .dns, .host = &host, .port = 8776 },
         .{ .kind = .ipv4, .host = &.{ 10, 0, 0, 7 }, .port = 8776 },
-    }));
+    });
+    c.onMessage(msg);
+    c.onMessage(msg);
+    @memset(&host, 'x');
 
     try testing.expectEqual(@as(usize, 1), c.peers().len);
     const p = c.peers()[0];
@@ -328,34 +326,6 @@ test "collects peers with their advertised addresses" {
     try testing.expectEqual(@as(usize, 2), p.addrs.len);
     try testing.expectEqualStrings("seed.example:8776", p.addrs[0]);
     try testing.expectEqualStrings("10.0.0.7:8776", p.addrs[1]);
-}
-
-// Addresses borrow the decode scratch buffer, which the next frame overwrites,
-// so a peer that outlives one frame must own its strings.
-test "peer addresses survive the frame they arrived in" {
-    var c = PeerCollector.init(testing.allocator);
-    defer c.deinit();
-
-    var host = "seed.example".*;
-    c.onMessage(announcement(@splat(0xAA), "one", &.{
-        .{ .kind = .dns, .host = &host, .port = 8776 },
-    }));
-    @memset(&host, 'x');
-
-    try testing.expectEqualStrings("seed.example:8776", c.peers()[0].addrs[0]);
-}
-
-test "a node re-announcing is one peer" {
-    var c = PeerCollector.init(testing.allocator);
-    defer c.deinit();
-
-    const msg = announcement(@splat(0xAA), "one", &.{
-        .{ .kind = .dns, .host = "seed.example", .port = 8776 },
-    });
-    c.onMessage(msg);
-    c.onMessage(msg);
-
-    try testing.expectEqual(@as(usize, 1), c.peers().len);
 }
 
 // A seed is usable only when both halves have arrived: the inventory saying
@@ -385,51 +355,28 @@ test "locator waits for both the inventory and an address" {
     try testing.expectEqualStrings("seed.example:8776", got.addr);
 }
 
-test "locator ignores a holder that published no address" {
+test "locator ignores a holder with no address, and a reachable non-holder" {
     const want = rid.RepoId.fromOid(oidOf(1));
     var l = Locator.init(testing.allocator, want);
     defer l.deinit();
 
-    const node: [32]u8 = @splat(0xAA);
-    l.onMessage(announcement(node, "unreachable", &.{}));
+    const unreachable_holder: [32]u8 = @splat(0xAA);
+    l.onMessage(announcement(unreachable_holder, "unreachable", &.{}));
     l.onMessage(.{ .inventory_announced = .{
-        .node = node,
+        .node = unreachable_holder,
         .inventory = &.{oidOf(1)},
         .timestamp = 0,
     } });
 
-    try testing.expectEqual(@as(?Located, null), l.located());
-}
-
-test "locator ignores a reachable node that lacks the repo" {
-    const want = rid.RepoId.fromOid(oidOf(1));
-    var l = Locator.init(testing.allocator, want);
-    defer l.deinit();
-
-    l.onMessage(announcement(@splat(0xBB), "other", &.{
+    const non_holder: [32]u8 = @splat(0xBB);
+    l.onMessage(announcement(non_holder, "other", &.{
         .{ .kind = .dns, .host = "other.example", .port = 8776 },
     }));
     l.onMessage(.{ .inventory_announced = .{
-        .node = @splat(0xBB),
+        .node = non_holder,
         .inventory = &.{oidOf(9)},
         .timestamp = 0,
     } });
 
     try testing.expectEqual(@as(?Located, null), l.located());
-}
-
-test "node announcements are not seeds" {
-    const want = rid.RepoId.fromOid(oidOf(1));
-    var c = Collector.init(testing.allocator, want);
-    defer c.deinit();
-
-    c.onMessage(.{ .node_announced = .{
-        .node = @splat(0xAA),
-        .alias = "a",
-        .agent = "b",
-        .timestamp = 0,
-    } });
-
-    try testing.expectEqual(@as(usize, 0), c.seeds().len);
-    try testing.expectEqual(@as(usize, 0), c.inventories);
 }

@@ -118,16 +118,10 @@ pub fn decode(allocator: std.mem.Allocator, input: []const u8) Error![]u8 {
 
 const testing = std.testing;
 
-test "round trip empty" {
-    const enc = try encode(testing.allocator, "");
-    defer testing.allocator.free(enc);
-    try testing.expectEqualStrings("", enc);
-}
-
 test "known vectors" {
-    // Source: base58 draft (draft-msporny-base58) test vectors,
-    // https://datatracker.ietf.org/doc/html/draft-msporny-base58
+    // draft-msporny-base58 test vectors.
     const cases = .{
+        .{ "", "" },
         .{ "Hello World!", "2NEpo7TZRRrLZSi2U" },
         .{ "The quick brown fox jumps over the lazy dog.", "USm3fpXnKG5EUBx2ndxBDMPVciP5hGey2Jh4NDv6gmeo1LkMeiKrLJUUBk6Z" },
         .{ "\x00\x00\x28\x7f\xb4\xcd", "11233QC4" },

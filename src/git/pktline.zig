@@ -63,26 +63,22 @@ pub fn writeData(out: []u8, payload: []const u8) Error![]u8 {
 
 const testing = std.testing;
 
-test "parse flush/delim/response-end" {
+test "parses flush, delim and response-end" {
     try testing.expectEqual(Marker.flush, (try parse("0000")).line.marker);
     try testing.expectEqual(Marker.delim, (try parse("0001")).line.marker);
     try testing.expectEqual(Marker.response_end, (try parse("0002")).line.marker);
     try testing.expectEqualStrings("0000", Marker.flush.wire());
 }
 
-test "parse data line" {
-    const r = try parse("000ahello!");
-    try testing.expectEqualStrings("hello!", r.line.data);
-    try testing.expectEqual(@as(usize, 10), r.consumed);
-}
-
-test "writeData round trips" {
+test "writeData round trips through parse" {
     var buf: [64]u8 = undefined;
     const line = try writeData(&buf, "command=ls-refs\n");
     // "command=ls-refs\n" is 16 bytes -> total 20 -> 0014
     try testing.expectEqualStrings("0014command=ls-refs\n", line);
+
     const r = try parse(line);
     try testing.expectEqualStrings("command=ls-refs\n", r.line.data);
+    try testing.expectEqual(line.len, r.consumed);
 }
 
 test "short buffer is detected, not misparsed" {

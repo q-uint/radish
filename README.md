@@ -39,6 +39,7 @@ radish fetch-deps  <manifest> [dir]                     resolve `.rad` dependenc
   --from <host>:<port>:<node-id>                        fetch from this node instead of locating a seed
 radish serve       <port> [sessions]                    answer inbound connections (one at a time)
 radish quic ping   <host> <port>                        2.x: handshake, then a gossip ping/pong
+radish quic subscribe <host> <port> [messages]          2.x: listen to gossip (default 200)
 radish quic probe  <host> <port> [alpn] [sni]           2.x: send an Initial, read the reply
 ```
 

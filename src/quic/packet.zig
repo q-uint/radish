@@ -541,7 +541,9 @@ test "packet number and nonce helpers" {
     try testing.expectEqual(@as(usize, 0), minPayloadLen(4));
 }
 
-test "parses the RFC 9001 A.2 long header" {
+// The whole packet layer end to end: a real 1200-byte QUIC packet in, the
+// TLS ClientHello that started a connection out.
+test "opens the RFC 9001 A.2 client Initial and finds the ClientHello" {
     var packet: [1200]u8 = undefined;
     _ = try std.fmt.hexToBytes(&packet, testdata.rfc9001_client_initial_hex);
 
@@ -552,16 +554,8 @@ test "parses the RFC 9001 A.2 long header" {
     try testing.expectEqual(@as(usize, 0), h.scid.len);
     try testing.expectEqual(@as(usize, 0), h.token.len);
     try testing.expectEqual(@as(u64, 1182), h.length); // 4 pn + 1162 frames + 16 tag
-
-    // The offset the header protection tests had to be told.
+    // The offset the header protection test had to be told.
     try testing.expectEqual(@as(usize, a2_pn_offset), h.pn_offset);
-}
-
-// The whole packet layer end to end: a real 1200-byte QUIC packet in, the
-// TLS ClientHello that started a connection out.
-test "opens the RFC 9001 A.2 client Initial and finds the ClientHello" {
-    var packet: [1200]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&packet, testdata.rfc9001_client_initial_hex);
 
     const keys = crypto.keysFromSecret(crypto.initialSecrets(&hex(testdata.rfc9001_dcid)).client);
 
@@ -730,9 +724,6 @@ test "a failed open reports the tamper and restores the packet" {
     try testing.expectEqualSlices(u8, &arrived, &packet);
 }
 
-// Masking is XOR, so flipping a reserved bit in the protected byte flips it in
-// the unprotected one. Reported ahead of the authentication failure it also
-// causes.
 // The five masked bits and the missing length field are what separate this from
 // the long header path, so both directions get walked.
 test "seals and opens a 1-RTT packet" {
@@ -760,7 +751,10 @@ test "seals and opens a 1-RTT packet" {
     try testing.expectEqualSlices(u8, &payload, opened.payload);
 }
 
-test "1-RTT headers are refused when they are not one" {
+// Masking is XOR, so flipping a reserved bit in the protected byte flips it in
+// the unprotected one. Reported ahead of the authentication failure it also
+// causes.
+test "1-RTT headers are refused when they are not one, and reserved bits are a violation" {
     const dcid = hex(testdata.other_dcid);
     const keys = clientKeys(testdata.other_dcid);
 
@@ -774,26 +768,18 @@ test "1-RTT headers are refused when they are not one" {
     try testing.expectError(error.ConnectionIdTooLong, parseShortHeader(&[_]u8{0x40}, 21));
     try testing.expectError(error.PacketTooShort, parseShortHeader(&[_]u8{0x40}, 8));
 
-    // Reserved bits are 0x18 here, one bit over from the long header's 0x0c.
     var payload: [32]u8 = @splat(0);
     payload[0] = 0x01;
     var buf: [256]u8 = undefined;
-    const n = try sealShort(&buf, .{ .dcid = &dcid, .pn = 1, .pn_len = 4 }, &payload, keys);
+    var out: [256]u8 = undefined;
+
+    // Reserved bits are 0x18 in a short header, one bit over from the long
+    // header's 0x0c.
+    const short_n = try sealShort(&buf, .{ .dcid = &dcid, .pn = 1, .pn_len = 4 }, &payload, keys);
     buf[0] ^= 0x10;
-    var out: [256]u8 = undefined;
-    try testing.expectError(error.ProtocolViolation, openShort(&out, buf[0..n], dcid.len, keys, null));
-}
+    try testing.expectError(error.ProtocolViolation, openShort(&out, buf[0..short_n], dcid.len, keys, null));
 
-test "reserved bits set is a protocol violation" {
-    const dcid = hex(testdata.other_dcid);
-    const keys = clientKeys(testdata.other_dcid);
-    var payload: [32]u8 = @splat(0);
-    payload[0] = 0x01;
-
-    var buf: [256]u8 = undefined;
-    const n = try seal(&buf, .{ .kind = .handshake, .dcid = &dcid, .pn = 1, .pn_len = 4 }, &payload, keys);
+    const long_n = try seal(&buf, .{ .kind = .handshake, .dcid = &dcid, .pn = 1, .pn_len = 4 }, &payload, keys);
     buf[0] ^= 0x08;
-
-    var out: [256]u8 = undefined;
-    try testing.expectError(error.ProtocolViolation, open(&out, buf[0..n], keys, null));
+    try testing.expectError(error.ProtocolViolation, open(&out, buf[0..long_n], keys, null));
 }

@@ -60,6 +60,23 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, args[2], "ping")) {
             return quicPing(init, args[3], port);
         }
+        if (std.mem.eql(u8, args[2], "fetch-probe") and args.len >= 6) {
+            return quicFetchProbe(init, args[3], port, args[5]);
+        }
+        if (std.mem.eql(u8, args[2], "capture")) {
+            const max: usize = if (args.len >= 6)
+                std.fmt.parseInt(usize, args[5], 10) catch return usage()
+            else
+                10;
+            return quicCapture(init, args[3], port, max);
+        }
+        if (std.mem.eql(u8, args[2], "subscribe")) {
+            const max: usize = if (args.len >= 6)
+                std.fmt.parseInt(usize, args[5], 10) catch return usage()
+            else
+                200;
+            return quicSubscribe(init, args[3], port, max);
+        }
         if (std.mem.eql(u8, args[2], "probe")) {
             const alpn = if (args.len >= 6) args[5] else "h3";
             const sni = if (args.len >= 7) args[6] else null;
@@ -125,6 +142,9 @@ fn usage() void {
         \\
         \\radicle 2.x, over QUIC:
         \\  radish quic ping   <host> <port>                        handshake, then a gossip ping/pong
+        \\  radish quic subscribe <host> <port> [messages]          listen to gossip (default 200)
+        \\  radish quic fetch-probe <host> <port> <rid>             open the git ALPN, list refs
+        \\  radish quic capture <host> <port> [messages]            record datagrams as hex fixtures
         \\  radish quic probe  <host> <port> [alpn] [sni]           send an Initial, read the reply
         \\                                                          (default alpn h3). Only raw public
         \\                                                          keys are offered, so a public
@@ -223,36 +243,64 @@ const GossipPrinter = struct {
     nodes: usize = 0,
     inventories: usize = 0,
     rids: usize = 0,
+    unsigned: usize = 0,
+    undecodable: usize = 0,
+
+    /// A relayed announcement is signed by the node it describes, not by the
+    /// peer that passed it on, so an unverified one is worth nothing.
+    fn mark(self: *GossipPrinter, ok: bool) []const u8 {
+        if (ok) return "";
+        self.unsigned += 1;
+        return " UNSIGNED";
+    }
 
     pub fn onMessage(self: *GossipPrinter, msg: radish.net.protocol.Message) void {
         switch (msg) {
             .node_announced => |n| {
                 self.nodes += 1;
                 const id = radish.NodeId.fromPublicKey(n.node).encode(self.arena) catch return;
-                std.debug.print("node  {s}  alias={s} agent={s}\n", .{ id, n.alias, n.agent });
+                std.debug.print("node  {s}  alias={s} agent={s} ts={d} addrs={d}{s}\n", .{
+                    id,
+                    n.alias,
+                    n.agent,
+                    n.timestamp,
+                    n.addr_count,
+                    self.mark(n.verified()),
+                });
             },
             .inventory_announced => |inv| {
                 self.inventories += 1;
                 const id = radish.NodeId.fromPublicKey(inv.node).encode(self.arena) catch return;
-                std.debug.print("inv   {s}  {d} repos\n", .{ id, inv.inventory.len });
+                std.debug.print("inv   {s}  {d} repos{s}\n", .{
+                    id,
+                    inv.inventory.len,
+                    self.mark(inv.verified()),
+                });
                 for (inv.inventory) |oid| {
                     self.rids += 1;
                     const rid = radish.RepoId.fromOid(oid).encode(self.arena) catch continue;
                     std.debug.print("        {s}\n", .{rid});
                 }
             },
+            // Named, not dropped: knowing which kinds a node sends is half of
+            // what a subscribe run is for.
+            .other => |t| std.debug.print("other message type {d}\n", .{@backingInt(t)}),
             else => {},
         }
+    }
+
+    /// A message this build cannot read is still news: it names a field or an
+    /// address kind we do not know yet.
+    pub fn onUndecodable(self: *GossipPrinter, err: anyerror) void {
+        self.undecodable += 1;
+        std.debug.print("undecodable message: {s}\n", .{@errorName(err)});
     }
 };
 
 /// Resolves the `.rad` dependencies in a build.zig.zon: clone each repo, verify
 /// it really is the RID that was asked for, resolve the canonical branch, and
-/// check that commit out into `out_dir/<name>`.
-///
-/// POC. See README for the limitations, the main one being that Zig cannot
-/// consume the result automatically: its dependency location is a closed union
-/// of `url` and `path`, so a `.rad` field is parsed by us and ignored by Zig.
+/// check that commit out into `out_dir/<name>`. A POC; see the README for what
+/// it cannot do.
 fn fetchDeps(init: std.process.Init, manifest_path: []const u8, from: ?[]const u8, out_dir: []const u8) !void {
     const arena = init.arena.allocator();
     // Only used when the caller named a node; otherwise each dependency is
@@ -403,53 +451,164 @@ const ServePrinter = struct {
     }
 };
 
+/// Connection settings for a live 2.x exchange: a fresh key share and
+/// connection id, which RFC 9000 s7.2 wants unpredictable, and the fixed
+/// identity so the node keeps seeing the same peer. `quic probe` overrides the
+/// fresh parts, since a recorded exchange has to replay.
+fn quicDial(init: std.process.Init, host: []const u8, port: u16) !radish.quic.conn.Options {
+    const arena = init.arena.allocator();
+    var seed: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&seed, radish.quic.testdata.fixed_identity_seed);
+
+    // Allocated, not a local: the options outlive this function.
+    const dcid = try arena.alloc(u8, 8);
+    try init.io.randomSecure(dcid);
+
+    var opts: radish.quic.conn.Options = .{
+        .host = host,
+        .port = port,
+        .alpn = radish.net.gossip.alpn_gossip,
+        .secret = undefined,
+        .random = undefined,
+        .dcid = dcid,
+        .identity = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed),
+    };
+    try init.io.randomSecure(&opts.secret);
+    try init.io.randomSecure(&opts.random);
+    return opts;
+}
+
+/// The node id a set of options presents.
+fn quicNodeId(arena: std.mem.Allocator, opts: radish.quic.conn.Options) ![]u8 {
+    return radish.NodeId.fromPublicKey(opts.identity.public_key.toBytes()).encode(arena);
+}
+
 /// A radicle 2.x ping: the QUIC handshake, then one gossip message each way.
 fn quicPing(init: std.process.Init, host: []const u8, port: u16) !void {
     const quic = radish.quic;
     const arena = init.arena.allocator();
-
-    // A real exchange, so the key share and the connection id are fresh: the
-    // probe's fixed ones exist to make a capture replay, and cost the session
-    // its forward secrecy. Only the identity stays fixed, so the node keeps
-    // seeing the same peer.
-    var secret: [32]u8 = undefined;
-    try init.io.randomSecure(&secret);
-    var random: [32]u8 = undefined;
-    try init.io.randomSecure(&random);
-    var dcid: [8]u8 = undefined;
-    try init.io.randomSecure(&dcid);
-    var seed: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&seed, quic.testdata.fixed_identity_seed);
-    const identity = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
-
-    const our_nid = try radish.NodeId.fromPublicKey(identity.public_key.toBytes()).encode(arena);
-    std.debug.print("quic ping {s}:{d} as {s}\n", .{ host, port, our_nid });
+    const opts = try quicDial(init, host, port);
+    std.debug.print("quic ping {s}:{d} as {s}\n", .{ host, port, try quicNodeId(arena, opts) });
 
     const c = try arena.create(quic.conn.Conn);
-    const pong = radish.net.gossip.ping(init.io, arena, c, .{
-        .host = host,
-        .port = port,
-        .alpn = radish.net.gossip.alpn_gossip,
-        .secret = secret,
-        .random = random,
-        .dcid = &dcid,
-        .identity = identity,
-    }, 8) catch |e| {
+    defer c.close();
+    const pong = radish.net.gossip.ping(init.io, arena, c, opts, 8) catch |e| {
         std.debug.print("quic ping failed: {s}\n", .{@errorName(e)});
-        if (c.hs.closed) |close| {
+        if (c.peerClose()) |close| {
             std.debug.print("  peer closed: 0x{x} {s}\n", .{ close.error_code, close.reason() });
         }
         if (c.last_err) |last| std.debug.print("  last error: {s}\n", .{@errorName(last)});
         return e;
     };
-    defer c.close();
 
-    if (c.hs.accepted.peer_key) |k| {
+    if (c.accepted()) |a| if (a.peer_key) |k| {
         std.debug.print("peer node id: {s}\n", .{
             try radish.NodeId.fromPublicKey(k).encode(arena),
         });
-    }
+    };
     std.debug.print("pong: {d} zeroes\n", .{pong.zeroes});
+}
+
+/// Subscribes to a 2.x node's gossip and prints what arrives, the counterpart
+/// of `radish subscribe`.
+fn quicSubscribe(init: std.process.Init, host: []const u8, port: u16, max: usize) !void {
+    const quic = radish.quic;
+    const arena = init.arena.allocator();
+    const opts = try quicDial(init, host, port);
+    std.debug.print("quic subscribe {s}:{d} as {s}\n", .{ host, port, try quicNodeId(arena, opts) });
+
+    var printer = GossipPrinter{ .arena = arena };
+    const c = try arena.create(quic.conn.Conn);
+    defer c.close();
+    const seen = radish.net.gossip.subscribe(init.io, arena, c, opts, max, &printer) catch |e| {
+        std.debug.print("quic subscribe failed: {s}\n", .{@errorName(e)});
+        if (c.peerClose()) |close| {
+            std.debug.print("  peer closed: 0x{x} {s}\n", .{ close.error_code, close.reason() });
+        }
+        return e;
+    };
+
+    std.debug.print(
+        "\n{d} message(s): {d} nodes, {d} inventories, {d} repos, {d} unsigned, {d} undecodable\n",
+        .{
+            seen,
+            printer.nodes,
+            printer.inventories,
+            printer.rids,
+            printer.unsigned,
+            printer.undecodable,
+        },
+    );
+    // A peer that ends the run says why, and "why" is often the whole story
+    // when nothing arrived.
+    if (c.peerClose()) |close| {
+        std.debug.print("peer closed: 0x{x} {s}\n", .{ close.error_code, close.reason() });
+    }
+}
+
+/// Records a gossip exchange: every datagram that arrives, as hex, one per
+/// line, for pasting into `quic/testdata.zig`. The key share and connection id
+/// are the fixed ones, so the recording replays.
+fn quicCapture(init: std.process.Init, host: []const u8, port: u16, max: usize) !void {
+    const quic = radish.quic;
+    const arena = init.arena.allocator();
+    const dcid = quic.testdata.hex(quic.testdata.fixed_dcid);
+
+    var opts = try quicDial(init, host, port);
+    opts.secret = quic.testdata.hex(quic.testdata.fixed_x25519_secret);
+    opts.random = quic.testdata.hex(quic.testdata.fixed_hello_random);
+    opts.dcid = &dcid;
+
+    var buf: [4096]u8 = undefined;
+    var out = std.Io.File.stdout().writer(init.io, &buf);
+    opts.capture = &out.interface;
+
+    var printer = GossipPrinter{ .arena = arena };
+    const c = try arena.create(quic.conn.Conn);
+    defer c.close();
+    // However the capture ends, the reason belongs with the recording.
+    defer if (c.peerClose()) |close| {
+        std.debug.print("peer closed: 0x{x} {s}\n", .{ close.error_code, close.reason() });
+    };
+    _ = try radish.net.gossip.subscribe(init.io, arena, c, opts, max, &printer);
+    try out.interface.flush();
+}
+
+/// Opens the git ALPN, sends the upload-pack intro, and lists the refs the
+/// node advertises: the 2.x counterpart of `radish fetch-probe`.
+fn quicFetchProbe(init: std.process.Init, host: []const u8, port: u16, rid: []const u8) !void {
+    const quic = radish.quic;
+    const arena = init.arena.allocator();
+    const opts = try quicDial(init, host, port);
+    std.debug.print("quic fetch-probe {s}:{d} {s}\n", .{ host, port, rid });
+
+    const c = try arena.create(quic.conn.Conn);
+    defer c.close();
+    var session = radish.net.gitstream.Session.connect(
+        init.io,
+        arena,
+        c,
+        opts,
+        rid,
+    ) catch |e| {
+        std.debug.print("fetch-probe failed: {s}\n", .{@errorName(e)});
+        if (c.peerClose()) |close| {
+            std.debug.print("  peer closed: 0x{x} {s}\n", .{ close.error_code, close.reason() });
+        }
+        return e;
+    };
+
+    var refs = radish.git.protocol.lsRefs(arena, &session, &.{"refs/"}) catch |e| {
+        std.debug.print("ls-refs failed: {s}\n", .{@errorName(e)});
+        if (c.peerClose()) |close| {
+            std.debug.print("  peer closed: 0x{x} {s}\n", .{ close.error_code, close.reason() });
+        }
+        return e;
+    };
+    defer refs.deinit();
+
+    for (refs.refs) |ref| std.debug.print("{s}  {s}\n", .{ ref.oid, ref.name });
+    std.debug.print("\n{d} ref(s)\n", .{refs.refs.len});
 }
 
 /// One QUIC first flight against a live server. The x25519 key is fixed, so a
@@ -458,30 +617,26 @@ fn quicPing(init: std.process.Init, host: []const u8, port: u16) !void {
 fn quicProbe(init: std.process.Init, host: []const u8, port: u16, alpn: []const u8, sni: ?[]const u8) !void {
     const quic = radish.quic;
     const arena = init.arena.allocator();
-    var secret: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&secret, quic.testdata.fixed_x25519_secret);
-    var random: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&random, quic.testdata.fixed_hello_random);
-    var seed: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&seed, quic.testdata.fixed_identity_seed);
-    const identity = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
     const dcid = quic.testdata.hex(quic.testdata.fixed_dcid);
 
-    const our_nid = try radish.NodeId.fromPublicKey(identity.public_key.toBytes()).encode(arena);
-    std.debug.print("quic probe {s}:{d} alpn={s} as {s}\n", .{ host, port, alpn, our_nid });
+    var opts = try quicDial(init, host, port);
+    opts.alpn = alpn;
+    opts.server_name = sni;
+    // Fixed, so a recorded reply replays byte for byte.
+    opts.secret = quic.testdata.hex(quic.testdata.fixed_x25519_secret);
+    opts.random = quic.testdata.hex(quic.testdata.fixed_hello_random);
+    opts.dcid = &dcid;
+
+    std.debug.print("quic probe {s}:{d} alpn={s} as {s}\n", .{
+        host,
+        port,
+        alpn,
+        try quicNodeId(arena, opts),
+    });
 
     // Every buffer the connection reports from lives in here, so it stays put.
     const c = try arena.create(quic.conn.Conn);
-    c.open(init.io, .{
-        .host = host,
-        .port = port,
-        .alpn = alpn,
-        .secret = secret,
-        .random = random,
-        .dcid = &dcid,
-        .identity = identity,
-        .server_name = sni,
-    }) catch |e| {
+    c.open(init.io, opts) catch |e| {
         std.debug.print("probe failed: {s}\n", .{@errorName(e)});
         return e;
     };
@@ -494,8 +649,7 @@ fn quicProbe(init: std.process.Init, host: []const u8, port: u16, alpn: []const 
     std.debug.print("sent {d} bytes, received {d} in {d} datagram(s)\n", .{ c.sent, c.received, c.datagrams });
     // Partial progress is worth printing: a peer that answers the ServerHello
     // and then closes still yields secrets and a reason.
-    if (c.hs.accepted.handshake != null) {
-        const a = c.hs.accepted;
+    if (c.accepted()) |a| if (a.handshake != null) {
         std.debug.print("cipher suite 0x{x:0>4}\n", .{a.cipher_suite});
         std.debug.print("server connection id: {x}\n", .{a.scid()});
         if (a.handshake) |h| {
@@ -507,13 +661,13 @@ fn quicProbe(init: std.process.Init, host: []const u8, port: u16, alpn: []const 
             try radish.NodeId.fromPublicKey(k).encode(arena),
             if (a.peer_verified) "" else " (unverified)",
         });
-    }
-    if (c.hs.confirmed) {
+    };
+    if (c.confirmed()) {
         std.debug.print("handshake confirmed\n", .{});
     } else if (c.flight_out) {
         std.debug.print("our flight sent, no HANDSHAKE_DONE\n", .{});
     }
-    if (c.hs.closed) |close| {
+    if (c.peerClose()) |close| {
         std.debug.print("peer closed: 0x{x}", .{close.error_code});
         if (radish.quic.frame.cryptoAlert(close.error_code)) |alert| {
             // A CRYPTO_ERROR carries the TLS alert in its low byte, which is

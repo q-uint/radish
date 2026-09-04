@@ -4,7 +4,9 @@
 //! Source: radicle-protocol/src/wire/{frame,message}.rs, service/message.rs.
 const std = @import("std");
 const codec = @import("../codec.zig");
+const node_id = @import("../identity/node_id.zig");
 const pktline = @import("../git/pktline.zig");
+const signature = @import("../crypto/signature.zig");
 
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const VERSION_STRING = [4]u8{ 'r', 'a', 'd', PROTOCOL_VERSION };
@@ -80,26 +82,30 @@ pub const INVENTORY_LIMIT = 2973;
 /// Source: radicle node/timestamp.rs Timestamp::MAX.
 pub const TIMESTAMP_MAX: u64 = std.math.maxInt(i64);
 
-/// A Subscribe frame requesting all gossip: the "match everything" filter
+/// A Subscribe message requesting all gossip: the "match everything" filter
 /// (1 KiB of 0xff) over the full time range. It depends on nothing at runtime,
 /// so it is built once at compile time rather than allocated per call.
 /// Source: radicle-protocol service/message.rs Subscribe, filter.rs default().
-pub const subscribe_all_frame = blk: {
-    // message: type ++ filter(u16 len ++ bytes) ++ since ++ until
-    const msg_len = 2 + 2 + FILTER_SIZE_S + 8 + 8;
-    var msg: [msg_len]u8 = undefined;
+pub const subscribe_all_message = blk: {
+    // type ++ filter(u16 len ++ bytes) ++ since ++ until
+    var msg: [2 + 2 + FILTER_SIZE_S + 8 + 8]u8 = undefined;
     std.mem.writeInt(u16, msg[0..2], @backingInt(MessageType.subscribe), .big);
     std.mem.writeInt(u16, msg[2..4], FILTER_SIZE_S, .big);
     @memset(msg[4 .. 4 + FILTER_SIZE_S], 0xff);
     std.mem.writeInt(u64, msg[4 + FILTER_SIZE_S ..][0..8], 0, .big); // since
     std.mem.writeInt(u64, msg[12 + FILTER_SIZE_S ..][0..8], TIMESTAMP_MAX, .big); // until
+    break :blk msg;
+};
 
-    // frame: version ++ stream varint ++ length varint ++ message
+/// `subscribe_all_message` in a 1.x frame: version ++ stream varint ++ length
+/// varint ++ message.
+pub const subscribe_all_frame = blk: {
+    const msg_len = subscribe_all_message.len;
     var frame: [VERSION_STRING.len + 1 + 2 + msg_len]u8 = undefined;
     @memcpy(frame[0..VERSION_STRING.len], &VERSION_STRING);
     frame[VERSION_STRING.len] = @intCast(StreamId.gossip_out.value);
     std.mem.writeInt(u16, frame[VERSION_STRING.len + 1 ..][0..2], (0b01 << 14) | @as(u16, msg_len), .big);
-    @memcpy(frame[VERSION_STRING.len + 3 ..], &msg);
+    @memcpy(frame[VERSION_STRING.len + 3 ..], &subscribe_all_message);
     break :blk frame;
 };
 
@@ -212,6 +218,18 @@ pub const Address = struct {
     pub const Kind = enum(u8) { ipv4 = 1, ipv6 = 2, dns = 3, onion = 4, i2p = 5, iroh = 6, _ };
 };
 
+/// Whether `node` signed `body`, which is the message body alone: not the type
+/// id, not the wrapper carrying it.
+/// Source: radicle-protocol service/message.rs Announcement::verify.
+fn signedBy(node: [32]u8, body: []const u8, sig: [64]u8) bool {
+    signature.verify(
+        node_id.NodeId.fromPublicKey(node),
+        body,
+        .{ .bytes = sig },
+    ) catch return false;
+    return true;
+}
+
 /// A node announcing itself: identity, alias, and the addresses it can be
 /// reached at. `alias`, `agent`, and each address host borrow the decode
 /// scratch buffer; copy them out to retain past the next frame.
@@ -224,9 +242,17 @@ pub const NodeAnnounced = struct {
     /// buffer to thread through, unlike the unbounded inventory list.
     addr_storage: [ADDRESS_LIMIT]Address = undefined,
     addr_count: u8 = 0,
+    /// The signature and the bytes it covers, kept so a caller can decide
+    /// whether to trust any of the above.
+    sig: [64]u8 = @splat(0),
+    signed: []const u8 = &.{},
 
     pub fn addresses(self: *const NodeAnnounced) []const Address {
         return self.addr_storage[0..self.addr_count];
+    }
+
+    pub fn verified(self: *const NodeAnnounced) bool {
+        return signedBy(self.node, self.signed, self.sig);
     }
 };
 
@@ -236,6 +262,12 @@ pub const InventoryAnnounced = struct {
     node: [32]u8,
     inventory: []const [20]u8,
     timestamp: u64,
+    sig: [64]u8 = @splat(0),
+    signed: []const u8 = &.{},
+
+    pub fn verified(self: *const InventoryAnnounced) bool {
+        return signedBy(self.node, self.signed, self.sig);
+    }
 };
 
 /// A parsed gossip message (only the variants we handle).
@@ -356,7 +388,10 @@ pub fn readRawFrame(r: *std.Io.Reader, scratch: []u8) !RawFrame {
 /// parsed-but-dropped: the fields after the address list still have to be read.
 fn parseNodeAnnounced(r: *codec.Reader) !NodeAnnounced {
     const node = (try r.take(32))[0..32].*;
-    _ = try r.take(64); // signature
+    const sig = (try r.take(64))[0..64].*;
+    // What the signature covers: the body, which runs to the end of the
+    // message.
+    const signed = r.buf[r.pos..];
     _ = try r.readU8(); // version
     _ = try r.readU64(); // features
     const timestamp = try r.readU64();
@@ -387,12 +422,15 @@ fn parseNodeAnnounced(r: *codec.Reader) !NodeAnnounced {
         .timestamp = timestamp,
         .addr_storage = storage,
         .addr_count = found,
+        .sig = sig,
+        .signed = signed,
     };
 }
 
 fn parseInventoryAnnounced(r: *codec.Reader, oid_buf: [][20]u8) !InventoryAnnounced {
     const node = (try r.take(32))[0..32].*;
-    _ = try r.take(64); // signature
+    const sig = (try r.take(64))[0..64].*;
+    const signed = r.buf[r.pos..];
     // inventory: u16 count ++ [RepoId]. Each RepoId (git::Oid) is itself
     // u16-length-prefixed bytes, so oids are NOT contiguous - copy each out.
     const count = try r.readU16();
@@ -404,7 +442,13 @@ fn parseInventoryAnnounced(r: *codec.Reader, oid_buf: [][20]u8) !InventoryAnnoun
         @memcpy(&oid_buf[i], try r.take(20));
     }
     const timestamp = try r.readU64();
-    return .{ .node = node, .inventory = oid_buf[0..count], .timestamp = timestamp };
+    return .{
+        .node = node,
+        .inventory = oid_buf[0..count],
+        .timestamp = timestamp,
+        .sig = sig,
+        .signed = signed,
+    };
 }
 
 // Address wire form (radicle-protocol wire/message.rs Address): u8 kind ++
@@ -443,16 +487,27 @@ fn readStreamVarint(r: *std.Io.Reader) !u64 {
 
 const testing = std.testing;
 
-test "encode ping frame layout" {
-    const frame = try encodePingFrame(testing.allocator, .{ .ponglen = 0, .zeroes = 0 });
-    defer testing.allocator.free(frame);
+test "ping and control frame layouts, and a ping round trip" {
+    const ping = try encodePingFrame(testing.allocator, .{ .ponglen = 0, .zeroes = 0 });
+    defer testing.allocator.free(ping);
     // version(rad,1) ++ stream(varint 0x02) ++ len(varint 0x06) ++
     //   ping: type(00 0a) ponglen(00 00) zeroes-len(00 00)
     try testing.expectEqualSlices(u8, &[_]u8{
         'r',  'a',  'd',  1,
         0x02, 0x06, 0x00, 0x0a,
         0x00, 0x00, 0x00, 0x00,
-    }, frame);
+    }, ping);
+
+    const control = try encodeControlFrame(testing.allocator, .open, StreamId.git_out);
+    defer testing.allocator.free(control);
+    // version(rad,1) ++ control-stream(0x00) ++ type(open=0x00) ++ target(0x04)
+    try testing.expectEqualSlices(u8, &[_]u8{ 'r', 'a', 'd', 1, 0x00, 0x00, 0x04 }, control);
+
+    const round_trip = try encodePingFrame(testing.allocator, .{ .ponglen = 5, .zeroes = 2 });
+    defer testing.allocator.free(round_trip);
+    const decoded = try decodeFrame(round_trip);
+    try testing.expectEqual(@as(u16, 5), decoded.message.ping.ponglen);
+    try testing.expectEqual(@as(u16, 2), decoded.message.ping.zeroes);
 }
 
 test "encode subscribe-all frame layout" {
@@ -484,16 +539,9 @@ test "stream ids match the frame.rs table" {
     try testing.expectEqual(@as(u64, 0b100 + 8), StreamId.git_out.nth(1).value);
 }
 
-test "control open frame layout" {
-    const frame = try encodeControlFrame(testing.allocator, .open, StreamId.git_out);
-    defer testing.allocator.free(frame);
-    // version(rad,1) ++ control-stream(0x00) ++ type(open=0x00) ++ target(0x04)
-    try testing.expectEqualSlices(u8, &[_]u8{ 'r', 'a', 'd', 1, 0x00, 0x00, 0x04 }, frame);
-}
-
 test "git-upload-pack pkt-line matches a captured radicle-node fetch" {
-    // Golden bytes captured off the wire from a real radicle-node 1.9.1 fetch:
-    // bare base58 id (no rad:, no .git), empty host, then version=2.
+    // Captured off the wire from radicle-node 1.9.1: bare base58 id (no rad:,
+    // no .git), empty host, then version=2.
     const line = try gitUploadPackLine(testing.allocator, "rad:z3WukSjzicL8WaZHFALbBwb2r8W52");
     defer testing.allocator.free(line);
     const expected = "003egit-upload-pack /z3WukSjzicL8WaZHFALbBwb2r8W52\x00\x00version=2\x00";
@@ -536,10 +584,43 @@ test "decode inventory announcement: each oid is u16-length-prefixed" {
 }
 
 // Peer discovery rides on NodeAnnouncement: the addresses field is the only
-// place the wire says where another node can be reached.
-test "decode node announcement addresses" {
-    const node: [32]u8 = @splat(0xAB);
-    const sig: [64]u8 = @splat(0xCD);
+// place the wire says where another node can be reached. Every address kind
+// has to be read exactly, unframed ones included, or the fields after the
+// address list misalign.
+test "decode node announcement addresses, and reject an unknown kind" {
+    const key = try signature.SecretKey.fromSeed(@splat(7));
+
+    // The signed part: version ++ features ++ timestamp ++ alias ++ addresses
+    // ++ nonce ++ agent. iroh (which every 2.x node announces, and which
+    // carries nothing) and i2p (behind a heartwood feature flag) sit between
+    // the two ordinary kinds.
+    var signed: std.ArrayList(u8) = .empty;
+    defer signed.deinit(testing.allocator);
+    const sw = codec.Writer{ .out = &signed, .allocator = testing.allocator };
+    try sw.writeU8(1); // version
+    try sw.writeU64(0); // features
+    try sw.writeU64(7); // timestamp
+    try sw.writeU8(1);
+    try sw.bytes("a"); // alias
+    try sw.writeU16(4); // address count
+    const first_kind_at = signed.items.len;
+    try sw.writeU8(@backingInt(Address.Kind.ipv4));
+    try sw.bytes(&[_]u8{ 192, 168, 0, 1 });
+    try sw.writeU16(8776);
+    try sw.writeU8(@backingInt(Address.Kind.dns));
+    try sw.writeU8(11);
+    try sw.bytes("example.com");
+    try sw.writeU16(8777);
+    try sw.writeU8(@backingInt(Address.Kind.iroh));
+    try sw.writeU8(@backingInt(Address.Kind.i2p));
+    try sw.writeU8(4);
+    try sw.bytes("i2pa");
+    try sw.writeU16(1234);
+    try sw.writeU64(0); // nonce
+    try sw.writeU8(1);
+    try sw.bytes("x"); // agent
+
+    const sig = try key.sign(signed.items);
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -551,24 +632,10 @@ test "decode node announcement addresses" {
     defer body.deinit(testing.allocator);
     const bw = codec.Writer{ .out = &body, .allocator = testing.allocator };
     try bw.writeU16(@backingInt(MessageType.node_announcement));
-    try bw.bytes(&node);
-    try bw.bytes(&sig);
-    try bw.writeU8(1); // version
-    try bw.writeU64(0); // features
-    try bw.writeU64(0x1122334455667788); // timestamp
-    try bw.writeU8(3);
-    try bw.bytes("abc"); // alias
-    try bw.writeU16(2); // address count
-    try bw.writeU8(1); // ipv4
-    try bw.bytes(&[_]u8{ 192, 168, 0, 1 });
-    try bw.writeU16(8776);
-    try bw.writeU8(3); // dns
-    try bw.writeU8(11);
-    try bw.bytes("example.com");
-    try bw.writeU16(8777);
-    try bw.writeU64(0); // nonce
-    try bw.writeU8(5);
-    try bw.bytes("agent");
+    try bw.bytes(&key.nodeId().key);
+    try bw.bytes(&sig.bytes);
+    const signed_at = body.items.len;
+    try bw.bytes(signed.items);
     try w.varint(body.items.len);
     try w.bytes(body.items);
 
@@ -577,79 +644,41 @@ test "decode node announcement addresses" {
     var oids: [8][20]u8 = undefined;
     const msg = try decodeFrameStreaming(&stream_reader, &scratch, &oids);
     const n = msg.node_announced;
+    // The fields after the address list line up, so no address ran long.
+    try testing.expectEqualStrings("a", n.alias);
+    try testing.expectEqualStrings("x", n.agent);
+    try testing.expectEqual(@as(u64, 7), n.timestamp);
+    try testing.expect(n.verified());
 
-    try testing.expectEqualStrings("abc", n.alias);
-    try testing.expectEqualStrings("agent", n.agent);
     const addrs = n.addresses();
-    try testing.expectEqual(@as(usize, 2), addrs.len);
+    try testing.expectEqual(@as(usize, 4), addrs.len);
     try testing.expectEqual(Address.Kind.ipv4, addrs[0].kind);
     try testing.expectEqualSlices(u8, &[_]u8{ 192, 168, 0, 1 }, addrs[0].host);
     try testing.expectEqual(@as(u16, 8776), addrs[0].port);
     try testing.expectEqual(Address.Kind.dns, addrs[1].kind);
     try testing.expectEqualStrings("example.com", addrs[1].host);
     try testing.expectEqual(@as(u16, 8777), addrs[1].port);
-}
+    try testing.expectEqual(Address.Kind.iroh, addrs[2].kind);
+    try testing.expectEqual(@as(u16, 0), addrs[2].port);
+    try testing.expectEqual(@as(u16, 1234), addrs[3].port);
 
-// A node may advertise more than we have room for, and an address kind we do
-// not know (heartwood has i2p behind a feature flag). Neither may abort the
-// frame: the announcement's other fields are still usable.
-test "an iroh address is the kind byte alone, an unknown kind is fatal" {
-    const node: [32]u8 = @splat(0xAB);
-    const sig: [64]u8 = @splat(0xCD);
-
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(testing.allocator);
-    const w = codec.Writer{ .out = &buf, .allocator = testing.allocator };
-    try w.bytes(&VERSION_STRING);
-    try w.varint(StreamId.gossip_out.value);
-
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(testing.allocator);
-    const bw = codec.Writer{ .out = &body, .allocator = testing.allocator };
-    try bw.writeU16(@backingInt(MessageType.node_announcement));
-    try bw.bytes(&node);
-    try bw.bytes(&sig);
-    try bw.writeU8(1);
-    try bw.writeU64(0);
-    try bw.writeU64(7);
-    try bw.writeU8(1);
-    try bw.bytes("a");
-    // Two addresses: iroh, which every 2.x node announces and which carries
-    // nothing, then an i2p one, which is length-prefixed.
-    try bw.writeU16(2);
-    const first_kind_at = body.items.len;
-    try bw.writeU8(@backingInt(Address.Kind.iroh));
-    try bw.writeU8(@backingInt(Address.Kind.i2p));
-    try bw.writeU8(4);
-    try bw.bytes("i2pa");
-    try bw.writeU16(1234);
-    try bw.writeU64(0);
-    try bw.writeU8(1);
-    try bw.bytes("x");
-    try w.varint(body.items.len);
-    try w.bytes(body.items);
-
-    var stream_reader = std.Io.Reader.fixed(buf.items);
-    var scratch: [1024]u8 = undefined;
-    var oids: [8][20]u8 = undefined;
-    const msg = try decodeFrameStreaming(&stream_reader, &scratch, &oids);
-    const n = msg.node_announced;
-    // The fields after the address list line up, so neither address ran long.
-    try testing.expectEqualStrings("a", n.alias);
-    try testing.expectEqualStrings("x", n.agent);
-    try testing.expectEqual(@as(u64, 7), n.timestamp);
-    try testing.expectEqual(@as(u8, 2), n.addr_count);
-    try testing.expectEqual(@as(u16, 0), n.addresses()[0].port);
-    try testing.expectEqual(@as(u16, 1234), n.addresses()[1].port);
+    // Editing what the announcer signed breaks the signature, whoever relays
+    // it: the alias here, which a peer would love to rewrite.
+    var tampered = try body.clone(testing.allocator);
+    defer tampered.deinit(testing.allocator);
+    tampered.items[signed_at + 1 + 8 + 8 + 1] = 'b';
+    const edited = (try decodeMessage(tampered.items, &oids)).node_announced;
+    try testing.expectEqualStrings("b", edited.alias);
+    try testing.expect(!edited.verified());
 
     // A kind nothing frames cannot be skipped, so it fails the message.
     var unknown = try body.clone(testing.allocator);
     defer unknown.deinit(testing.allocator);
-    unknown.items[first_kind_at] = 0x7f;
+    unknown.items[signed_at + first_kind_at] = 0x7f;
     try testing.expectError(error.UnknownAddressType, decodeMessage(unknown.items, &oids));
 }
 
-test "decode pong frame" {
+test "decode pong frame, consuming exactly the frame" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
     const w = codec.Writer{ .out = &buf, .allocator = testing.allocator };
@@ -665,12 +694,4 @@ test "decode pong frame" {
     const decoded = try decodeFrame(buf.items);
     try testing.expectEqual(@as(u16, 3), decoded.message.pong.zeroes);
     try testing.expectEqual(buf.items.len, decoded.consumed);
-}
-
-test "round trip ping via decode" {
-    const frame = try encodePingFrame(testing.allocator, .{ .ponglen = 5, .zeroes = 2 });
-    defer testing.allocator.free(frame);
-    const decoded = try decodeFrame(frame);
-    try testing.expectEqual(@as(u16, 5), decoded.message.ping.ponglen);
-    try testing.expectEqual(@as(u16, 2), decoded.message.ping.zeroes);
 }

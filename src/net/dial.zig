@@ -34,19 +34,15 @@ pub fn connect(io: std.Io, host: []const u8, port: u16) !std.Io.net.Stream {
 
 const testing = std.testing;
 
-test "resolves IPv4 literals without a lookup" {
-    const addr = try resolve(testing.io, "127.0.0.1", 8776);
-    try testing.expectEqual(@as(u16, 8776), addr.getPort());
+test "resolves IP literals without a lookup, and rejects a bad hostname" {
+    const v4 = try resolve(testing.io, "127.0.0.1", 8776);
+    try testing.expectEqual(@as(u16, 8776), v4.getPort());
     var buf: [64]u8 = undefined;
-    const text = try std.fmt.bufPrint(&buf, "{f}", .{addr});
+    const text = try std.fmt.bufPrint(&buf, "{f}", .{v4});
     try testing.expect(std.mem.startsWith(u8, text, "127.0.0.1"));
-}
 
-test "resolves IPv6 literals" {
-    const addr = try resolve(testing.io, "::1", 8776);
-    try testing.expectEqual(@as(u16, 8776), addr.getPort());
-}
+    const v6 = try resolve(testing.io, "::1", 8776);
+    try testing.expectEqual(@as(u16, 8776), v6.getPort());
 
-test "rejects a name that is not a valid hostname" {
     try testing.expectError(error.InvalidHostName, resolve(testing.io, "not a host", 8776));
 }

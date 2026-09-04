@@ -356,6 +356,16 @@ pub fn writeStream(w: *std.Io.Writer, s: Stream) !void {
     try w.writeAll(s.data);
 }
 
+/// Writes an application CONNECTION_CLOSE, which ends the connection and tells
+/// the peer it may drop the state it holds for us.
+/// Source: RFC 9000 s19.19.
+pub fn writeConnectionClose(w: *std.Io.Writer, error_code: u64, reason: []const u8) !void {
+    try codec.writeVarint(w, @backingInt(Type.connection_close_app));
+    try codec.writeVarint(w, error_code);
+    try codec.writeVarint(w, reason.len);
+    try w.writeAll(reason);
+}
+
 /// Writes MAX_DATA, raising the limit on everything the peer may send.
 /// Source: RFC 9000 s19.9.
 pub fn writeMaxData(w: *std.Io.Writer, max: u64) !void {
@@ -525,7 +535,8 @@ pub const Iterator = struct {
 
 const testing = std.testing;
 
-test "a written STREAM frame parses back" {
+// The flags live in the type code, so the same frame has eight spellings.
+test "STREAM frames carry their optional fields only when they say something" {
     var buf: [32]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try writeStream(&w, .{ .id = 4, .offset = 7, .data = &.{ 0xaa, 0xbb }, .fin = true });
@@ -539,26 +550,53 @@ test "a written STREAM frame parses back" {
     try testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb }, s.data);
     try testing.expect(s.fin);
     try testing.expectEqual(@as(?Frame, null), try it.next());
-}
 
-test "a STREAM frame at offset zero leaves the offset out" {
-    var buf: [32]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
+    // At offset zero the offset field goes away.
+    w = std.Io.Writer.fixed(&buf);
     try writeStream(&w, .{ .id = 0, .offset = 0, .data = &.{0xcc}, .fin = false });
     try testing.expectEqualSlices(u8, &.{ 0x0a, 0x00, 0x01, 0xcc }, w.buffered());
+
+    // 0x08 is none of the flags: offset 0, and the data runs to the end.
+    var bare = [_]u8{ 0x08, 0x04, 0xaa, 0xbb };
+    var it2 = Iterator.init(&bare);
+    const b = (try it2.next()).?.stream;
+    try testing.expectEqual(@as(u64, 0), b.offset);
+    try testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb }, b.data);
+    try testing.expect(!b.fin);
+    try testing.expectEqual(@as(?Frame, null), try it2.next());
 }
 
-test "written limits parse back" {
-    var buf: [32]u8 = undefined;
+// The limits are read; the rest is consumed by shape so the walk reaches the
+// frames that matter.
+test "frames we write parse back, and the rest are walked past" {
+    var buf: [64]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try writeMaxData(&w, 1 << 20);
     try writeMaxStreamData(&w, .{ .id = 0, .max = 4096 });
+    try writeConnectionClose(&w, 0, "done");
 
     var it = Iterator.init(w.buffered());
     try testing.expectEqual(@as(u64, 1 << 20), (try it.next()).?.max_data);
     const m = (try it.next()).?.max_stream_data;
     try testing.expectEqual(@as(u64, 0), m.id);
     try testing.expectEqual(@as(u64, 4096), m.max);
+
+    const close = (try it.next()).?.connection_close;
+    try testing.expectEqual(@as(u64, 0), close.error_code);
+    try testing.expectEqualStrings("done", close.reason);
+    // An application close carries no frame type, unlike a transport one.
+    try testing.expectEqual(@as(?u64, null), close.frame_type);
+
+    var ignored = [_]u8{
+        0x04, 0x04, 0x01, 0x08, // RESET_STREAM, three varints
+        0x07, 0x02, 0xaa, 0xbb, // NEW_TOKEN, a length-prefixed blob
+        0x01, // PING, to prove the walk arrived
+    };
+    var it2 = Iterator.init(&ignored);
+    try testing.expectEqual(Type.reset_stream, (try it2.next()).?.ignored);
+    try testing.expectEqual(Type.new_token, (try it2.next()).?.ignored);
+    try testing.expectEqual(Frame.ping, (try it2.next()).?);
+    try testing.expectEqual(@as(?Frame, null), try it2.next());
 }
 
 test "parses a CRYPTO frame followed by padding" {
@@ -577,7 +615,7 @@ test "parses a CRYPTO frame followed by padding" {
 // Every value here stays under 64 so it is a one-byte varint.
 // largest=60 first=2 -> [58,60]; gap=1 len=3 -> 58-1-2=55, [52,55];
 // gap=0 len=0 -> 52-0-2=50, [50,50].
-test "walks ack ranges downward" {
+test "walks ack ranges downward, and reads the ecn counts behind them" {
     var payload = [_]u8{ 0x02, 60, 0x00, 0x02, 0x02, 0x01, 0x03, 0x00, 0x00 };
     var it = Iterator.init(&payload);
     const ack = (try it.next()).?.ack;
@@ -590,17 +628,14 @@ test "walks ack ranges downward" {
     try testing.expectEqual(AckRange{ .largest = 50, .smallest = 50 }, (try r.next()).?);
     try testing.expectEqual(@as(?AckRange, null), try r.next());
     try testing.expectEqual(@as(?Ecn, null), ack.ecn);
-}
 
-// Type 0x03 appends three counts after the ranges.
-test "reads the ecn counts of an ack_ecn frame" {
-    var payload = [_]u8{ 0x03, 10, 0x00, 0x00, 0x00, 0x05, 0x06, 0x07 };
-    var it = Iterator.init(&payload);
-    const ack = (try it.next()).?.ack;
-
-    try testing.expectEqual(@as(u64, 10), ack.largest);
-    try testing.expectEqual(Ecn{ .ect0 = 5, .ect1 = 6, .ce = 7 }, ack.ecn.?);
-    try testing.expectEqual(@as(?Frame, null), try it.next());
+    // Type 0x03 appends three counts after the ranges.
+    var ecn_payload = [_]u8{ 0x03, 10, 0x00, 0x00, 0x00, 0x05, 0x06, 0x07 };
+    var it2 = Iterator.init(&ecn_payload);
+    const ecn_ack = (try it2.next()).?.ack;
+    try testing.expectEqual(@as(u64, 10), ecn_ack.largest);
+    try testing.expectEqual(Ecn{ .ect0 = 5, .ect1 = 6, .ce = 7 }, ecn_ack.ecn.?);
+    try testing.expectEqual(@as(?Frame, null), try it2.next());
 }
 
 // A peer can encode gaps that drive the computation below zero. The RFC
@@ -616,28 +651,6 @@ test "ack ranges that would go negative are rejected" {
     var bad = [_]u8{ 0x02, 0x01, 0x00, 0x00, 0x05 };
     var it2 = Iterator.init(&bad);
     try testing.expectError(error.FrameEncoding, (try it2.next()).?.ack.firstRange());
-}
-
-// The flags live in the type code, so the same frame has eight spellings.
-test "parses a STREAM frame with and without its optional fields" {
-    // 0x0f is off|len|fin: id 4, offset 8, length 3.
-    var full = [_]u8{ 0x0f, 0x04, 0x08, 0x03, 0xaa, 0xbb, 0xcc };
-    var it = Iterator.init(&full);
-    const a = (try it.next()).?.stream;
-    try testing.expectEqual(@as(u64, 4), a.id);
-    try testing.expectEqual(@as(u64, 8), a.offset);
-    try testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb, 0xcc }, a.data);
-    try testing.expect(a.fin);
-    try testing.expectEqual(@as(?Frame, null), try it.next());
-
-    // 0x08 is none of them: offset 0, and the data runs to the end.
-    var bare = [_]u8{ 0x08, 0x04, 0xaa, 0xbb };
-    var it2 = Iterator.init(&bare);
-    const b = (try it2.next()).?.stream;
-    try testing.expectEqual(@as(u64, 0), b.offset);
-    try testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb }, b.data);
-    try testing.expect(!b.fin);
-    try testing.expectEqual(@as(?Frame, null), try it2.next());
 }
 
 test "parses the 1-RTT frames radish acts on" {
@@ -671,38 +684,17 @@ test "parses NEW_CONNECTION_ID and rejects a retire past its sequence" {
     try testing.expectError(error.FrameEncoding, it2.next());
 }
 
-// The limits are read; the rest is consumed by shape so the walk reaches the
-// frames that matter.
-test "limit frames are read and the rest walked past" {
-    var payload = [_]u8{
-        0x10, 0x44, 0x00, // MAX_DATA, a two-byte varint
-        0x11, 0x04, 0x20, // MAX_STREAM_DATA, two varints
-        0x04, 0x04, 0x01, 0x08, // RESET_STREAM, three varints
-        0x07, 0x02, 0xaa, 0xbb, // NEW_TOKEN, a length-prefixed blob
-        0x01, // PING, to prove the walk arrived
-    };
-    var it = Iterator.init(&payload);
-    try testing.expectEqual(@as(u64, 0x400), (try it.next()).?.max_data);
-    try testing.expectEqual(@as(u64, 0x20), (try it.next()).?.max_stream_data.max);
-    try testing.expectEqual(Type.reset_stream, (try it.next()).?.ignored);
-    try testing.expectEqual(Type.new_token, (try it.next()).?.ignored);
-    try testing.expectEqual(Frame.ping, (try it.next()).?);
-    try testing.expectEqual(@as(?Frame, null), try it.next());
-}
-
-// QUIC v1 stops at 0x1e, so anything above it is another protocol's frame and
-// skipping is impossible without knowing its length.
-test "an unknown frame type is fatal" {
-    var payload = [_]u8{0x1f};
-    var it = Iterator.init(&payload);
+test "a frame type we cannot walk past is fatal" {
+    // QUIC v1 stops at 0x1e, so anything above it is another protocol's frame
+    // and skipping is impossible without knowing its length.
+    var unknown = [_]u8{0x1f};
+    var it = Iterator.init(&unknown);
     try testing.expectError(error.UnsupportedFrame, it.next());
-}
 
-// 0x4001 is a two-byte encoding of 1, which would otherwise read as PING.
-test "an overlong frame type encoding is rejected" {
-    var payload = [_]u8{ 0x40, 0x01 };
-    var it = Iterator.init(&payload);
-    try testing.expectError(error.VarIntNotCanonical, it.next());
+    // 0x4001 is a two-byte encoding of 1, which would otherwise read as PING.
+    var overlong = [_]u8{ 0x40, 0x01 };
+    var it2 = Iterator.init(&overlong);
+    try testing.expectError(error.VarIntNotCanonical, it2.next());
 }
 
 test "records packet numbers into ranges regardless of arrival order" {
@@ -720,21 +712,18 @@ test "records packet numbers into ranges regardless of arrival order" {
     try testing.expectEqual(AckRange{ .largest = 6, .smallest = 5 }, a.ranges[1]);
     try testing.expectEqual(AckRange{ .largest = 2, .smallest = 0 }, a.ranges[2]);
 
+    // Recording one already inside a range changes nothing.
     a.record(6);
     try testing.expectEqual(@as(usize, 3), a.count);
+
+    // Filling a gap merges the ranges on either side of it.
+    a.record(4);
+    a.record(3);
+    try testing.expectEqual(@as(usize, 2), a.count);
+    try testing.expectEqual(AckRange{ .largest = 6, .smallest = 0 }, a.ranges[1]);
 }
 
-test "filling a gap merges the ranges around it" {
-    var r: NumberSet = .{};
-    for ([_]u64{ 0, 2 }) |pn| r.record(pn);
-    try testing.expectEqual(@as(usize, 2), r.count);
-
-    r.record(1);
-    try testing.expectEqual(@as(usize, 1), r.count);
-    try testing.expectEqual(AckRange{ .largest = 2, .smallest = 0 }, r.ranges[0]);
-}
-
-test "an ACK we write reads back as the ranges we recorded" {
+test "an ACK we write reads back as the ranges we recorded, and acking nothing is refused" {
     var r: NumberSet = .{};
     for ([_]u64{ 50, 52, 53, 54, 55, 58, 59, 60 }) |pn| r.record(pn);
 
@@ -753,6 +742,10 @@ test "an ACK we write reads back as the ranges we recorded" {
     try testing.expectEqual(AckRange{ .largest = 50, .smallest = 50 }, (try ranges.next()).?);
     try testing.expectEqual(@as(?AckRange, null), try ranges.next());
     try testing.expectEqual(@as(?Frame, null), try it.next());
+
+    const empty: NumberSet = .{};
+    var w2 = std.Io.Writer.fixed(&buf);
+    try testing.expectError(error.NothingToAck, empty.writeAck(&w2, 0));
 }
 
 // Extending the lowest range downward has nothing beneath it to merge with. On
@@ -765,11 +758,4 @@ test "extending the lowest of a full set of ranges" {
     r.record(3);
     try testing.expect(r.contains(3));
     try testing.expectEqual(AckRange{ .largest = 4, .smallest = 3 }, r.ranges[r.count - 1]);
-}
-
-test "acking nothing is refused" {
-    const r: NumberSet = .{};
-    var buf: [16]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    try testing.expectError(error.NothingToAck, r.writeAck(&w, 0));
 }

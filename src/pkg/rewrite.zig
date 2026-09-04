@@ -169,29 +169,9 @@ test "comments and formatting survive a rewrite" {
     try testing.expect(std.mem.indexOf(u8, out, ".name = .demo,") != null);
 }
 
-test "two edits to one dependency both land" {
-    const src =
-        \\.{
-        \\    .dependencies = .{
-        \\        .radish = .{
-        \\            .rad = "z4VSy",
-        \\        },
-        \\    },
-        \\}
-    ;
-    const out = try apply(testing.allocator, src, &.{
-        .{ .dep = "radish", .field = "path", .value = "p" },
-        .{ .dep = "radish", .field = "rad_hash", .value = "h" },
-    });
-    defer testing.allocator.free(out);
-
-    try testing.expect(std.mem.indexOf(u8, out, ".path = \"p\",") != null);
-    try testing.expect(std.mem.indexOf(u8, out, ".rad_hash = \"h\",") != null);
-}
-
 // Indentation has to come from the field being followed, not from wherever a
 // previous splice left the closing brace, or successive edits stair-step.
-test "appended fields keep the surrounding indentation" {
+test "two appended fields both land, keeping the surrounding indentation" {
     const src =
         \\.{
         \\    .dependencies = .{

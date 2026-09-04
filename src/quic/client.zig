@@ -606,6 +606,23 @@ pub const Handshaker = struct {
         }, pw.buffered(), keys);
     }
 
+    /// An application CONNECTION_CLOSE, so the peer can release what it holds
+    /// for us instead of waiting out its idle timeout.
+    /// Source: RFC 9000 s10.2.
+    pub fn sealClose(self: *Handshaker, out: []u8, reason: []const u8) Error!usize {
+        const keys = (self.app_keys orelse return error.HandshakeIncomplete).send;
+        var payload: [128]u8 = undefined;
+        var pw = std.Io.Writer.fixed(&payload);
+        // NO_ERROR: leaving is not a failure.
+        frame.writeConnectionClose(&pw, 0, reason) catch return error.BufferTooSmall;
+
+        return packet.sealShort(out, .{
+            .dcid = self.accepted.scid(),
+            .pn = self.takePacketNumber(.application),
+            .pn_len = packet.max_pn_len,
+        }, pw.buffered(), keys);
+    }
+
     /// A PING, which carries nothing and only asks to be acknowledged. Sent
     /// before the idle timeout to hold a quiet connection open.
     /// Source: RFC 9000 s19.2, s10.1.
@@ -1115,17 +1132,45 @@ const testing = std.testing;
 const testdata = @import("testdata.zig");
 const hex = testdata.hex;
 
-/// A handshaker addressing itself, for tests that only drive one side. The
-/// buffers are the caller's because they outlive the call.
-fn testHandshaker(dcid: []const u8, initial_buf: []u8, handshake_buf: []u8) Handshaker {
+/// Buffers a handshaker borrows, declared by the caller because they outlive
+/// the call that made it. The send buffer holds two full packets' worth, for
+/// the tests that fill the sender.
+const TestBufs = struct {
+    initial: [1024]u8 = undefined,
+    handshake: [1024]u8 = undefined,
+    send: [2 * max_stream_chunk]u8 = undefined,
+};
+
+/// A handshaker addressing itself, for tests that only drive one side.
+fn testHandshaker(dcid: []const u8, bufs: *TestBufs) Handshaker {
     return Handshaker.init(.{
         .original_dcid = dcid,
         .our_scid = dcid,
         .client_hello = "",
         .secret = hex(testdata.fixed_x25519_secret),
-        .initial_buf = initial_buf,
-        .handshake_buf = handshake_buf,
+        .initial_buf = &bufs.initial,
+        .handshake_buf = &bufs.handshake,
     });
+}
+
+/// The same, with application keys in place so the 1-RTT paths run. One key
+/// both ways, so a packet we seal is one we can also open.
+fn appHandshaker(dcid: []const u8, bufs: *TestBufs, stream_buf: []u8) Handshaker {
+    var h = Handshaker.init(.{
+        .original_dcid = dcid,
+        .our_scid = dcid,
+        .client_hello = "",
+        .secret = hex(testdata.fixed_x25519_secret),
+        .initial_buf = &bufs.initial,
+        .handshake_buf = &bufs.handshake,
+        .stream_buf = stream_buf,
+        .send_buf = &bufs.send,
+    });
+    const keys = crypto.keysFromSecret(crypto.initialSecrets(dcid).client);
+    h.app_keys = .{ .send = keys, .recv = keys };
+    h.accepted.scid_len = dcid.len;
+    @memcpy(h.accepted.scid_buf[0..dcid.len], dcid);
+    return h;
 }
 
 /// Opens a packet we sealed ourselves. `open` decrypts in place, so it works on
@@ -1445,9 +1490,8 @@ test "builds an Initial datagram we can open again" {
 // rejection is indistinguishable from silence.
 test "packets that cannot be opened are reported" {
     const dcid = hex(testdata.other_dcid);
-    var initial_crypto: [1024]u8 = undefined;
-    var handshake_crypto: [1024]u8 = undefined;
-    var h = testHandshaker(&dcid, &initial_crypto, &handshake_crypto);
+    var bufs: TestBufs = .{};
+    var h = testHandshaker(&dcid, &bufs);
 
     var scratch: [512]u8 = undefined;
     var payload: [32]u8 = @splat(0);
@@ -1479,27 +1523,12 @@ test "packets that cannot be opened are reported" {
 
 test "stream data survives a 1-RTT round trip" {
     const dcid = hex(testdata.other_dcid);
-    var initial_crypto: [1024]u8 = undefined;
-    var handshake_crypto: [1024]u8 = undefined;
+    var bufs: TestBufs = .{};
     // Small, so reading one message crosses the half the grant waits for.
     var stream_buf: [8]u8 = undefined;
-    var send_buf: [64]u8 = undefined;
-    var h = Handshaker.init(.{
-        .original_dcid = &dcid,
-        .our_scid = &dcid,
-        .client_hello = "",
-        .secret = hex(testdata.fixed_x25519_secret),
-        .initial_buf = &initial_crypto,
-        .handshake_buf = &handshake_crypto,
-        .stream_buf = &stream_buf,
-        .send_buf = &send_buf,
-    });
-
-    // One key both ways, so the packet we seal is one we can also open.
+    var h = appHandshaker(&dcid, &bufs, &stream_buf);
     const keys = crypto.keysFromSecret(crypto.initialSecrets(&dcid).client);
-    h.app_keys = .{ .send = keys, .recv = keys };
-    h.accepted.scid_len = dcid.len;
-    @memcpy(h.accepted.scid_buf[0..dcid.len], &dcid);
+
     // What the peer's transport parameters would have opened.
     h.send_data.extend(32);
     h.send_stream.extend(32);
@@ -1533,24 +1562,11 @@ test "stream data survives a 1-RTT round trip" {
 
 test "unacknowledged stream data goes again under a new number" {
     const dcid = hex(testdata.other_dcid);
-    var initial_crypto: [1024]u8 = undefined;
-    var handshake_crypto: [1024]u8 = undefined;
+    var bufs: TestBufs = .{};
     var stream_buf: [64]u8 = undefined;
-    var send_buf: [64]u8 = undefined;
-    var h = Handshaker.init(.{
-        .original_dcid = &dcid,
-        .our_scid = &dcid,
-        .client_hello = "",
-        .secret = hex(testdata.fixed_x25519_secret),
-        .initial_buf = &initial_crypto,
-        .handshake_buf = &handshake_crypto,
-        .stream_buf = &stream_buf,
-        .send_buf = &send_buf,
-    });
+    var h = appHandshaker(&dcid, &bufs, &stream_buf);
     const keys = crypto.keysFromSecret(crypto.initialSecrets(&dcid).client);
-    h.app_keys = .{ .send = keys, .recv = keys };
-    h.accepted.scid_len = dcid.len;
-    @memcpy(h.accepted.scid_buf[0..dcid.len], &dcid);
+
     h.send_data.extend(64);
     h.send_stream.extend(64);
 
@@ -1577,25 +1593,9 @@ test "unacknowledged stream data goes again under a new number" {
 
 test "sending stops at the limit the peer gave" {
     const dcid = hex(testdata.other_dcid);
-    var initial_crypto: [1024]u8 = undefined;
-    var handshake_crypto: [1024]u8 = undefined;
-    // Two full packets' worth, since the test fills the sender.
-    var send_buf: [2 * max_stream_chunk]u8 = undefined;
+    var bufs: TestBufs = .{};
     var stream_buf: [64]u8 = undefined;
-    var h = Handshaker.init(.{
-        .original_dcid = &dcid,
-        .our_scid = &dcid,
-        .client_hello = "",
-        .secret = hex(testdata.fixed_x25519_secret),
-        .initial_buf = &initial_crypto,
-        .handshake_buf = &handshake_crypto,
-        .stream_buf = &stream_buf,
-        .send_buf = &send_buf,
-    });
-    const keys = crypto.keysFromSecret(crypto.initialSecrets(&dcid).client);
-    h.app_keys = .{ .send = keys, .recv = keys };
-    h.accepted.scid_len = dcid.len;
-    @memcpy(h.accepted.scid_buf[0..dcid.len], &dcid);
+    var h = appHandshaker(&dcid, &bufs, &stream_buf);
 
     var out: [256]u8 = undefined;
     // Nothing may be sent until the peer's parameters open a window.
@@ -1631,9 +1631,8 @@ test "sending stops at the limit the peer gave" {
 
 test "a handshake message out of turn is refused" {
     const dcid = hex(testdata.other_dcid);
-    var initial_crypto: [1024]u8 = undefined;
-    var handshake_crypto: [1024]u8 = undefined;
-    var h = testHandshaker(&dcid, &initial_crypto, &handshake_crypto);
+    var bufs: TestBufs = .{};
+    var h = testHandshaker(&dcid, &bufs);
 
     try testing.expectEqual(Handshaker.Phase.wait_server_hello, h.phase);
 
@@ -1657,9 +1656,8 @@ fn firstMessage(bytes: []const u8) handshake.Message {
 test "acknowledges an Initial the server can open" {
     const dcid = hex(testdata.other_dcid);
     const server_scid = hex("aabbccdd");
-    var initial_crypto: [1024]u8 = undefined;
-    var handshake_crypto: [1024]u8 = undefined;
-    var h = testHandshaker(&dcid, &initial_crypto, &handshake_crypto);
+    var bufs: TestBufs = .{};
+    var h = testHandshaker(&dcid, &bufs);
 
     // Nothing has arrived, so nothing is owed.
     var out: [max_initial_datagram]u8 = undefined;
@@ -1705,9 +1703,8 @@ test "acknowledges an Initial the server can open" {
 
 test "retransmitting the ClientHello uses a fresh packet number" {
     const dcid = hex(testdata.other_dcid);
-    var initial_crypto: [1024]u8 = undefined;
-    var handshake_crypto: [1024]u8 = undefined;
-    var h = testHandshaker(&dcid, &initial_crypto, &handshake_crypto);
+    var bufs: TestBufs = .{};
+    var h = testHandshaker(&dcid, &bufs);
 
     const hello: [32]u8 = @splat(0xaa);
     var out: [max_initial_datagram]u8 = undefined;

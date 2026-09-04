@@ -363,7 +363,7 @@ test "hkdf2 matches HMAC chain" {
     try testing.expectEqualSlices(u8, &o1, &out[0]);
 }
 
-test "symmetric encrypt/decrypt round trip with key" {
+test "encryptAndHash round trips, and an empty payload encrypts to empty" {
     var a = SymmetricState.init();
     a.mixKey("shared-secret-material");
     var b = a; // same state -> same key/nonce
@@ -371,14 +371,9 @@ test "symmetric encrypt/decrypt round trip with key" {
     var buf: [64]u8 = undefined;
     const n = a.encryptAndHash(&buf, "hello");
     var out: [64]u8 = undefined;
-    const pt = try b.decryptAndHash(&out, buf[0..n]);
-    try testing.expectEqualStrings("hello", pt);
-}
+    try testing.expectEqualStrings("hello", try b.decryptAndHash(&out, buf[0..n]));
 
-test "empty payload encrypts to empty" {
-    var a = SymmetricState.init();
-    a.mixKey("k");
-    var buf: [64]u8 = undefined;
-    const n = a.encryptAndHash(&buf, "");
-    try testing.expectEqual(@as(usize, 0), n);
+    var c = SymmetricState.init();
+    c.mixKey("k");
+    try testing.expectEqual(@as(usize, 0), c.encryptAndHash(&buf, ""));
 }

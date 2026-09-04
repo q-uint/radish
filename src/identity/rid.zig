@@ -83,49 +83,29 @@ test "round trip" {
     try testing.expectEqualSlices(u8, &oid, &back.oid);
 }
 
-test "heartwood vector parse round trip" {
-    // Source: heartwood examples (e.g. crates/radicle-cli/examples/rad-node.md).
-    // https://codeberg.org/radicle/heartwood
+test "heartwood vector re-encodes to itself, with or without the rad prefix" {
+    // Source: heartwood crates/radicle-cli/examples/rad-node.md.
     const input = "rad:z42hL2jL4XNk6K8oHQaSWfMgCL7ji";
-    const rid = try RepoId.parse(input);
-    const s = try rid.encode(testing.allocator);
-    defer testing.allocator.free(s);
-    try testing.expectEqualStrings(input, s);
+    for ([_][]const u8{ input, input["rad:".len..] }) |v| {
+        const s = try (try RepoId.parse(v)).encode(testing.allocator);
+        defer testing.allocator.free(s);
+        try testing.expectEqualStrings(input, s);
+    }
 }
 
-test "parse accepts missing rad prefix" {
-    const rid = try RepoId.parse("z42hL2jL4XNk6K8oHQaSWfMgCL7ji");
-    const s = try rid.encode(testing.allocator);
-    defer testing.allocator.free(s);
-    try testing.expectEqualStrings("rad:z42hL2jL4XNk6K8oHQaSWfMgCL7ji", s);
-}
-
-test "parse rejects non-base58btc multibase" {
+test "parse rejects another multibase, or base58btc that decodes to the wrong length" {
     // 'f' is the multibase tag for base16; must be rejected, not decoded.
     try testing.expectError(error.MismatchedBaseEncoding, RepoId.parse("rad:fdeadbeef"));
+    try testing.expectError(error.InvalidLength, RepoId.parse("rad:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"));
 }
 
 test "fromDoc matches git hash-object" {
     // `printf '%s' '{"payload":{},"delegates":[],"threshold":1}' | git hash-object --stdin`
-    //   -> cf486bcaca813b85095310f78385dd17a2a930f1
-    // (Placeholder doc bytes: exercises the derivation pipeline, not the real
-    // canonical-JSON doc schema, which is a later slice.)
     const doc = "{\"payload\":{},\"delegates\":[],\"threshold\":1}";
     const rid = try RepoId.fromDoc(doc);
-
     const expected_oid = [_]u8{
         0xcf, 0x48, 0x6b, 0xca, 0xca, 0x81, 0x3b, 0x85, 0x09, 0x53,
         0x10, 0xf7, 0x83, 0x85, 0xdd, 0x17, 0xa2, 0xa9, 0x30, 0xf1,
     };
     try testing.expectEqualSlices(u8, &expected_oid, &rid.oid);
-
-    const s = try rid.encode(testing.allocator);
-    defer testing.allocator.free(s);
-    const back = try RepoId.parse(s);
-    try testing.expectEqualSlices(u8, &rid.oid, &back.oid);
-}
-
-test "parse rejects wrong length" {
-    // Valid base58btc but decodes to != 20 bytes.
-    try testing.expectError(error.InvalidLength, RepoId.parse("rad:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"));
 }

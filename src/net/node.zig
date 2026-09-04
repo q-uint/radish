@@ -62,13 +62,7 @@ pub fn serveOver(
 }
 
 /// Binds `port` and serves inbound connections one at a time, until
-/// `max_sessions` have been handled. Sequential on purpose: a concurrent
-/// accept loop needs a session table and cancellation, which is the next piece
-/// of work rather than this one.
-///
-/// `key` is the node's identity. It is a parameter because radish generates a
-/// throwaway key per run today; a listener really wants a stable one, or peers
-/// cannot find it twice across restarts.
+/// `max_sessions` have been handled. `key` is the node's identity.
 pub fn listen(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -207,54 +201,38 @@ test "greets with a signed announcement and a subscribe" {
 }
 
 // A node that does not answer pings is dropped as unresponsive after
-// STALE_CONNECTION_TIMEOUT, so this is what keeps a session alive.
-test "answers a ping with a matching pong" {
-    var out: [8192]u8 = undefined;
-    var w = std.Io.Writer.fixed(&out);
-
-    const ping = try protocol.encodePingFrame(testing.allocator, .{ .ponglen = 4, .zeroes = 0 });
-    defer testing.allocator.free(ping);
-    var r = std.Io.Reader.fixed(ping);
-
-    const stats = try serveOver(testing.allocator, &r, &w, try testKey(), "radish", 1, 10);
-    try testing.expectEqual(@as(usize, 1), stats.pings);
-
-    // Skip the greeting, then find the pong we wrote.
-    var sent = std.Io.Reader.fixed(w.buffered());
+// STALE_CONNECTION_TIMEOUT, so a pong is what keeps a session alive. A ponglen
+// above MAX_PONG_ZEROES cannot be encoded as a Pong at all, so answering that
+// one would mean sending a malformed frame.
+test "answers a ping with a matching pong, but ignores one asking for too many zeroes" {
     var scratch: [protocol.MAX_FRAME_PAYLOAD]u8 = undefined;
     var oids: [8][20]u8 = undefined;
-    _ = try protocol.decodeFrameStreaming(&sent, &scratch, &oids);
-    _ = try protocol.decodeFrameStreaming(&sent, &scratch, &oids);
-    const reply = try protocol.decodeFrameStreaming(&sent, &scratch, &oids);
-    try testing.expectEqual(@as(u16, 4), reply.pong.zeroes);
+
+    for ([_]u16{ 4, protocol.MAX_PONG_ZEROES + 1 }) |ponglen| {
+        var out: [8192]u8 = undefined;
+        var w = std.Io.Writer.fixed(&out);
+
+        const ping = try protocol.encodePingFrame(testing.allocator, .{ .ponglen = ponglen, .zeroes = 0 });
+        defer testing.allocator.free(ping);
+        var r = std.Io.Reader.fixed(ping);
+
+        const stats = try serveOver(testing.allocator, &r, &w, try testKey(), "radish", 1, 10);
+        try testing.expectEqual(@as(usize, 1), stats.pings);
+
+        // Skip the greeting, then look for a reply behind it.
+        var sent = std.Io.Reader.fixed(w.buffered());
+        _ = try protocol.decodeFrameStreaming(&sent, &scratch, &oids);
+        _ = try protocol.decodeFrameStreaming(&sent, &scratch, &oids);
+        if (ponglen <= protocol.MAX_PONG_ZEROES) {
+            const reply = try protocol.decodeFrameStreaming(&sent, &scratch, &oids);
+            try testing.expectEqual(ponglen, reply.pong.zeroes);
+        } else {
+            try testing.expectError(error.EndOfStream, protocol.decodeFrameStreaming(&sent, &scratch, &oids));
+        }
+    }
 }
 
-// A ponglen above MAX_PONG_ZEROES cannot be encoded as a Pong at all, so
-// answering it would mean sending a malformed frame.
-test "ignores a ping asking for more zeroes than a pong can carry" {
-    var out: [8192]u8 = undefined;
-    var w = std.Io.Writer.fixed(&out);
-
-    const ping = try protocol.encodePingFrame(testing.allocator, .{
-        .ponglen = protocol.MAX_PONG_ZEROES + 1,
-        .zeroes = 0,
-    });
-    defer testing.allocator.free(ping);
-    var r = std.Io.Reader.fixed(ping);
-
-    const stats = try serveOver(testing.allocator, &r, &w, try testKey(), "radish", 1, 10);
-    try testing.expectEqual(@as(usize, 1), stats.pings);
-
-    // The greeting is all that was written: no pong follows it.
-    var sent = std.Io.Reader.fixed(w.buffered());
-    var scratch: [protocol.MAX_FRAME_PAYLOAD]u8 = undefined;
-    var oids: [8][20]u8 = undefined;
-    _ = try protocol.decodeFrameStreaming(&sent, &scratch, &oids);
-    _ = try protocol.decodeFrameStreaming(&sent, &scratch, &oids);
-    try testing.expectError(error.EndOfStream, protocol.decodeFrameStreaming(&sent, &scratch, &oids));
-}
-
-test "counts a peer's subscribe and announcements" {
+test "counts a peer's subscribe" {
     var out: [16384]u8 = undefined;
     var w = std.Io.Writer.fixed(&out);
 
