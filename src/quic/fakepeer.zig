@@ -103,12 +103,28 @@ pub const FakePeer = struct {
     /// The same, waiting only `timeout_ms`: for asking whether anything is
     /// there without paying the full wait when nothing is.
     pub fn receiveFramesIn(self: *FakePeer, out: []u8, timeout_ms: u64) ![]const u8 {
+        return (try self.receivePacketIn(out, timeout_ms)).payload;
+    }
+
+    /// The whole packet, for a test that needs the number it arrived under to
+    /// acknowledge some and not others.
+    pub fn receivePacketIn(self: *FakePeer, out: []u8, timeout_ms: u64) !packet.OpenedShort {
         const got = try self.sock.receiveTimeout(self.io, &self.datagram, .{ .duration = .{
             .raw = .fromNanoseconds(@intCast(timeout_ms * std.time.ns_per_ms)),
             .clock = .awake,
         } });
-        const opened = try packet.openShort(out, got.data, 0, self.keys, null);
-        return opened.payload;
+        return packet.openShort(out, got.data, 0, self.keys, null);
+    }
+
+    /// Acknowledges exactly `pns`, so whatever a test leaves out is a hole the
+    /// client's loss detection has to act on.
+    pub fn ackOnly(self: *FakePeer, pns: []const u64) !void {
+        var set: frame.NumberSet = .{};
+        for (pns) |pn| set.record(pn);
+
+        var w = std.Io.Writer.fixed(&self.payload);
+        try set.writeAck(&w, 0);
+        try self.sendFrames(w.buffered());
     }
 
     /// Moves to the next generation of keys and flips the phase our packets

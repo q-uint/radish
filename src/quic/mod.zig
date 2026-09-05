@@ -8,6 +8,7 @@ pub const packet = @import("packet.zig");
 pub const reassembly = @import("reassembly.zig");
 pub const stream = @import("stream.zig");
 pub const recovery = @import("recovery.zig");
+pub const profile = @import("profile.zig");
 pub const frame = @import("frame.zig");
 pub const tls = @import("tls.zig");
 pub const handshake = @import("handshake.zig");
@@ -21,6 +22,7 @@ test {
     _ = reassembly;
     _ = stream;
     _ = recovery;
+    _ = profile;
     _ = frame;
     _ = tls;
     _ = handshake;

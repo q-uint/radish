@@ -215,6 +215,23 @@ pub const NumberSet = struct {
         self.insert(pn);
     }
 
+    /// Drops everything at or below `pn`, which the peer has confirmed reading
+    /// an ACK for. Without this the holes left by early loss are re-encoded in
+    /// every ACK for the rest of the connection.
+    /// Source: RFC 9000 s13.2.4.
+    pub fn trimTo(self: *NumberSet, pn: u64) void {
+        var kept: usize = 0;
+        for (self.ranges[0..self.count]) |r| {
+            if (r.largest <= pn) continue;
+            self.ranges[kept] = .{
+                .largest = r.largest,
+                .smallest = @max(r.smallest, pn + 1),
+            };
+            kept += 1;
+        }
+        self.count = kept;
+    }
+
     /// Joins range `i - 1` with range `i` when they have become adjacent.
     /// `i == count` means the extended range was already the lowest, so there
     /// is nothing under it to join.
@@ -753,6 +770,29 @@ test "a frame type we cannot walk past is fatal" {
     var overlong = [_]u8{ 0x40, 0x01 };
     var it2 = Iterator.init(&overlong);
     try testing.expectError(error.VarIntNotCanonical, it2.next());
+}
+
+test "trimming drops what the peer has confirmed reading an ACK for" {
+    var a: NumberSet = .{};
+    for ([_]u64{ 0, 1, 2, 5, 6, 9 }) |pn| a.record(pn);
+    try testing.expectEqual(@as(usize, 3), a.count);
+
+    // Below every range, so nothing goes.
+    a.trimTo(0);
+    try testing.expectEqual(@as(usize, 3), a.count);
+    try testing.expectEqual(AckRange{ .largest = 2, .smallest = 1 }, a.ranges[2]);
+
+    // Straddling a range keeps the half above the cut.
+    a.trimTo(5);
+    try testing.expectEqual(@as(usize, 2), a.count);
+    try testing.expectEqual(AckRange{ .largest = 9, .smallest = 9 }, a.ranges[0]);
+    try testing.expectEqual(AckRange{ .largest = 6, .smallest = 6 }, a.ranges[1]);
+
+    // At or above the largest empties it, which is the whole point: an
+    // unbroken run costs one range rather than eight.
+    a.trimTo(9);
+    try testing.expectEqual(@as(usize, 0), a.count);
+    try testing.expectEqual(@as(?u64, null), a.largest());
 }
 
 test "records packet numbers into ranges regardless of arrival order" {

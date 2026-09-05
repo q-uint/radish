@@ -7,6 +7,7 @@ const handshake = @import("handshake.zig");
 const frame = @import("frame.zig");
 const packet = @import("packet.zig");
 const reassembly = @import("reassembly.zig");
+const profile = @import("profile.zig");
 const recovery = @import("recovery.zig");
 const stream = @import("stream.zig");
 const tls = @import("tls.zig");
@@ -82,10 +83,18 @@ pub const max_initial_datagram = min_initial_datagram + 8;
 /// TLS_AES_128_GCM_SHA256, the only suite the Initial keys are sized for.
 pub const cipher_suite: u16 = 0x1301;
 
+/// The path we size the window for. A receiver whose credit is under the
+/// bandwidth-delay product limits its own throughput, so this is a bandwidth
+/// and a round trip rather than a round number.
+/// Source: RFC 9000 s4.3, and radicle's own quinn fork, which picks the same
+/// pair as its default (noq-proto config/transport.rs).
+pub const expected_bandwidth: u64 = 12_500_000; // bytes/s, 100 Mbps
+pub const expected_rtt_ms: u64 = 100;
+
 /// How much the peer may send before we raise its limit, and so how big a
-/// stream buffer must be. A window under one whole message deadlocks the
-/// stream; this clears a 64 KiB message and its length prefix.
-pub const default_window: u64 = 1 << 17;
+/// stream buffer must be. Also over one whole message, which a window under
+/// would deadlock.
+pub const default_window: u64 = expected_bandwidth / 1000 * expected_rtt_ms;
 
 /// How long we let a connection go quiet before treating it as dead. The peer
 /// advertises its own and the lower of the two applies.
@@ -444,6 +453,18 @@ pub const Handshaker = struct {
     /// lone one is still answered inside what the peer expects.
     /// Source: RFC 9000 s13.2.1.
     ack_deadline_ms: ?u64 = null,
+    /// The last 1-RTT ACK we sent, and the largest it named. Once the peer
+    /// acknowledges that packet, everything up to that number can stop being
+    /// reported, which is what keeps an early hole out of every later ACK.
+    /// Source: RFC 9000 s13.2.4.
+    sent_ack: ?struct { pn: u64, largest: u64 } = null,
+    /// When an ACK last carried a PING. A packet holding only an ACK is not
+    /// ack-eliciting, so without one the peer never acknowledges our ACKs and
+    /// nothing is ever trimmed.
+    /// Source: RFC 9000 s13.2.4.
+    ack_pinged_ms: u64 = 0,
+    /// Counters, when the caller wants them.
+    profile: ?*profile.Profile = null,
     /// What the peer scales its ACK delays by, as a power of two microseconds.
     /// Source: RFC 9000 s18.2.
     peer_ack_exponent: u6 = 3,
@@ -550,7 +571,13 @@ pub const Handshaker = struct {
                 // we then dropped tells the peer that data arrived, and it
                 // never sends those bytes again.
                 try self.appFrames(opened.payload);
+                const before = self.app_received.out_of_order;
                 self.app_received.record(opened.pn);
+                if (self.profile) |p| {
+                    p.app_packets += 1;
+                    p.app_highest = @max(p.app_highest, opened.pn);
+                    if (!before and self.app_received.out_of_order) p.app_gaps += 1;
+                }
                 return;
             }
 
@@ -880,6 +907,7 @@ pub const Handshaker = struct {
         // as soon as it reads it, and data past our own limit is a violation.
         self.stream.window.extend(grant);
         self.grant_pn = pn;
+        if (self.profile) |p| p.grants_sent += 1;
         return self.tracked(.application, pn, n);
     }
 
@@ -989,6 +1017,18 @@ pub const Handshaker = struct {
         if (self.recovery.onAck(space, a.largest, self.ackDelayMs(a.delay), self.now_ms).any()) {
             self.lost = true;
         }
+
+        // An ACK of ours that got through means the peer has read everything it
+        // named, so those numbers need not be reported again.
+        // Source: RFC 9000 s13.2.4.
+        if (space == .application) {
+            if (self.sent_ack) |sent| {
+                if (set.contains(sent.pn)) {
+                    self.app_received.numbers.trimTo(sent.largest);
+                    self.sent_ack = null;
+                }
+            }
+        }
     }
 
     /// An ACK's delay field in milliseconds. It arrives as microseconds scaled
@@ -1045,6 +1085,15 @@ pub const Handshaker = struct {
             },
             else => return error.BufferTooSmall,
         };
+        // Once a round trip, the ACK carries a PING so the peer has to
+        // acknowledge it, which is the only way we learn what it has read.
+        // Source: RFC 9000 s13.2.4.
+        const ping = space == .application and
+            self.now_ms -| self.ack_pinged_ms >= self.recovery.rtt.smoothed_ms;
+        if (ping) {
+            codec.writeVarint(&pw, @backingInt(frame.Type.ping)) catch return error.BufferTooSmall;
+            self.ack_pinged_ms = self.now_ms;
+        }
         // Taken only once there is a packet to spend it on: a number consumed
         // and not sent is a gap the peer reads as loss.
         const pn = self.takePacketNumber(space);
@@ -1077,8 +1126,24 @@ pub const Handshaker = struct {
                 .key_phase = self.key_phase,
             }, pw.buffered(), (self.app_keys orelse return error.KeysUnavailable).send),
         };
+        if (self.profile) |p| {
+            p.acks_sent += 1;
+            p.ack_ranges += tracker.numbers.count;
+            p.ack_ranges_max = @max(p.ack_ranges_max, tracker.numbers.count);
+        }
+        if (space == .application) {
+            self.ack_deadline_ms = null;
+            // Only the ACK carrying a PING: the peer acknowledges nothing else
+            // we send, so remembering any other would be waiting on an
+            // acknowledgement that never comes.
+            if (ping) {
+                if (tracker.numbers.largest()) |l| self.sent_ack = .{ .pn = pn, .largest = l };
+            }
+        }
         tracker.cleared();
-        if (space == .application) self.ack_deadline_ms = null;
+        // A PING makes the packet ack-eliciting, so it is one loss detection
+        // and the congestion window have to know about.
+        if (ping) return self.tracked(space, pn, n);
         return n;
     }
 

@@ -8,6 +8,7 @@ const std = @import("std");
 const dial = @import("../net/dial.zig");
 const client = @import("client.zig");
 const packet = @import("packet.zig");
+const profile = @import("profile.zig");
 const recovery = @import("recovery.zig");
 const stream = @import("stream.zig");
 const tls = @import("tls.zig");
@@ -89,6 +90,8 @@ pub const Conn = struct {
     /// When the stream last moved. A peer that answers but sends nothing keeps
     /// the connection alive, so only this notices a stuck transfer.
     last_stream_ms: u64 = 0,
+    /// When the connection opened, which the profile measures from.
+    opened_ms: u64 = 0,
     /// When we last sent a keepalive, which does not count as being busy.
     last_ping_ms: u64 = 0,
 
@@ -106,6 +109,8 @@ pub const Conn = struct {
     ready: bool = false,
     /// Whether `sock` is still ours to send on and close.
     sock_open: bool = false,
+    /// Counters for the connection, filled whether or not anyone reads them.
+    profile: profile.Profile = .{},
 
     /// The peer's CRYPTO stream in each space. A ServerHello is small; the
     /// handshake flight carries a certificate, so it gets room to spare.
@@ -160,6 +165,7 @@ pub const Conn = struct {
         self.now_ms = opts.clock.nowMs(io);
         self.last_arrival_ms = self.now_ms;
         self.last_stream_ms = self.now_ms;
+        self.opened_ms = self.now_ms;
         self.hs = client.Handshaker.init(.{
             .original_dcid = opts.dcid,
             .our_scid = opts.dcid,
@@ -174,11 +180,12 @@ pub const Conn = struct {
         self.ready = true;
         self.sock_open = true;
         self.hs.now_ms = self.now_ms;
+        self.hs.profile = &self.profile;
         // The ClientHello is packet 0 of the Initial space and carries CRYPTO,
         // so it is what the first probe timeout waits on.
         self.hs.recovery.onSent(.initial, 0, initial.len, self.now_ms);
 
-        try self.sock.send(io, &self.addr, datagram[0..initial.len]);
+        try self.sendDatagram(datagram[0..initial.len]);
     }
 
     /// Says goodbye before dropping the socket, so the peer releases the state
@@ -197,7 +204,7 @@ pub const Conn = struct {
         if (self.hs.app_keys != null and self.hs.closed == null and !self.hs.stateless_reset) {
             var out: [client.max_initial_datagram]u8 = undefined;
             if (self.hs.sealClose(&out, "done") catch null) |n| {
-                self.sock.send(self.io, &self.addr, out[0..n]) catch {};
+                self.sendDatagram(out[0..n]) catch {};
             }
         }
         self.sock.close(self.io);
@@ -242,9 +249,14 @@ pub const Conn = struct {
 
     /// One datagram in, and whatever it obliges us to send back out.
     pub fn service(self: *Conn) !Serviced {
-        const arrived = self.receive() orelse return .silent;
+        const arrived = self.receive() orelse {
+            self.profile.silent += 1;
+            return .silent;
+        };
         self.datagrams += 1;
         self.received += arrived.len;
+        self.profile.datagrams_in += 1;
+        self.profile.bytes_in += arrived.len;
         self.last = arrived;
         self.now_ms = self.opts.clock.nowMs(self.io);
         self.hs.now_ms = self.now_ms;
@@ -271,6 +283,7 @@ pub const Conn = struct {
                 self.last_err = null;
             } else |e| {
                 self.last_err = e;
+                self.profile.unopened += 1;
                 // A close is the end of the connection, so reading on would
                 // only overwrite the reason with the next datagram. A stateless
                 // reset is the same ending without the courtesy.
@@ -284,16 +297,16 @@ pub const Conn = struct {
         var out: [client.max_initial_datagram]u8 = undefined;
         for ([_]packet.Space{ .initial, .handshake, .application }) |space| {
             const n = try self.hs.sealAck(&out, space) orelse continue;
-            self.sock.send(self.io, &self.addr, out[0..n]) catch {};
+            self.sendDatagram(out[0..n]) catch {};
         }
 
         // Both need 1-RTT keys, so there is nothing owed until they exist.
         if (self.hs.app_keys != null) {
             if (try self.hs.sealPathResponse(&out)) |n| {
-                self.sock.send(self.io, &self.addr, out[0..n]) catch {};
+                self.sendDatagram(out[0..n]) catch {};
             }
             if (try self.hs.sealMaxData(&out)) |n| {
-                self.sock.send(self.io, &self.addr, out[0..n]) catch {};
+                self.sendDatagram(out[0..n]) catch {};
             }
         }
 
@@ -310,7 +323,7 @@ pub const Conn = struct {
                 self.last_err = e;
                 break :send;
             };
-            self.sock.send(self.io, &self.addr, out[0..n]) catch |e| {
+            self.sendDatagram(out[0..n]) catch |e| {
                 self.last_err = e;
                 break :send;
             };
@@ -332,12 +345,24 @@ pub const Conn = struct {
             self.now_ms = self.opts.clock.nowMs(self.io);
             const wait_ms = self.waitMs();
             if (wait_ms > 0) {
+                const asked = std.Io.Timestamp.now(self.io, .awake);
                 if (self.sock.receiveTimeout(self.io, &self.datagram, .{ .duration = .{
                     .raw = .fromNanoseconds(@intCast(wait_ms * std.time.ns_per_ms)),
                     .clock = .awake,
                 } })) |got| {
+                    const waited = std.Io.Timestamp.now(self.io, .awake).nanoseconds -| asked.nanoseconds;
+                    self.profile.waited_ns += @intCast(@max(0, waited));
+                    if (waited < std.time.ns_per_us) self.profile.ready += 1;
                     return got.data;
-                } else |_| {}
+                } else |e| switch (e) {
+                    // The wait ran out, so whatever the timer was for is due.
+                    error.Timeout => {},
+                    // Retrying a broken socket spins until the idle timeout.
+                    else => {
+                        self.last_err = e;
+                        return null;
+                    },
+                }
                 self.now_ms = self.opts.clock.nowMs(self.io);
             }
             if (!self.onTimeout()) return null;
@@ -384,7 +409,7 @@ pub const Conn = struct {
         // Whatever else the silence means, an ACK that has run out of time
         // goes first: no datagram is coming to carry it.
         if (self.hs.sealAck(&out, .application) catch null) |n| {
-            self.sock.send(self.io, &self.addr, out[0..n]) catch {};
+            self.sendDatagram(out[0..n]) catch {};
             return true;
         }
         if (self.due()) |t| {
@@ -454,8 +479,15 @@ pub const Conn = struct {
     }
 
     fn emit(self: *Conn, datagram: []const u8) bool {
-        self.sock.send(self.io, &self.addr, datagram) catch return false;
+        self.sendDatagram(datagram) catch return false;
         return true;
+    }
+
+    /// Every datagram leaves through here, so the counters see all of them.
+    fn sendDatagram(self: *Conn, datagram: []const u8) !void {
+        try self.sock.send(self.io, &self.addr, datagram);
+        self.profile.datagrams_out += 1;
+        self.profile.bytes_out += datagram.len;
     }
 
     /// Sends `data` on the stream, split across as many packets as it takes.
@@ -493,7 +525,7 @@ pub const Conn = struct {
             self.now_ms = self.opts.clock.nowMs(self.io);
             self.hs.now_ms = self.now_ms;
             const n = try self.hs.sealStream(&out, rest[0..take], fin and take == rest.len);
-            try self.sock.send(self.io, &self.addr, out[0..n]);
+            try self.sendDatagram(out[0..n]);
 
             rest = rest[take..];
             if (rest.len == 0) return;
@@ -554,6 +586,18 @@ pub const Conn = struct {
     pub fn accepted(self: *const Conn) ?*const client.Accepted {
         if (!self.ready) return null;
         return &self.hs.accepted;
+    }
+
+    /// The counters, with the round trip and window folded in as they stand.
+    pub fn profiled(self: *Conn) *const profile.Profile {
+        if (self.ready) {
+            self.profile.rtt_ms = self.hs.recovery.rtt.smoothed_ms;
+            self.profile.cwnd = self.hs.recovery.cc.window;
+        }
+        // When the bytes stopped arriving, which is the transfer whether the
+        // peer ended it with a FIN or by closing the connection.
+        self.profile.pack_ms = self.last_stream_ms -| self.opened_ms;
+        return &self.profile;
     }
 
     pub fn consume(self: *Conn, n: usize) void {

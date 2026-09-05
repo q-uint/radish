@@ -29,6 +29,7 @@ radish subscribe   <host> <port> <node-id> [frames]     listen to gossip (nodes 
 radish fetch-probe <host> <port> <node-id> <rid>        open a git stream, read the v2 advertisement
 radish clone       <host> <port> <node-id> <rid> <dir>  clone a repo into <dir> (bare), verifying each remote
   --require-verified                                    exit non-zero if any remote fails verification
+  --profile                                             print connection counters on exit
 radish seeds       <rid>                                who holds a repo; needs --from or --dir
   --dir <path>                                          remotes in a local clone (no network)
   --from <host>:<port>:<node-id>                        seeds announcing it over gossip
@@ -42,6 +43,7 @@ radish quic ping   <host> <port>                        2.x: handshake, then a g
 radish quic subscribe <host> <port> [messages]          2.x: listen to gossip (default 200)
 radish quic clone  <host> <port> <rid> <dir>            2.x: clone a repo into <dir> (bare)
   --require-verified                                    exit non-zero if any remote fails verification
+  --profile                                             print connection counters on exit
 radish quic probe  <host> <port> [alpn] [sni]           2.x: send an Initial, read the reply
 ```
 

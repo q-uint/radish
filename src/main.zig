@@ -65,10 +65,12 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, args[2], "clone") and args.len >= 7) {
             var require = false;
+            var profile = false;
             for (args[7..]) |a| {
                 if (std.mem.eql(u8, a, "--require-verified")) require = true;
+                if (std.mem.eql(u8, a, "--profile")) profile = true;
             }
-            return quicClone(init, args[3], port, args[5], args[6], require);
+            return quicClone(init, args[3], port, args[5], args[6], require, profile);
         }
         if (std.mem.eql(u8, args[2], "capture")) {
             const max: usize = if (args.len >= 6)
@@ -153,6 +155,7 @@ fn usage() void {
         \\  radish quic fetch-probe <host> <port> <rid>             open the git ALPN, list refs
         \\  radish quic clone  <host> <port> <rid> <dir>            clone a repo into <dir> (bare)
         \\    --require-verified                                    exit non-zero if any remote fails verification
+        \\    --profile                                             print connection counters on exit
         \\  radish quic capture <host> <port> [messages]            record datagrams as hex fixtures
         \\  radish quic probe  <host> <port> [alpn] [sni]           send an Initial, read the reply
         \\                                                          (default alpn h3). Only raw public
@@ -640,6 +643,7 @@ fn quicClone(
     rid: []const u8,
     dir: []const u8,
     require_verified: bool,
+    show_profile: bool,
 ) !void {
     const quic = radish.quic;
     const arena = init.arena.allocator();
@@ -648,6 +652,11 @@ fn quicClone(
 
     const c = try arena.create(quic.conn.Conn);
     defer c.close();
+    const started = (quic.conn.Clock{ .awake = {} }).nowMs(init.io);
+    // Printed whether or not the clone worked: a failure is when the counters
+    // are most worth seeing.
+    defer if (show_profile) printProfile(init, c, started);
+
     var result = radish.net.clone.overQuic(init.io, arena, c, opts, rid, dir) catch |e| {
         std.debug.print("clone failed: {s}\n", .{@errorName(e)});
         if (c.lastError()) |last| std.debug.print("  last datagram: {s}\n", .{@errorName(last)});
@@ -658,6 +667,14 @@ fn quicClone(
     };
     defer result.deinit(arena);
     return report(result, rid, dir, require_verified);
+}
+
+fn printProfile(init: std.process.Init, c: *radish.quic.conn.Conn, started_ms: u64) void {
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.File.stderr().writer(init.io, &buf);
+    const elapsed = (radish.quic.conn.Clock{ .awake = {} }).nowMs(init.io) -| started_ms;
+    c.profiled().report(&w.interface, elapsed) catch return;
+    w.interface.flush() catch {};
 }
 
 /// One QUIC first flight against a live server. The x25519 key is fixed, so a

@@ -348,6 +348,45 @@ test "a reset naming another stream leaves ours running" {
     try testing.expectEqual(@as(usize, 0), try s.readGit(&buf));
 }
 
+test "a chunk the peer never acknowledged goes out again under a new number" {
+    const d = try fakepeer.Dialed.init(testing.io, 1000);
+    defer d.deinit();
+
+    // Four chunks, so a hole sits three behind the largest and is lost by
+    // packet threshold rather than by a timer.
+    // Source: RFC 9002 s6.1.1.
+    const chunk = quic.client.max_stream_chunk;
+    var data: [4 * chunk]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i);
+    try d.conn.send(&data, false);
+
+    var out: [2048]u8 = undefined;
+    var pns: [4]u64 = undefined;
+    var offsets: [4]u64 = undefined;
+    for (0..4) |i| {
+        const got = try d.peer.receivePacketIn(&out, 200);
+        pns[i] = got.pn;
+        var it = quic.frame.Iterator.init(got.payload);
+        offsets[i] = while (try it.next()) |f| {
+            if (f == .stream) break f.stream.offset;
+        } else unreachable;
+    }
+
+    // Everything but the first, which leaves it three behind the largest.
+    try d.peer.ackOnly(pns[1..4]);
+    _ = try d.conn.service();
+
+    // The resend carries the same offset under a number of its own.
+    const again = try d.peer.receivePacketIn(&out, 500);
+    try testing.expect(again.pn > pns[3]);
+    var it = quic.frame.Iterator.init(again.payload);
+    const resent = while (try it.next()) |f| {
+        if (f == .stream) break f.stream;
+    } else unreachable;
+    try testing.expectEqual(offsets[0], resent.offset);
+    try testing.expectEqualSlices(u8, data[0..chunk], resent.data);
+}
+
 test "a peer saying it is blocked gets a grant it has not earned" {
     const d = try fakepeer.Dialed.init(testing.io, 1000);
     defer d.deinit();
