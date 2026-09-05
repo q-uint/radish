@@ -350,6 +350,9 @@ pub const Conn = struct {
     fn waitMs(self: *const Conn) u64 {
         var wait = self.opts.timeout_ms;
         if (self.hs.recovery.timer()) |t| wait = @min(wait, t.afterMs(self.now_ms));
+        // An ACK held back for a second packet that never comes still has to
+        // go before the peer's patience runs out.
+        if (self.hs.ackDeadlineMs()) |at| wait = @min(wait, at -| self.now_ms);
 
         // Deadlines too, so neither rests on a tick being shorter than they are.
         const idle = self.hs.idleTimeoutMs();
@@ -378,6 +381,12 @@ pub const Conn = struct {
         if (self.stalled()) return false;
 
         var out: [client.max_initial_datagram]u8 = undefined;
+        // Whatever else the silence means, an ACK that has run out of time
+        // goes first: no datagram is coming to carry it.
+        if (self.hs.sealAck(&out, .application) catch null) |n| {
+            self.sock.send(self.io, &self.addr, out[0..n]) catch {};
+            return true;
+        }
         if (self.due()) |t| {
             switch (t.kind) {
                 // The reordering window passed, so what it held open is lost.

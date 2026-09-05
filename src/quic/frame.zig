@@ -271,9 +271,36 @@ pub const Received = struct {
     /// CONNECTION_CLOSE alone do not elicit one.
     /// Source: RFC 9000 s13.2.1.
     ack_eliciting: bool = false,
+    /// Ack-eliciting packets since the last ACK went out. Two of them oblige
+    /// one, so acknowledging every packet is twice the traffic the RFC asks
+    /// for.
+    /// Source: RFC 9000 s13.2.2.
+    pending: u32 = 0,
+    /// Set by a packet that did not follow the one before it, whichever side
+    /// of the gap it fell. Reordering is what loss detection runs on, so it is
+    /// reported at once rather than held back.
+    /// Source: RFC 9000 s13.2.1.
+    out_of_order: bool = false,
 
     pub fn record(self: *Received, pn: u64) void {
+        if (self.numbers.largest()) |l| {
+            if (pn != l + 1) self.out_of_order = true;
+        }
         self.numbers.record(pn);
+    }
+
+    /// Notes a packet that must be acknowledged.
+    pub fn elicited(self: *Received) void {
+        self.ack_eliciting = true;
+        self.pending +|= 1;
+    }
+
+    /// Clears what an ACK just covered. The numbers stay: an ACK names
+    /// everything received, not only what is new.
+    pub fn cleared(self: *Received) void {
+        self.ack_eliciting = false;
+        self.pending = 0;
+        self.out_of_order = false;
     }
 
     pub fn largest(self: *const Received) ?u64 {

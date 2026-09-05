@@ -92,6 +92,17 @@ pub const default_window: u64 = 1 << 17;
 /// Source: RFC 9000 s10.1.
 pub const idle_timeout_ms: u64 = 30_000;
 
+/// Ack-eliciting packets that oblige an ACK. Answering every packet with one
+/// doubles the datagrams on the path for no gain, since an ACK names every
+/// number it has, not only the newest.
+/// Source: RFC 9000 s13.2.2.
+pub const ack_threshold: u32 = 2;
+
+/// How long an ACK may be held back. Not advertised, so this is the default
+/// the peer assumes of us and must not be exceeded.
+/// Source: RFC 9000 s18.2.
+pub const max_ack_delay_ms: u64 = 25;
+
 /// A STREAM frame's fields ahead of the data: the type byte, then the stream
 /// id, offset and length as varints.
 /// Source: RFC 9000 s19.8.
@@ -428,6 +439,11 @@ pub const Handshaker = struct {
     /// reads it: `conn.zig` sets it each turn, and the sealing paths stamp what
     /// they send with it.
     now_ms: u64 = 0,
+    /// When the ACK a held-back packet is owed runs out of time, or null when
+    /// nothing is waiting. Set from the first packet an ACK owes for, so a
+    /// lone one is still answered inside what the peer expects.
+    /// Source: RFC 9000 s13.2.1.
+    ack_deadline_ms: ?u64 = null,
     /// What the peer scales its ACK delays by, as a power of two microseconds.
     /// Source: RFC 9000 s18.2.
     peer_ack_exponent: u6 = 3,
@@ -702,7 +718,10 @@ pub const Handshaker = struct {
             }
             // Only once the frame is in: a frame we then refused takes the
             // packet with it, and there is nothing to acknowledge.
-            if (frame.isAckEliciting(f)) self.app_received.ack_eliciting = true;
+            if (frame.isAckEliciting(f)) {
+                self.app_received.elicited();
+                if (self.ack_deadline_ms == null) self.ack_deadline_ms = self.now_ms + max_ack_delay_ms;
+            }
         }
     }
 
@@ -1010,6 +1029,7 @@ pub const Handshaker = struct {
     pub fn sealAck(self: *Handshaker, out: []u8, space: packet.Space) Error!?usize {
         const tracker = self.received(space);
         if (!tracker.ack_eliciting) return null;
+        if (!self.ackDue(space)) return null;
 
         var payload: [min_initial_datagram]u8 = undefined;
         var pw = std.Io.Writer.fixed(&payload);
@@ -1057,8 +1077,30 @@ pub const Handshaker = struct {
                 .key_phase = self.key_phase,
             }, pw.buffered(), (self.app_keys orelse return error.KeysUnavailable).send),
         };
-        tracker.ack_eliciting = false;
+        tracker.cleared();
+        if (space == .application) self.ack_deadline_ms = null;
         return n;
+    }
+
+    /// Whether an ACK for `space` is owed yet. The handshake spaces answer
+    /// every ack-eliciting packet at once, since the flights are small and a
+    /// held-back ACK is a retransmitted flight. The application space waits
+    /// for a second packet, for one out of order, or for the delay to run
+    /// out, which is what stops a bulk transfer from answering every datagram
+    /// with one of its own.
+    /// Source: RFC 9000 s13.2.1, s13.2.2.
+    fn ackDue(self: *const Handshaker, space: packet.Space) bool {
+        if (space != .application) return true;
+        if (self.app_received.pending >= ack_threshold) return true;
+        if (self.app_received.out_of_order) return true;
+        return if (self.ack_deadline_ms) |at| self.now_ms >= at else false;
+    }
+
+    /// When the application space's held-back ACK must go, or null when
+    /// nothing is waiting on one.
+    pub fn ackDeadlineMs(self: *const Handshaker) ?u64 {
+        if (!self.app_received.ack_eliciting) return null;
+        return self.ack_deadline_ms;
     }
 
     fn frames(self: *Handshaker, kind: packet.Kind, opened: packet.Opened) Error!void {
@@ -1083,7 +1125,7 @@ pub const Handshaker = struct {
                 },
                 else => {},
             }
-            if (frame.isAckEliciting(f)) tracker.ack_eliciting = true;
+            if (frame.isAckEliciting(f)) tracker.elicited();
         }
     }
 
@@ -1980,6 +2022,50 @@ test "acknowledges an Initial the server can open" {
 
     // The debt is settled, so a second call owes nothing.
     try testing.expectEqual(@as(?usize, null), try h.sealAck(&out, .initial));
+}
+
+test "a bulk transfer is acknowledged every second packet, not every packet" {
+    const dcid = hex(testdata.other_dcid);
+    var bufs: TestBufs = .{};
+    var stream_buf: [4096]u8 = undefined;
+    var h = appHandshaker(&dcid, &bufs, &stream_buf);
+
+    var out: [max_initial_datagram]u8 = undefined;
+
+    h.app_received.record(0);
+    h.app_received.elicited();
+    h.ack_deadline_ms = h.now_ms + max_ack_delay_ms;
+    try testing.expectEqual(@as(?usize, null), try h.sealAck(&out, .application));
+
+    h.app_received.record(1);
+    h.app_received.elicited();
+    try testing.expect(try h.sealAck(&out, .application) != null);
+
+    try testing.expectEqual(@as(?usize, null), try h.sealAck(&out, .application));
+    try testing.expectEqual(@as(?u64, null), h.ackDeadlineMs());
+}
+
+test "a held ACK goes once the delay runs out, or at once when a packet is out of order" {
+    const dcid = hex(testdata.other_dcid);
+    var bufs: TestBufs = .{};
+    var stream_buf: [4096]u8 = undefined;
+    var h = appHandshaker(&dcid, &bufs, &stream_buf);
+
+    var out: [max_initial_datagram]u8 = undefined;
+    h.now_ms = 1_000;
+    h.app_received.record(0);
+    h.app_received.elicited();
+    h.ack_deadline_ms = h.now_ms + max_ack_delay_ms;
+    try testing.expectEqual(@as(?usize, null), try h.sealAck(&out, .application));
+
+    try testing.expectEqual(@as(?u64, 1_000 + max_ack_delay_ms), h.ackDeadlineMs());
+    h.now_ms = 1_000 + max_ack_delay_ms;
+    try testing.expect(try h.sealAck(&out, .application) != null);
+
+    h.app_received.record(9);
+    h.app_received.elicited();
+    try testing.expect(h.app_received.out_of_order);
+    try testing.expect(try h.sealAck(&out, .application) != null);
 }
 
 // A packet whose frames are refused is dropped without its number being
