@@ -7,6 +7,7 @@ const handshake = @import("handshake.zig");
 const frame = @import("frame.zig");
 const packet = @import("packet.zig");
 const reassembly = @import("reassembly.zig");
+const recovery = @import("recovery.zig");
 const stream = @import("stream.zig");
 const tls = @import("tls.zig");
 
@@ -35,7 +36,15 @@ pub const Error = error{
     TransportParameterError,
     UnsupportedStream,
     StreamChunkTooLong,
+    KeyUpdateError,
+    StatelessReset,
 } || packet.Error || handshake.Error || frame.Error || stream.Error;
+
+/// The shortest datagram that could be a stateless reset: a short header, a
+/// connection id we might have used, and the 16-byte token. Anything smaller
+/// cannot be one, whatever its last bytes hold.
+/// Source: RFC 9000 s10.3.
+pub const min_stateless_reset_len = 21;
 
 /// A u16-length-prefixed list of u16s, the shape most TLS extensions take.
 fn u16List(comptime values: []const u16) [2 + 2 * values.len]u8 {
@@ -96,8 +105,12 @@ pub const max_stream_chunk = min_initial_datagram -
     Aes128Gcm.tag_length -
     stream_frame_overhead;
 
-/// What a peer may send us. Above an Ethernet MTU, so a datagram that does not
-/// fit is a peer ignoring its own max_udp_payload_size.
+/// What a peer may send us, and what we advertise as `max_udp_payload_size`:
+/// the parameter is "the space an endpoint dedicates to holding incoming
+/// packets", so the two are the same number. Without it the peer is entitled to
+/// the default 65527 and will grow its datagrams past this buffer on a path
+/// that allows it, which a socket read then truncates into garbage.
+/// Source: RFC 9000 s18.2.
 pub const max_receive_datagram = 2048;
 
 /// Room for our handshake flight. Certificate, CertificateVerify and Finished
@@ -164,6 +177,10 @@ fn writeExtensions(w: *std.Io.Writer, cfg: Config) !void {
     // covers the streams a peer opens toward us.
     // Source: RFC 9000 s18.2.
     try handshake.writeIntTransportParam(&pw, .initial_max_streams_bidi, 0);
+    // What we can hold. The default is 65527, and a peer that probes its way up
+    // to it sends datagrams this side reads as truncated garbage.
+    // Source: RFC 9000 s18.2.
+    try handshake.writeIntTransportParam(&pw, .max_udp_payload_size, max_receive_datagram);
     try handshake.writeIntTransportParam(&pw, .max_idle_timeout, idle_timeout_ms);
     try handshake.writeTransportParam(&pw, .initial_source_connection_id, cfg.scid);
     try handshake.writeExtension(w, @backingInt(ExtensionType.quic_transport_parameters), pw.buffered());
@@ -312,11 +329,6 @@ pub const Handshaker = struct {
         recv: crypto.Keys,
     };
 
-    /// Packet numbers restart in each space and each is acknowledged on its own,
-    /// so nothing crosses between them.
-    /// Source: RFC 9000 s12.3.
-    pub const Space = enum { initial, handshake, application };
-
     /// The order the server's messages must arrive in; a message out of turn is
     /// refused. EncryptedExtensions carries the negotiated certificate type,
     /// and the peer's key can only be read once that is known.
@@ -339,6 +351,30 @@ pub const Handshaker = struct {
     /// direction: the two are not interchangeable, and using the wrong one
     /// produces a packet the peer cannot unmask.
     app_keys: ?Directional = null,
+    /// Which generation of 1-RTT keys `app_keys` holds, and the Key Phase bit
+    /// every short header we send carries. Starts at 0 and flips once per
+    /// update. Source: RFC 9001 s6.
+    key_phase: bool = false,
+    /// The receive keys an update replaced, kept so a packet reordered across
+    /// the update still opens. One generation back is as far as it goes.
+    /// Source: RFC 9001 s6.3.
+    prev_recv: ?crypto.Keys = null,
+    /// The token the peer will prove a lost connection with, from its transport
+    /// parameters.
+    /// Source: RFC 9000 s10.3.
+    peer_reset_token: ?[16]u8 = null,
+    /// Set when a datagram arrived bearing that token: the peer has thrown away
+    /// everything it knew about this connection.
+    stateless_reset: bool = false,
+    /// Set by a DATA_BLOCKED or STREAM_DATA_BLOCKED, and cleared by the grant
+    /// that answers it.
+    grant_asked: bool = false,
+    /// The packet the last grant went out in, so a lost one can go again.
+    /// Nothing else retransmits flow control, and our own limit has already
+    /// moved by then, so `wantsGrant` will not ask for another: a grant the
+    /// peer never sees stalls the transfer for good.
+    /// Source: RFC 9000 s13.3.
+    grant_pn: ?u64 = null,
     /// The id we gave for ourselves. Every long header we send has to carry it,
     /// because it is what we advertised as initial_source_connection_id and the
     /// peer checks the two against each other. Its length is also the only way
@@ -384,6 +420,20 @@ pub const Handshaker = struct {
     /// Source: RFC 9000 s4.1.
     send_data: stream.Window = .{ .limit = 0 },
     send_stream: stream.Window = .{ .limit = 0 },
+
+    /// Round trip estimate, loss detection and the congestion window. Fed by
+    /// every ack-eliciting packet sealed here and every ACK opened here.
+    recovery: recovery.Recovery = recovery.Recovery.init(min_initial_datagram),
+    /// The clock as the connection last read it, in milliseconds. Nothing here
+    /// reads it: `conn.zig` sets it each turn, and the sealing paths stamp what
+    /// they send with it.
+    now_ms: u64 = 0,
+    /// What the peer scales its ACK delays by, as a power of two microseconds.
+    /// Source: RFC 9000 s18.2.
+    peer_ack_exponent: u6 = 3,
+    /// Set when loss detection found something and cleared by the caller acting
+    /// on it, since only the caller can put the bytes back on the wire.
+    lost: bool = false,
 
     /// What has arrived in each space, for acknowledging it and for recovering
     /// the next truncated packet number.
@@ -479,16 +529,12 @@ pub const Handshaker = struct {
             if (!packet.isLongHeader(rest[0])) {
                 // No length field, so this packet is the remainder of the
                 // datagram and nothing can follow it.
-                const keys = (self.app_keys orelse return error.KeysUnavailable).recv;
-                const opened = try packet.openShort(
-                    scratch,
-                    rest,
-                    self.our_cid_len,
-                    keys,
-                    self.app_received.largest(),
-                );
-                self.app_received.record(opened.pn);
+                const opened = try self.openApp(scratch, rest, datagram);
+                // Acknowledge only once the frames are in: an ACK for a packet
+                // we then dropped tells the peer that data arrived, and it
+                // never sends those bytes again.
                 try self.appFrames(opened.payload);
+                self.app_received.record(opened.pn);
                 return;
             }
 
@@ -509,8 +555,8 @@ pub const Handshaker = struct {
                 else => &self.handshake_received,
             };
             const opened = try packet.open(scratch, rest, keys, tracker.largest());
-            tracker.record(opened.pn);
             try self.frames(hdr.kind, opened);
+            tracker.record(opened.pn);
             rest = rest[opened.len..];
 
             try self.drain(&self.initial_crypto, &self.initial_read);
@@ -520,11 +566,94 @@ pub const Handshaker = struct {
         }
     }
 
+    /// Opens a 1-RTT packet under the current keys, or failing that either
+    /// generation around them: one reordered across a key update still opens
+    /// under the keys it was sealed with, and one from the generation after is
+    /// how an update announces itself. A datagram no key opens may be the peer
+    /// saying it has lost us.
+    /// Source: RFC 9001 s6.3, RFC 9000 s10.3.1.
+    fn openApp(
+        self: *Handshaker,
+        scratch: []u8,
+        rest: []u8,
+        datagram: []const u8,
+    ) Error!packet.OpenedShort {
+        const dir = self.app_keys orelse return error.KeysUnavailable;
+        const largest = self.app_received.largest();
+
+        if (packet.openShort(scratch, rest, self.our_cid_len, dir.recv, largest)) |opened| {
+            return opened;
+        } else |e| if (e != error.AuthenticationFailed) return e;
+
+        if (self.prev_recv) |old| {
+            if (packet.openShort(scratch, rest, self.our_cid_len, old, largest)) |opened| {
+                return opened;
+            } else |e| if (e != error.AuthenticationFailed) return e;
+        }
+
+        return self.openUpdated(scratch, rest) catch |e| {
+            if (e == error.AuthenticationFailed and self.isStatelessReset(datagram)) {
+                self.stateless_reset = true;
+                return error.StatelessReset;
+            }
+            return e;
+        };
+    }
+
+    /// Whether `datagram` is the peer proving it has thrown away this
+    /// connection: a short header, long enough to hold the token, ending in the
+    /// token it gave us. None of it is authenticated, which is why it is only
+    /// ever asked once no key would open the packet. Compared in constant time,
+    /// since leaking the token would let anyone who can inject a datagram end
+    /// the connection at will.
+    /// Source: RFC 9000 s10.3, s10.3.1.
+    fn isStatelessReset(self: *const Handshaker, datagram: []const u8) bool {
+        const token = self.peer_reset_token orelse return false;
+        if (datagram.len < min_stateless_reset_len) return false;
+        if (packet.isLongHeader(datagram[0])) return false;
+        const tail = datagram[datagram.len - token.len ..][0..token.len].*;
+        return std.crypto.timing_safe.eql([token.len]u8, tail, token);
+    }
+
+    /// Opens `rest` under the generation after the current one, and on success
+    /// moves both directions to it. Sending keys have to move too, since the
+    /// acknowledgement for this packet is what tells the peer the update is
+    /// complete. The header protection key is not part of an update, so it
+    /// carries over, and the receive keys being replaced are kept as
+    /// `prev_recv` for whatever is still in flight under them.
+    /// Source: RFC 9001 s6.1, s6.2, s6.3.
+    fn openUpdated(self: *Handshaker, scratch: []u8, rest: []u8) Error!packet.OpenedShort {
+        const app = self.accepted.application orelse return error.KeysUnavailable;
+        const dir = self.app_keys orelse return error.KeysUnavailable;
+
+        const server = crypto.nextSecret(app.server);
+        const opened = try packet.openShort(
+            scratch,
+            rest,
+            self.our_cid_len,
+            crypto.updatedKeys(server, dir.recv.hp),
+            self.app_received.largest(),
+        );
+        // These keys are the other phase by construction, so a packet that
+        // opens under them and claims the phase we are already in is a peer
+        // that has updated twice without waiting for us.
+        if (opened.key_phase == self.key_phase) return error.KeyUpdateError;
+
+        const client = crypto.nextSecret(app.client);
+        self.accepted.application = .{ .client = client, .server = server };
+        self.prev_recv = dir.recv;
+        self.app_keys = .{
+            .send = crypto.updatedKeys(client, dir.send.hp),
+            .recv = crypto.updatedKeys(server, dir.recv.hp),
+        };
+        self.key_phase = opened.key_phase;
+        return opened;
+    }
+
     /// Frames from a 1-RTT packet.
     fn appFrames(self: *Handshaker, payload: []const u8) Error!void {
         var it = frame.Iterator.init(payload);
         while (try it.next()) |f| {
-            if (frame.isAckEliciting(f)) self.app_received.ack_eliciting = true;
             switch (f) {
                 .ack => |a| try self.recordAck(.application, a),
                 .stream => |s| {
@@ -535,14 +664,45 @@ pub const Handshaker = struct {
                 .max_stream_data => |m| {
                     if (m.id == stream.first_client_bidi) self.send_stream.extend(m.max);
                 },
-                .handshake_done => self.confirmed = true,
+                .handshake_done => {
+                    self.confirmed = true;
+                    // Only now may the application space be probed: before it,
+                    // an acknowledgement might not be readable by either side.
+                    // Source: RFC 9002 s6.2.1.
+                    self.recovery.confirmed = true;
+                    // Nothing in the handshake spaces can be acknowledged from
+                    // here, so their timers and in-flight bytes go. radish
+                    // keeps the keys themselves, having no reason to drop them.
+                    // Source: RFC 9002 s6.4.
+                    self.recovery.discard(.initial);
+                    self.recovery.discard(.handshake);
+                },
                 .path_challenge => |c| self.path_challenge = c,
                 .connection_close => |c| {
                     self.closed = .from(c);
                     return error.PeerClosed;
                 },
+                .ignored => |i| switch (i.kind) {
+                    // Only stream 0 is ever open, so a reset naming another id
+                    // is about a stream that never existed here.
+                    // Source: RFC 9000 s19.4.
+                    .reset_stream => if (i.about(stream.first_client_bidi)) {
+                        self.stream.reset = true;
+                    },
+                    // The peer is out of credit and saying so, which earns a
+                    // grant even when the reader has not freed enough for one.
+                    // Source: RFC 9000 s19.12, s19.13.
+                    .data_blocked => self.grant_asked = true,
+                    .stream_data_blocked => if (i.about(stream.first_client_bidi)) {
+                        self.grant_asked = true;
+                    },
+                    else => {},
+                },
                 else => {},
             }
+            // Only once the frame is in: a frame we then refused takes the
+            // packet with it, and there is nothing to acknowledge.
+            if (frame.isAckEliciting(f)) self.app_received.ack_eliciting = true;
         }
     }
 
@@ -559,15 +719,20 @@ pub const Handshaker = struct {
         try self.sender.sent(pn, data, fin);
         try self.send_data.take(data.len);
         try self.send_stream.take(data.len);
-        return n;
+        return self.tracked(.application, pn, n);
     }
 
-    /// Sends the oldest unacknowledged chunk again, under a fresh packet
-    /// number, or null when the peer has acknowledged everything.
-    /// Source: RFC 9000 s13.3.
-    pub fn resendStream(self: *Handshaker, out: []u8) Error!?usize {
+    /// Sends an unacknowledged chunk again, under a fresh packet number, or
+    /// null when there is nothing to send. Successive calls work through what
+    /// is outstanding; `force` starts from the oldest again whether or not it
+    /// has already been tried, which is what a probe needs.
+    /// Source: RFC 9000 s13.3, RFC 9002 s6.2.4.
+    pub fn resendStream(self: *Handshaker, out: []u8, force: bool) Error!?usize {
         self.sender.ack(&self.app_acked);
-        const chunk = self.sender.unacked() orelse return null;
+        const chunk = (if (force)
+            self.sender.oldestUnacked()
+        else
+            self.sender.unacked()) orelse return null;
 
         const pn = self.takePacketNumber(.application);
         const n = try self.sealStreamAt(
@@ -578,7 +743,8 @@ pub const Handshaker = struct {
             chunk.fin,
         );
         chunk.pn = pn;
-        return n;
+        chunk.resent = true;
+        return self.tracked(.application, pn, n);
     }
 
     fn sealStreamAt(
@@ -603,6 +769,7 @@ pub const Handshaker = struct {
             .dcid = self.accepted.scid(),
             .pn = pn,
             .pn_len = packet.max_pn_len,
+            .key_phase = self.key_phase,
         }, pw.buffered(), keys);
     }
 
@@ -620,6 +787,7 @@ pub const Handshaker = struct {
             .dcid = self.accepted.scid(),
             .pn = self.takePacketNumber(.application),
             .pn_len = packet.max_pn_len,
+            .key_phase = self.key_phase,
         }, pw.buffered(), keys);
     }
 
@@ -632,11 +800,14 @@ pub const Handshaker = struct {
         var pw = std.Io.Writer.fixed(&payload);
         codec.writeVarint(&pw, @backingInt(frame.Type.ping)) catch return error.BufferTooSmall;
 
-        return packet.sealShort(out, .{
+        const pn = self.takePacketNumber(.application);
+        const n = try packet.sealShort(out, .{
             .dcid = self.accepted.scid(),
-            .pn = self.takePacketNumber(.application),
+            .pn = pn,
             .pn_len = packet.max_pn_len,
+            .key_phase = self.key_phase,
         }, pw.buffered(), keys);
+        return self.tracked(.application, pn, n);
     }
 
     /// When the connection dies without traffic: the lower of the two
@@ -652,13 +823,22 @@ pub const Handshaker = struct {
         return @min(self.send_data.room(), self.send_stream.room());
     }
 
+    /// Whether the last grant is neither acknowledged nor still in flight,
+    /// which leaves loss as the only explanation for it.
+    fn grantLost(self: *const Handshaker) bool {
+        const pn = self.grant_pn orelse return false;
+        if (self.app_acked.contains(pn)) return false;
+        return !self.recovery.outstanding(.application, pn);
+    }
+
     /// Raises the peer's limits once the reader has freed enough of the buffer,
     /// or null when there is nothing worth sending. One stream, so the
     /// connection limit and the stream limit move together.
     /// Source: RFC 9000 s4.1.
     pub fn sealMaxData(self: *Handshaker, out: []u8) Error!?usize {
         const keys = (self.app_keys orelse return error.HandshakeIncomplete).send;
-        if (!self.stream.wantsGrant()) return null;
+        if (!self.stream.wantsGrant() and !self.grant_asked and !self.grantLost()) return null;
+        self.grant_asked = false;
         const grant = self.stream.grant();
 
         // MAX_STREAM_DATA is a type and two varints, MAX_DATA a type and one.
@@ -670,13 +850,18 @@ pub const Handshaker = struct {
         }) catch return error.BufferTooSmall;
         frame.writeMaxData(&pw, grant) catch return error.BufferTooSmall;
 
+        const pn = self.takePacketNumber(.application);
         const n = try packet.sealShort(out, .{
             .dcid = self.accepted.scid(),
-            .pn = self.takePacketNumber(.application),
+            .pn = pn,
             .pn_len = packet.max_pn_len,
+            .key_phase = self.key_phase,
         }, pw.buffered(), keys);
+        // Extended now, not on the acknowledgement: the peer may use the grant
+        // as soon as it reads it, and data past our own limit is a violation.
         self.stream.window.extend(grant);
-        return n;
+        self.grant_pn = pn;
+        return self.tracked(.application, pn, n);
     }
 
     /// A PATH_RESPONSE echoing the challenge the peer sent, sealed as 1-RTT.
@@ -695,9 +880,10 @@ pub const Handshaker = struct {
             .dcid = self.accepted.scid(),
             .pn = pn,
             .pn_len = packet.max_pn_len,
+            .key_phase = self.key_phase,
         }, pw.buffered(), keys);
         self.path_challenge = null;
-        return n;
+        return self.tracked(.application, pn, n);
     }
 
     /// Sends the ClientHello again under a fresh packet number. A lost packet is
@@ -727,10 +913,21 @@ pub const Handshaker = struct {
         if (payload_len > payload.len) return error.BufferTooSmall;
         pw.splatByteAll(0, payload_len - frames_len) catch return error.BufferTooSmall;
 
-        return packet.seal(out, build, pw.buffered(), self.initial_keys.send);
+        const n = try packet.seal(out, build, pw.buffered(), self.initial_keys.send);
+        return self.tracked(.initial, build.pn, n);
     }
 
-    pub fn received(self: *Handshaker, space: Space) *frame.Received {
+    /// Hands a packet about to go out to loss detection and the congestion
+    /// window, and passes its length back through. Only ack-eliciting packets
+    /// are worth this: an ACK or a CONNECTION_CLOSE is never repeated and never
+    /// counted against the window.
+    /// Source: RFC 9002 s2, s7.
+    fn tracked(self: *Handshaker, space: packet.Space, pn: u64, n: usize) usize {
+        self.recovery.onSent(space, pn, n, self.now_ms);
+        return n;
+    }
+
+    pub fn received(self: *Handshaker, space: packet.Space) *frame.Received {
         return switch (space) {
             .initial => &self.initial_received,
             .handshake => &self.handshake_received,
@@ -738,7 +935,7 @@ pub const Handshaker = struct {
         };
     }
 
-    pub fn acked(self: *Handshaker, space: Space) *frame.NumberSet {
+    pub fn acked(self: *Handshaker, space: packet.Space) *frame.NumberSet {
         return switch (space) {
             .initial => &self.initial_acked,
             .handshake => &self.handshake_acked,
@@ -750,22 +947,48 @@ pub const Handshaker = struct {
     /// actually sent, which also catches an acknowledgement of a packet that
     /// never existed.
     /// Source: RFC 9000 s13.1.
-    fn recordAck(self: *Handshaker, space: Space, a: frame.Ack) Error!void {
+    fn recordAck(self: *Handshaker, space: packet.Space, a: frame.Ack) Error!void {
         const next = self.nextPacketNumber(space).*;
         if (a.largest >= next) return error.ProtocolViolation;
 
         const set = self.acked(space);
         var pn = (try a.firstRange()).smallest;
-        while (pn < next and pn <= a.largest) : (pn += 1) set.record(pn);
+        while (pn < next and pn <= a.largest) : (pn += 1) {
+            set.record(pn);
+            self.recovery.acked(space, pn);
+        }
 
         var it = try a.ranges();
         while (try it.next()) |r| {
             pn = r.smallest;
-            while (pn <= r.largest) : (pn += 1) set.record(pn);
+            while (pn <= r.largest) : (pn += 1) {
+                set.record(pn);
+                self.recovery.acked(space, pn);
+            }
+        }
+
+        if (self.recovery.onAck(space, a.largest, self.ackDelayMs(a.delay), self.now_ms).any()) {
+            self.lost = true;
         }
     }
 
-    fn nextPacketNumber(self: *Handshaker, space: Space) *u64 {
+    /// An ACK's delay field in milliseconds. It arrives as microseconds scaled
+    /// down by the exponent the peer advertised, so scaling it back up is what
+    /// recovers the value it meant.
+    /// Source: RFC 9000 s19.3.
+    fn ackDelayMs(self: *const Handshaker, delay: u64) u64 {
+        const scaled = delay *| (@as(u64, 1) << self.peer_ack_exponent);
+        return scaled / std.time.us_per_ms;
+    }
+
+    /// Whether loss detection has found something since the caller last asked.
+    /// Repairing it is the caller's: only it can put bytes back on the wire.
+    pub fn takeLost(self: *Handshaker) bool {
+        defer self.lost = false;
+        return self.lost;
+    }
+
+    fn nextPacketNumber(self: *Handshaker, space: packet.Space) *u64 {
         return switch (space) {
             .initial => &self.next_initial_pn,
             .handshake => &self.next_handshake_pn,
@@ -774,7 +997,7 @@ pub const Handshaker = struct {
     }
 
     /// Consumes the next packet number in `space`.
-    fn takePacketNumber(self: *Handshaker, space: Space) u64 {
+    fn takePacketNumber(self: *Handshaker, space: packet.Space) u64 {
         const slot = self.nextPacketNumber(space);
         defer slot.* += 1;
         return slot.*;
@@ -784,19 +1007,27 @@ pub const Handshaker = struct {
     /// there is waiting to be acknowledged. Sent in the same space it covers,
     /// under that space's own keys.
     /// Source: RFC 9000 s13.2.
-    pub fn sealAck(self: *Handshaker, out: []u8, space: Space) Error!?usize {
+    pub fn sealAck(self: *Handshaker, out: []u8, space: packet.Space) Error!?usize {
         const tracker = self.received(space);
         if (!tracker.ack_eliciting) return null;
-        const pn = self.takePacketNumber(space);
 
         var payload: [min_initial_datagram]u8 = undefined;
         var pw = std.Io.Writer.fixed(&payload);
         // Zero delay: measuring it needs a clock, and a peer only uses it to
         // refine an RTT estimate.
-        tracker.writeAck(&pw, 0) catch |e| return switch (e) {
-            error.NothingToAck => null,
-            else => error.BufferTooSmall,
+        tracker.writeAck(&pw, 0) catch |e| switch (e) {
+            // Nothing to name, so whatever set the flag never made it into the
+            // set. Cleared, or every turn from here comes back for a packet
+            // number and sends nothing.
+            error.NothingToAck => {
+                tracker.ack_eliciting = false;
+                return null;
+            },
+            else => return error.BufferTooSmall,
         };
+        // Taken only once there is a packet to spend it on: a number consumed
+        // and not sent is a gap the peer reads as loss.
+        const pn = self.takePacketNumber(space);
 
         const build: packet.Build = .{
             .kind = if (space == .initial) .initial else .handshake,
@@ -823,6 +1054,7 @@ pub const Handshaker = struct {
                 .dcid = self.accepted.scid(),
                 .pn = pn,
                 .pn_len = packet.max_pn_len,
+                .key_phase = self.key_phase,
             }, pw.buffered(), (self.app_keys orelse return error.KeysUnavailable).send),
         };
         tracker.ack_eliciting = false;
@@ -839,7 +1071,6 @@ pub const Handshaker = struct {
 
         var it = frame.Iterator.init(opened.payload);
         while (try it.next()) |f| {
-            if (frame.isAckEliciting(f)) tracker.ack_eliciting = true;
             switch (f) {
                 .ack => |a| try self.recordAck(if (kind == .initial) .initial else .handshake, a),
                 .crypto => |c| {
@@ -852,6 +1083,7 @@ pub const Handshaker = struct {
                 },
                 else => {},
             }
+            if (frame.isAckEliciting(f)) tracker.ack_eliciting = true;
         }
     }
 
@@ -1020,13 +1252,14 @@ pub const Handshaker = struct {
         var fw = std.Io.Writer.fixed(&frame_buf);
         writeCryptoFrame(&fw, 0, flight) catch return error.BufferTooSmall;
 
-        return packet.seal(out, .{
+        const n = try packet.seal(out, .{
             .kind = .handshake,
             .dcid = self.accepted.scid(),
             .scid = self.our_scid[0..self.our_cid_len],
             .pn = pn,
             .pn_len = packet.max_pn_len,
         }, fw.buffered(), crypto.keysFromSecret(hs.client));
+        return self.tracked(.handshake, pn, n);
     }
 
     /// Checks the peer's signature over the transcript through Certificate.
@@ -1119,6 +1352,21 @@ pub const Handshaker = struct {
             // covers streams we open ourselves.
             // Source: RFC 9000 s18.2.
             .max_idle_timeout => self.peer_idle_ms = try varintParam(p.value),
+            // What a lost connection will be proved with, and how long the peer
+            // may sit on an acknowledgement before sending it.
+            // Source: RFC 9000 s10.3, s13.2.1.
+            .stateless_reset_token => {
+                if (p.value.len != 16) return error.TransportParameterError;
+                self.peer_reset_token = p.value[0..16].*;
+            },
+            .max_ack_delay => self.recovery.peer_max_ack_delay_ms = try varintParam(p.value),
+            .ack_delay_exponent => {
+                const e = try varintParam(p.value);
+                // Anything larger would scale a delay past any real time.
+                // Source: RFC 9000 s18.2.
+                if (e > 20) return error.TransportParameterError;
+                self.peer_ack_exponent = @intCast(e);
+            },
             .initial_max_data => self.send_data.extend(try varintParam(p.value)),
             .initial_max_stream_data_bidi_remote => {
                 self.send_stream.extend(try varintParam(p.value));
@@ -1558,6 +1806,33 @@ test "stream data survives a 1-RTT round trip" {
     var it = frame.Iterator.init(seen.payload);
     try testing.expectEqual(@as(u64, 14), (try it.next()).?.max_stream_data.max);
     try testing.expectEqual(@as(u64, 14), (try it.next()).?.max_data);
+
+    // Our limit moved when the grant went out, so `wantsGrant` will not ask
+    // again: if that packet was lost, only this sends the peer another.
+    const lost_pn = h.grant_pn.?;
+    _ = h.recovery.tracker(.application).take(lost_pn);
+    try testing.expect((try h.sealMaxData(&grant)) != null);
+    try testing.expect(h.grant_pn.? != lost_pn);
+
+    // Acknowledged, so there is nothing owed on it.
+    h.app_acked.record(h.grant_pn.?);
+    _ = h.recovery.tracker(.application).take(h.grant_pn.?);
+    try testing.expectEqual(@as(?usize, null), try h.sealMaxData(&grant));
+}
+
+test "an ACK's delay is scaled by the exponent the peer advertised" {
+    const dcid = hex(testdata.other_dcid);
+    var bufs: TestBufs = .{};
+    var h = testHandshaker(&dcid, &bufs);
+
+    // The default exponent is 3, so a unit is 8 microseconds.
+    try testing.expectEqual(@as(u64, 8), h.ackDelayMs(1000));
+    h.peer_ack_exponent = 0;
+    try testing.expectEqual(@as(u64, 1), h.ackDelayMs(1000));
+
+    // A delay no clock could mean saturates rather than wrapping to nothing.
+    h.peer_ack_exponent = 20;
+    try testing.expect(h.ackDelayMs(std.math.maxInt(u64)) > 0);
 }
 
 test "unacknowledged stream data goes again under a new number" {
@@ -1572,7 +1847,7 @@ test "unacknowledged stream data goes again under a new number" {
 
     var out: [256]u8 = undefined;
     _ = try h.sealStream(&out, "hello", false);
-    const again = (try h.resendStream(&out)).?;
+    const again = (try h.resendStream(&out, false)).?;
 
     // Same offset and bytes, a number the first packet did not use.
     var opened: [256]u8 = undefined;
@@ -1585,9 +1860,15 @@ test "unacknowledged stream data goes again under a new number" {
     try testing.expectEqual(@as(u64, 0), s.offset);
     try testing.expectEqualSlices(u8, "hello", s.data);
 
+    // A repair has nothing left to try until an acknowledgement says
+    // otherwise, though a probe would still send the chunk again.
+    try testing.expectEqual(@as(?usize, null), try h.resendStream(&out, false));
+    try testing.expect(try h.resendStream(&out, true) != null);
+
     // Acknowledging the resend retires the chunk, so nothing is owed.
-    h.app_acked.record(1);
-    try testing.expectEqual(@as(?usize, null), try h.resendStream(&out));
+    h.app_acked.record(2);
+    try testing.expectEqual(@as(?usize, null), try h.resendStream(&out, false));
+    try testing.expectEqual(@as(?usize, null), try h.resendStream(&out, true));
     try testing.expectEqual(@as(u64, 5), h.sender.base);
 }
 
@@ -1699,6 +1980,23 @@ test "acknowledges an Initial the server can open" {
 
     // The debt is settled, so a second call owes nothing.
     try testing.expectEqual(@as(?usize, null), try h.sealAck(&out, .initial));
+}
+
+// A packet whose frames are refused is dropped without its number being
+// recorded, which can leave the flag set over an empty set. Spending a number
+// on that every turn sends nothing and runs our numbers away from the peer's.
+test "an ack-eliciting flag with nothing behind it clears instead of spending a number" {
+    const dcid = hex(testdata.other_dcid);
+    var bufs: TestBufs = .{};
+    var h = testHandshaker(&dcid, &bufs);
+
+    const before = h.next_initial_pn;
+    h.received(.initial).ack_eliciting = true;
+
+    var out: [max_initial_datagram]u8 = undefined;
+    try testing.expectEqual(@as(?usize, null), try h.sealAck(&out, .initial));
+    try testing.expect(!h.received(.initial).ack_eliciting);
+    try testing.expectEqual(before, h.next_initial_pn);
 }
 
 test "retransmitting the ClientHello uses a fresh packet number" {

@@ -7,6 +7,8 @@ const std = @import("std");
 
 const dial = @import("../net/dial.zig");
 const client = @import("client.zig");
+const packet = @import("packet.zig");
+const recovery = @import("recovery.zig");
 const stream = @import("stream.zig");
 const tls = @import("tls.zig");
 
@@ -18,6 +20,28 @@ pub const Error = error{
     SendStalled,
     HandshakeUnconfirmed,
 } || client.Error;
+
+/// Where the connection reads time. A test supplies its own so a timer can be
+/// driven to expiry without waiting for it.
+pub const Clock = union(enum) {
+    /// The monotonic system clock.
+    awake,
+    /// Milliseconds, moved by whoever owns the value.
+    fixed: *const u64,
+
+    pub fn nowMs(self: Clock, io: std.Io) u64 {
+        return switch (self) {
+            .awake => ms(std.Io.Timestamp.now(io, .awake)),
+            .fixed => |at| at.*,
+        };
+    }
+
+    fn ms(t: std.Io.Timestamp) u64 {
+        // Clamped: the epoch is unspecified, and a negative timestamp would
+        // otherwise be a panic rather than an early one.
+        return @intCast(@max(0, @divTrunc(t.nanoseconds, std.time.ns_per_ms)));
+    }
+};
 
 pub const Options = struct {
     host: []const u8,
@@ -31,12 +55,15 @@ pub const Options = struct {
     /// sees us as.
     identity: Ed25519.KeyPair,
     server_name: ?[]const u8 = null,
+    /// How often the connection hands control back, whatever the timers say.
     timeout_ms: u64 = 3000,
     /// Datagrams to read before giving up on whatever we are waiting for.
     max_datagrams: usize = 6,
-    /// Resends of an unacknowledged flight before giving up. Each flight has
-    /// its own budget.
+    /// Consecutive probe timeouts before the connection is written off. Each
+    /// waits twice as long, so this is seconds, not the whole idle timeout.
+    /// Source: RFC 9002 s6.2.1.
     max_retries: usize = 2,
+    clock: Clock = .awake,
     /// Where to write every datagram that arrives, as hex, one per line. For
     /// recording an exchange as a test fixture.
     capture: ?*std.Io.Writer = null,
@@ -54,18 +81,16 @@ pub const Conn = struct {
     /// Our handshake flight, for the same reason.
     flight: ?[]const u8 = null,
     flight_out: bool = false,
-    initial_retries: usize = 0,
-    flight_retries: usize = 0,
-    /// Consecutive resends of stream data, reset by anything arriving. A
-    /// connection that lives on needs a budget that refills, unlike the
-    /// handshake's one-shot ones.
-    stream_retries: usize = 0,
-    /// How long the connection has been quiet, counted in receive timeouts,
-    /// which is the only clock this has.
-    quiet_ms: u64 = 0,
-    /// `quiet_ms` as of the last keepalive, so sending one does not erase the
-    /// silence the idle timeout is measured against.
-    pinged_ms: u64 = 0,
+    /// The clock as of this turn, which every deadline below is measured
+    /// against. Refreshed whenever the connection acts.
+    now_ms: u64 = 0,
+    /// When a datagram last opened, which the idle timeout runs from.
+    last_arrival_ms: u64 = 0,
+    /// When the stream last moved. A peer that answers but sends nothing keeps
+    /// the connection alive, so only this notices a stuck transfer.
+    last_stream_ms: u64 = 0,
+    /// When we last sent a keepalive, which does not count as being busy.
+    last_ping_ms: u64 = 0,
 
     /// Bytes in the Initial datagram, and what has come back since.
     sent: usize = 0,
@@ -132,6 +157,9 @@ pub const Conn = struct {
         self.sock = try local.bind(io, .{ .mode = .dgram });
         self.hello = initial.client_hello;
         self.sent = initial.len;
+        self.now_ms = opts.clock.nowMs(io);
+        self.last_arrival_ms = self.now_ms;
+        self.last_stream_ms = self.now_ms;
         self.hs = client.Handshaker.init(.{
             .original_dcid = opts.dcid,
             .our_scid = opts.dcid,
@@ -145,6 +173,10 @@ pub const Conn = struct {
         // Both fields hold something from here on, whatever the send does.
         self.ready = true;
         self.sock_open = true;
+        self.hs.now_ms = self.now_ms;
+        // The ClientHello is packet 0 of the Initial space and carries CRYPTO,
+        // so it is what the first probe timeout waits on.
+        self.hs.recovery.onSent(.initial, 0, initial.len, self.now_ms);
 
         try self.sock.send(io, &self.addr, datagram[0..initial.len]);
     }
@@ -159,7 +191,10 @@ pub const Conn = struct {
     pub fn close(self: *Conn) void {
         if (!self.sock_open) return;
         self.sock_open = false;
-        if (self.hs.app_keys != null and self.hs.closed == null) {
+        // A peer that reset us holds nothing to release, and would answer a
+        // goodbye with another reset.
+        // Source: RFC 9000 s10.3.
+        if (self.hs.app_keys != null and self.hs.closed == null and !self.hs.stateless_reset) {
             var out: [client.max_initial_datagram]u8 = undefined;
             if (self.hs.sealClose(&out, "done") catch null) |n| {
                 self.sock.send(self.io, &self.addr, out[0..n]) catch {};
@@ -211,30 +246,43 @@ pub const Conn = struct {
         self.datagrams += 1;
         self.received += arrived.len;
         self.last = arrived;
-        self.stream_retries = 0;
-        self.quiet_ms = 0;
-        self.pinged_ms = 0;
+        self.now_ms = self.opts.clock.nowMs(self.io);
+        self.hs.now_ms = self.now_ms;
         if (self.opts.capture) |w| {
             w.print("{x}\n", .{arrived}) catch {};
             w.flush() catch {};
         }
 
+        // The furthest byte the peer has sent, not what the reader has taken:
+        // this is about the transfer moving, not about who is draining it.
+        const before = self.hs.stream.highest;
         if (arrived.len > self.work.len) {
             self.last_err = error.DatagramTooLarge;
         } else {
             @memcpy(self.work[0..arrived.len], arrived);
-            self.hs.push(&self.plain, self.work[0..arrived.len]) catch |e| {
+            if (self.hs.push(&self.plain, self.work[0..arrived.len])) {
+                // Only a datagram that opened counts as the peer still being
+                // there. Anything can be sent at us, and garbage that reset the
+                // idle timeout would hold the connection open forever.
+                // Source: RFC 9000 s10.1.
+                self.last_arrival_ms = self.now_ms;
+                // Whatever went wrong before this is not what a later stall is
+                // about, and reporting it there points at the wrong thing.
+                self.last_err = null;
+            } else |e| {
                 self.last_err = e;
                 // A close is the end of the connection, so reading on would
-                // only overwrite the reason with the next datagram.
-                if (e == error.PeerClosed) return .closed;
-            };
+                // only overwrite the reason with the next datagram. A stateless
+                // reset is the same ending without the courtesy.
+                if (e == error.PeerClosed or e == error.StatelessReset) return .closed;
+            }
         }
+        if (self.hs.stream.highest != before) self.last_stream_ms = self.now_ms;
 
         // Acknowledge before reading on: an unacknowledged flight makes the
         // peer retransmit it, and the ACK is what ends that.
         var out: [client.max_initial_datagram]u8 = undefined;
-        for ([_]client.Handshaker.Space{ .initial, .handshake, .application }) |space| {
+        for ([_]packet.Space{ .initial, .handshake, .application }) |space| {
             const n = try self.hs.sealAck(&out, space) orelse continue;
             self.sock.send(self.io, &self.addr, out[0..n]) catch {};
         }
@@ -268,60 +316,137 @@ pub const Conn = struct {
             };
             self.flight_out = true;
         }
+
+        // An ACK can reveal that something earlier never landed. Repairing it
+        // now beats waiting for a timer that is only there for silence.
+        if (self.hs.takeLost()) _ = self.repair(&out, false);
         return .arrived;
     }
 
-    /// Waits for a datagram, resending whatever is outstanding while nothing
-    /// comes. Not RFC 9002 loss recovery: nothing measures a round trip or
-    /// backs off, which is enough to survive a dropped flight and no more.
+    /// Waits for a datagram, doing what the clock owes while nothing comes.
+    /// Null when there is nothing left to wait for, or once a tick has gone by
+    /// so the caller can look around.
     fn receive(self: *Conn) ?[]const u8 {
+        const started = self.opts.clock.nowMs(self.io);
         while (true) {
-            if (self.sock.receiveTimeout(self.io, &self.datagram, .{ .duration = .{
-                .raw = .fromNanoseconds(@intCast(self.opts.timeout_ms * std.time.ns_per_ms)),
-                .clock = .awake,
-            } })) |got| {
-                return got.data;
-            } else |_| {
-                var out: [client.max_initial_datagram]u8 = undefined;
-                const n = self.retransmit(&out) orelse return null;
-                self.sock.send(self.io, &self.addr, out[0..n]) catch return null;
+            self.now_ms = self.opts.clock.nowMs(self.io);
+            const wait_ms = self.waitMs();
+            if (wait_ms > 0) {
+                if (self.sock.receiveTimeout(self.io, &self.datagram, .{ .duration = .{
+                    .raw = .fromNanoseconds(@intCast(wait_ms * std.time.ns_per_ms)),
+                    .clock = .awake,
+                } })) |got| {
+                    return got.data;
+                } else |_| {}
+                self.now_ms = self.opts.clock.nowMs(self.io);
             }
+            if (!self.onTimeout()) return null;
+            if (self.now_ms -| started >= self.opts.timeout_ms) return null;
         }
     }
 
-    /// The packet to send again after silence, or null when there is nothing
-    /// outstanding or the budget is spent.
-    fn retransmit(self: *Conn, out: []u8) ?usize {
-        if (self.hs.confirmed) {
-            // Each timeout is one tick of the only clock we have, whatever we
-            // end up sending, so that the silence adds up.
-            self.quiet_ms += self.opts.timeout_ms;
-            // Past the idle timeout the peer has dropped us, so there is
-            // nothing left to resend to.
-            if (self.quiet_ms >= self.hs.idleTimeoutMs()) return null;
-            if (self.stream_retries >= self.opts.max_retries) return null;
-            if (self.hs.resendStream(out) catch null) |n| {
-                self.stream_retries += 1;
-                return n;
+    /// How long to sit in the next read: until the earliest thing owed, and
+    /// never past one tick.
+    fn waitMs(self: *const Conn) u64 {
+        var wait = self.opts.timeout_ms;
+        if (self.hs.recovery.timer()) |t| wait = @min(wait, t.afterMs(self.now_ms));
+
+        // Deadlines too, so neither rests on a tick being shorter than they are.
+        const idle = self.hs.idleTimeoutMs();
+        const quiet = self.now_ms -| self.last_arrival_ms;
+        wait = @min(wait, idle -| quiet);
+        if (self.hs.app_keys != null) {
+            const since_ping = self.now_ms -| @max(self.last_arrival_ms, self.last_ping_ms);
+            wait = @min(wait, (idle / 2) -| since_ping);
+        }
+        return wait;
+    }
+
+    /// The recovery timer, if it is already due.
+    fn due(self: *const Conn) ?recovery.Timer {
+        const t = self.hs.recovery.timer() orelse return null;
+        return if (t.afterMs(self.now_ms) == 0) t else null;
+    }
+
+    /// Acts on the silence so far. False when the connection is finished with:
+    /// the peer has stopped answering, or probing has run out of attempts.
+    /// Source: RFC 9002 s6.1.2, s6.2.4.
+    fn onTimeout(self: *Conn) bool {
+        self.now_ms = self.opts.clock.nowMs(self.io);
+        self.hs.now_ms = self.now_ms;
+        // Past the idle timeout there is nothing left to resend to.
+        if (self.stalled()) return false;
+
+        var out: [client.max_initial_datagram]u8 = undefined;
+        if (self.due()) |t| {
+            switch (t.kind) {
+                // The reordering window passed, so what it held open is lost.
+                .loss => _ = self.hs.recovery.onLossTimer(t.space, self.now_ms),
+                // Nothing acknowledged for a whole probe timeout. A run of
+                // them means the peer is not there.
+                .probe => {
+                    self.hs.recovery.onProbe();
+                    if (self.hs.recovery.backoff > self.opts.max_retries) return false;
+                },
             }
-            // Nothing outstanding, so the silence is just a quiet connection.
-            // Past half the idle timeout, a PING keeps the peer from dropping
-            // us.
-            if (self.quiet_ms - self.pinged_ms < self.hs.idleTimeoutMs() / 2) return null;
-            self.pinged_ms = self.quiet_ms;
-            return self.hs.sealPing(out) catch null;
+            if (self.repair(&out, t.kind == .probe)) return true;
+        }
+        _ = self.keepalive(&out);
+        return true;
+    }
+
+    /// Sends whatever is outstanding again under a fresh packet number, and
+    /// whether anything was. `probing` must put something on the wire even if
+    /// all of it has already been tried.
+    /// Source: RFC 9000 s13.3, RFC 9002 s6.2.4.
+    fn repair(self: *Conn, out: []u8, probing: bool) bool {
+        if (self.hs.confirmed) {
+            self.now_ms = self.opts.clock.nowMs(self.io);
+            self.hs.now_ms = self.now_ms;
+            // A burst of loss in one go rather than a chunk per timeout. Each
+            // chunk goes at most once per acknowledgement, so this ends.
+            var sent = false;
+            for (0..stream.Sender.max_chunks) |_| {
+                if (!self.hs.recovery.canSend(client.min_initial_datagram)) break;
+                const n = self.hs.resendStream(out, false) catch null orelse break;
+                if (!self.emit(out[0..n])) break;
+                sent = true;
+            }
+            if (sent) return true;
+            // Nothing fresh to repair. A probe still has to carry something,
+            // so the oldest goes again. A probe may exceed the window.
+            // Source: RFC 9002 s7.5.
+            if (!probing) return false;
+            const n = self.hs.resendStream(out, true) catch null orelse return false;
+            return self.emit(out[0..n]);
         }
         if (self.flight) |f| {
-            if (self.flight_retries >= self.opts.max_retries) return null;
-            self.flight_retries += 1;
-            return self.hs.sealFlight(out, f) catch null;
+            const n = self.hs.sealFlight(out, f) catch null orelse return false;
+            return self.emit(out[0..n]);
         }
         // An acknowledged Initial arrived, so silence is about something else
         // and resending would only add noise.
-        if (self.initial_retries >= self.opts.max_retries) return null;
-        if (self.hs.acked(.initial).contains(0)) return null;
-        self.initial_retries += 1;
-        return self.hs.sealInitialRetransmit(out, self.hello) catch null;
+        if (self.hs.acked(.initial).contains(0)) return false;
+        const n = self.hs.sealInitialRetransmit(out, self.hello) catch null orelse return false;
+        return self.emit(out[0..n]);
+    }
+
+    /// A PING once the connection has been quiet for half of what the peer will
+    /// put up with, which leaves room for a second before it gives up on us.
+    /// Whether one went out.
+    /// Source: RFC 9000 s10.1.
+    fn keepalive(self: *Conn, out: []u8) bool {
+        if (self.hs.app_keys == null) return false;
+        const since = self.now_ms -| @max(self.last_arrival_ms, self.last_ping_ms);
+        if (since < self.hs.idleTimeoutMs() / 2) return false;
+        self.last_ping_ms = self.now_ms;
+        const n = self.hs.sealPing(out) catch null orelse return false;
+        return self.emit(out[0..n]);
+    }
+
+    fn emit(self: *Conn, datagram: []const u8) bool {
+        self.sock.send(self.io, &self.addr, datagram) catch return false;
+        return true;
     }
 
     /// Sends `data` on the stream, split across as many packets as it takes.
@@ -337,12 +462,16 @@ pub const Conn = struct {
                 client.max_stream_chunk,
                 @min(self.hs.sendRoom(), self.hs.sender.room()),
             );
-            if (room == 0) {
+            // The peer's windows say what it will hold. The congestion window
+            // says what the path will carry, counted as a whole datagram,
+            // since that is what goes out and what the window is measured in.
+            // Source: RFC 9002 s7.
+            if (room == 0 or !self.hs.recovery.canSend(client.min_initial_datagram)) {
                 switch (try self.service()) {
                     .arrived => {},
                     // A peer that has closed will never take more, so the room
                     // we are waiting for is not coming.
-                    .closed => return error.PeerClosed,
+                    .closed => return if (self.wasReset()) error.StatelessReset else error.PeerClosed,
                     .silent => return error.SendStalled,
                 }
                 continue;
@@ -350,6 +479,10 @@ pub const Conn = struct {
 
             const take = @min(rest.len, room);
             var out: [client.max_initial_datagram]u8 = undefined;
+            // Stamped with the clock as of now: what a packet is sent at is
+            // what its round trip is later measured against.
+            self.now_ms = self.opts.clock.nowMs(self.io);
+            self.hs.now_ms = self.now_ms;
             const n = try self.hs.sealStream(&out, rest[0..take], fin and take == rest.len);
             try self.sock.send(self.io, &self.addr, out[0..n]);
 
@@ -369,10 +502,37 @@ pub const Conn = struct {
         return self.hs.stream.done();
     }
 
+    /// Whether the peer abandoned its half of the stream.
+    pub fn streamReset(self: *const Conn) bool {
+        return self.ready and self.hs.stream.reset;
+    }
+
+    /// Whether the peer proved it has thrown away this connection. Nothing more
+    /// can be sent on it, not even a goodbye.
+    /// Source: RFC 9000 s10.3.
+    pub fn wasReset(self: *const Conn) bool {
+        return self.ready and self.hs.stateless_reset;
+    }
+
     /// Whether the silence has run past what the peer said it would wait, at
     /// which point it has dropped us and nothing more is coming.
     pub fn stalled(self: *const Conn) bool {
-        return self.ready and self.quiet_ms >= self.hs.idleTimeoutMs();
+        return self.ready and self.now_ms -| self.last_arrival_ms >= self.hs.idleTimeoutMs();
+    }
+
+    /// Whether the stream has stopped moving for as long as the peer would
+    /// wait, which is a transfer that will not finish even though the
+    /// connection is alive: a peer blocked on something it will not get keeps
+    /// pinging, so `stalled` never fires on its own.
+    pub fn streamStalled(self: *const Conn) bool {
+        return self.ready and self.now_ms -| self.last_stream_ms >= self.hs.idleTimeoutMs();
+    }
+
+    /// What the last datagram went wrong with. `service` records these rather
+    /// than raising them, since one unreadable datagram is not the end of the
+    /// connection. A stall afterwards usually has its reason here.
+    pub fn lastError(self: *const Conn) ?anyerror {
+        return self.last_err;
     }
 
     /// Whether the handshake got all the way to confirmation.
@@ -470,41 +630,86 @@ test "closing is safe however far opening got, and sends one goodbye at most" {
     try testing.expect(c.ready);
 }
 
-test "silence on a confirmed connection adds up to the idle timeout" {
-    const dcid = [_]u8{ 0xc0, 0xff, 0xee, 0x02 };
-    const c = try testing.allocator.create(Conn);
-    defer testing.allocator.destroy(c);
+/// A connection on a clock the test moves, with the state a finished handshake
+/// would have left: keys, confirmation, and nothing outstanding, since what the
+/// handshake sent stops being tracked once it completes.
+fn clocked(c: *Conn, dcid: []const u8, at: *const u64) !void {
     @memset(std.mem.asBytes(c), 0xaa);
-
     try c.open(testing.io, .{
         .host = "127.0.0.1",
+        // Discard: what goes out is not the point, only what the clock makes
+        // the connection do about it.
         .port = 9,
         .alpn = "radicle/git/1",
         .secret = testdata.hex(testdata.fixed_x25519_secret),
         .random = testdata.hex(testdata.fixed_hello_random),
-        .dcid = &dcid,
+        .dcid = dcid,
         .identity = try Ed25519.KeyPair.generateDeterministic(@splat(4)),
+        .clock = .{ .fixed = at },
     });
-    defer c.close();
-
-    // Keys and confirmation are what `retransmit` needs to seal a keepalive,
-    // which is the branch that used to keep `quiet_ms` from ever adding up.
-    const keys = crypto.keysFromSecret(crypto.initialSecrets(&dcid).client);
+    const keys = crypto.keysFromSecret(crypto.initialSecrets(dcid).client);
     c.hs.app_keys = .{ .send = keys, .recv = keys };
     c.hs.confirmed = true;
+    c.hs.recovery.confirmed = true;
+    c.hs.recovery.discard(.initial);
+}
 
+test "a quiet connection is held open by halves, then given up at the idle timeout" {
+    const dcid = [_]u8{ 0xc0, 0xff, 0xee, 0x02 };
+    const c = try testing.allocator.create(Conn);
+    defer testing.allocator.destroy(c);
+
+    var at: u64 = 1_000_000;
+    try clocked(c, &dcid, &at);
+    defer c.close();
+
+    const idle = c.hs.idleTimeoutMs();
+    const opened = at;
+
+    // Just short of half the timeout, nothing is owed.
+    at = opened + idle / 2 - 1;
+    try testing.expect(c.onTimeout());
+    try testing.expectEqual(@as(u64, 0), c.last_ping_ms);
+
+    // Past it, a keepalive goes out. Being ack-eliciting, it is itself now
+    // something the connection is waiting on.
+    at = opened + idle / 2 + 1;
+    try testing.expect(c.onTimeout());
+    try testing.expectEqual(at, c.last_ping_ms);
+    try testing.expectEqual(@as(usize, 1), c.hs.recovery.tracker(.application).count);
+
+    // A keepalive does not count as the connection being busy, so the silence
+    // still runs out on schedule. `stalled` reads the clock as the connection
+    // last saw it, so it answers for the turn `onTimeout` just took.
+    at = opened + idle;
+    try testing.expect(!c.onTimeout());
+    try testing.expect(c.stalled());
+}
+
+test "a peer that stops answering is written off after a run of probes" {
+    const dcid = [_]u8{ 0xc0, 0xff, 0xee, 0x05 };
+    const c = try testing.allocator.create(Conn);
+    defer testing.allocator.destroy(c);
+
+    var at: u64 = 1_000_000;
+    try clocked(c, &dcid, &at);
+    defer c.close();
+
+    // One ack-eliciting packet outstanding, which is what a probe is about.
     var out: [client.max_initial_datagram]u8 = undefined;
-    var pings: usize = 0;
-    var ticks: usize = 0;
-    // One receive timeout per turn, with nothing arriving to reset the count.
-    while (c.quiet_ms < c.hs.idleTimeoutMs()) {
-        ticks += 1;
-        try testing.expect(ticks < 100);
-        if (c.retransmit(&out)) |_| pings += 1;
+    _ = try c.hs.sealPing(&out);
+
+    // Jump to each timeout as it comes due. Every probe doubles the wait, so
+    // this is seconds of silence rather than the full idle timeout.
+    var probes: usize = 0;
+    while (c.hs.recovery.timer()) |t| {
+        at = t.at_ms;
+        if (!c.onTimeout()) break;
+        probes += 1;
+        try testing.expect(probes < 10);
     }
-    // A keepalive went out, and it did not pass for traffic.
-    try testing.expect(pings > 0);
-    // Past the timeout there is nothing to send, which is what a reader
-    // waiting on the stream gives up on.
-    try testing.expect(c.retransmit(&out) == null);
+    // Each expiry probes. The one after the budget is spent gives up instead.
+    try testing.expectEqual(c.opts.max_retries, probes);
+    try testing.expect(!c.stalled());
+    try testing.expect(at - 1_000_000 < c.hs.idleTimeoutMs());
 }

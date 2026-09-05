@@ -63,6 +63,13 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, args[2], "fetch-probe") and args.len >= 6) {
             return quicFetchProbe(init, args[3], port, args[5]);
         }
+        if (std.mem.eql(u8, args[2], "clone") and args.len >= 7) {
+            var require = false;
+            for (args[7..]) |a| {
+                if (std.mem.eql(u8, a, "--require-verified")) require = true;
+            }
+            return quicClone(init, args[3], port, args[5], args[6], require);
+        }
         if (std.mem.eql(u8, args[2], "capture")) {
             const max: usize = if (args.len >= 6)
                 std.fmt.parseInt(usize, args[5], 10) catch return usage()
@@ -144,6 +151,8 @@ fn usage() void {
         \\  radish quic ping   <host> <port>                        handshake, then a gossip ping/pong
         \\  radish quic subscribe <host> <port> [messages]          listen to gossip (default 200)
         \\  radish quic fetch-probe <host> <port> <rid>             open the git ALPN, list refs
+        \\  radish quic clone  <host> <port> <rid> <dir>            clone a repo into <dir> (bare)
+        \\    --require-verified                                    exit non-zero if any remote fails verification
         \\  radish quic capture <host> <port> [messages]            record datagrams as hex fixtures
         \\  radish quic probe  <host> <port> [alpn] [sni]           send an Initial, read the reply
         \\                                                          (default alpn h3). Only raw public
@@ -158,11 +167,21 @@ fn clone(init: std.process.Init, t: Target, rid_str: []const u8, dir: []const u8
     const nid = try t.nodeId();
 
     std.debug.print("cloning {s} from {s} into {s}...\n", .{ rid_str, t.nid, dir });
-    var result = radish.net.fetch.clone(init.io, arena, t.host, t.port, nid, rid_str, dir) catch |e| {
+    var result = radish.net.clone.overNoise(init.io, arena, t.host, t.port, nid, rid_str, dir) catch |e| {
         std.debug.print("clone failed: {s}\n", .{@errorName(e)});
         return e;
     };
     defer result.deinit(arena);
+    return report(result, rid_str, dir, require_verified);
+}
+
+/// What a clone came to, whichever transport carried it.
+fn report(
+    result: radish.net.clone.CloneResult,
+    rid_str: []const u8,
+    dir: []const u8,
+    require_verified: bool,
+) !void {
     std.debug.print("cloned {s}: {d} refs, {d} pack bytes -> {s}\n", .{ rid_str, result.refs, result.pack_bytes, dir });
 
     for (result.report.verified) |remote| std.debug.print("  verified {s}\n", .{remote});
@@ -497,7 +516,7 @@ fn quicPing(init: std.process.Init, host: []const u8, port: u16) !void {
         if (c.peerClose()) |close| {
             std.debug.print("  peer closed: 0x{x} {s}\n", .{ close.error_code, close.reason() });
         }
-        if (c.last_err) |last| std.debug.print("  last error: {s}\n", .{@errorName(last)});
+        if (c.lastError()) |last| std.debug.print("  last error: {s}\n", .{@errorName(last)});
         return e;
     };
 
@@ -597,6 +616,7 @@ fn quicFetchProbe(init: std.process.Init, host: []const u8, port: u16, rid: []co
         }
         return e;
     };
+    defer session.deinit();
 
     var refs = radish.git.protocol.lsRefs(arena, &session, &.{"refs/"}) catch |e| {
         std.debug.print("ls-refs failed: {s}\n", .{@errorName(e)});
@@ -609,6 +629,35 @@ fn quicFetchProbe(init: std.process.Init, host: []const u8, port: u16, rid: []co
 
     for (refs.refs) |ref| std.debug.print("{s}  {s}\n", .{ ref.oid, ref.name });
     std.debug.print("\n{d} ref(s)\n", .{refs.refs.len});
+}
+
+/// Clones over the git ALPN: the 2.x counterpart of `radish clone`, and the
+/// same storage and verification once the bytes are in.
+fn quicClone(
+    init: std.process.Init,
+    host: []const u8,
+    port: u16,
+    rid: []const u8,
+    dir: []const u8,
+    require_verified: bool,
+) !void {
+    const quic = radish.quic;
+    const arena = init.arena.allocator();
+    const opts = try quicDial(init, host, port);
+    std.debug.print("quic clone {s} from {s}:{d} into {s}...\n", .{ rid, host, port, dir });
+
+    const c = try arena.create(quic.conn.Conn);
+    defer c.close();
+    var result = radish.net.clone.overQuic(init.io, arena, c, opts, rid, dir) catch |e| {
+        std.debug.print("clone failed: {s}\n", .{@errorName(e)});
+        if (c.lastError()) |last| std.debug.print("  last datagram: {s}\n", .{@errorName(last)});
+        if (c.peerClose()) |close| {
+            std.debug.print("  peer closed: 0x{x} {s}\n", .{ close.error_code, close.reason() });
+        }
+        return e;
+    };
+    defer result.deinit(arena);
+    return report(result, rid, dir, require_verified);
 }
 
 /// One QUIC first flight against a live server. The x25519 key is fixed, so a
@@ -724,10 +773,10 @@ fn cloneFrom(
     t: Target,
     rid_str: []const u8,
     bare: []const u8,
-) !radish.net.fetch.CloneResult {
+) !radish.net.clone.CloneResult {
     const arena = init.arena.allocator();
     const nid = try t.nodeId();
-    return radish.net.fetch.clone(init.io, arena, t.host, t.port, nid, rid_str, bare);
+    return radish.net.clone.overNoise(init.io, arena, t.host, t.port, nid, rid_str, bare);
 }
 
 /// Asks a bootstrap node who seeds `rid`, and returns the first seed that both
@@ -755,8 +804,14 @@ fn locate(init: std.process.Init, rid_str: []const u8, frames: usize) !Target {
         };
         const id = try radish.NodeId.fromPublicKey(found.node).encode(arena);
         const spec = try std.fmt.allocPrint(arena, "{s}:{s}", .{ found.addr, id });
+        // An address that will not parse is this bootstrap node's answer being
+        // unusable, not the end of the search.
+        const target = Target.parse(spec) orelse {
+            std.debug.print("  {s}: {s} is not a dial target\n", .{ boot.host, found.addr });
+            continue;
+        };
         std.debug.print("  found {s} at {s} (via {s})\n", .{ id, found.addr, boot.host });
-        return Target.parse(spec) orelse error.BadSeedAddress;
+        return target;
     }
     return error.NoSeedFound;
 }
@@ -820,7 +875,7 @@ fn peers(init: std.process.Init, from: []const u8, frames: usize) !void {
     for (collector.peers()) |p| {
         const id = radish.NodeId.fromPublicKey(p.node).encode(arena) catch continue;
         std.debug.print("peer  {s}  alias={s}\n", .{ id, p.alias });
-        for (p.addrs) |a| std.debug.print("        {s}\n", .{a});
+        for (p.addrs) |a| std.debug.print("        {s}\n", .{a.text});
     }
     std.debug.print("\n{d} peers seen in {d} frames\n", .{ collector.peers().len, read });
 }

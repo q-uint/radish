@@ -341,8 +341,29 @@ pub const Frame = union(enum) {
     max_stream_data: MaxStreamData,
     /// Parsed so the payload can be walked, but carried no further. Flow
     /// control and stream resets land here.
-    ignored: Type,
+    ignored: Ignored,
 };
+
+/// A frame consumed by shape rather than read, with the stream id it names when
+/// it has one: a reset or a blocked signal about a stream we never opened is
+/// not about ours.
+/// Source: RFC 9000 s19.4, s19.5, s19.13.
+pub const Ignored = struct {
+    kind: Type,
+    stream: ?u64 = null,
+
+    pub fn about(self: Ignored, id: u64) bool {
+        return self.stream != null and self.stream.? == id;
+    }
+};
+
+/// Whether an ignored frame's first varint is a stream id.
+fn streamScoped(t: Type) bool {
+    return switch (t) {
+        .reset_stream, .stop_sending, .stream_data_blocked => true,
+        else => false,
+    };
+}
 
 /// Writes a STREAM frame. The length is always explicit, so another frame can
 /// follow it in the same packet.
@@ -522,12 +543,16 @@ pub const Iterator = struct {
             },
             .new_token => |t| {
                 _ = try self.r.take(@intCast(try self.r.varint()));
-                return .{ .ignored = t };
+                return .{ .ignored = .{ .kind = t } };
             },
             else => |t| {
                 const n = ignoredVarints(t) orelse return error.UnsupportedFrame;
-                for (0..n) |_| _ = try self.r.varint();
-                return .{ .ignored = t };
+                var id: ?u64 = null;
+                for (0..n) |i| {
+                    const v = try self.r.varint();
+                    if (i == 0 and streamScoped(t)) id = v;
+                }
+                return .{ .ignored = .{ .kind = t, .stream = id } };
             },
         }
     }
@@ -593,8 +618,14 @@ test "frames we write parse back, and the rest are walked past" {
         0x01, // PING, to prove the walk arrived
     };
     var it2 = Iterator.init(&ignored);
-    try testing.expectEqual(Type.reset_stream, (try it2.next()).?.ignored);
-    try testing.expectEqual(Type.new_token, (try it2.next()).?.ignored);
+    const reset = (try it2.next()).?.ignored;
+    try testing.expectEqual(Type.reset_stream, reset.kind);
+    // The id it names, so a reset about another stream can be told apart.
+    try testing.expect(reset.about(4));
+    try testing.expect(!reset.about(0));
+    const token = (try it2.next()).?.ignored;
+    try testing.expectEqual(Type.new_token, token.kind);
+    try testing.expectEqual(@as(?u64, null), token.stream);
     try testing.expectEqual(Frame.ping, (try it2.next()).?);
     try testing.expectEqual(@as(?Frame, null), try it2.next());
 }

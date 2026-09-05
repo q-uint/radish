@@ -9,6 +9,7 @@ pub const seeds = @import("seeds.zig");
 pub const node = @import("node.zig");
 pub const gossip = @import("gossip.zig");
 pub const gitstream = @import("gitstream.zig");
+pub const clone = @import("clone.zig");
 
 test {
     _ = codec;
@@ -21,4 +22,5 @@ test {
     _ = node;
     _ = gossip;
     _ = gitstream;
+    _ = clone;
 }

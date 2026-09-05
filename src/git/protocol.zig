@@ -20,7 +20,7 @@ const MAX_PKT_BUF = pktline.MAX_DATA + 4;
 /// This client is transport-agnostic: `session` is any value exposing
 ///   readGit([]u8) !usize   writeGit([]const u8) !void
 ///   sendIntro() !void      intro_sent: bool
-/// (net/fetch.Session is the radicle-over-Noise implementation.)
+/// (net/fetch.Session runs it over Noise, net/gitstream.Session over QUIC.)
 pub const Ref = struct {
     oid: [40]u8, // hex
     name: []const u8, // owned by the RefList arena

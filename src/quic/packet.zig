@@ -94,6 +94,12 @@ pub fn protectHeader(header: []u8, pn_offset: usize, mask: [crypto.mask_len]u8) 
 /// Source: RFC 9000 s17.2.
 pub const Kind = enum(u2) { initial = 0, zero_rtt = 1, handshake = 2, retry = 3 };
 
+/// The three packet number spaces. Numbers restart in each, each acknowledges
+/// separately, and each has its own keys, so almost everything about a packet
+/// is qualified by one.
+/// Source: RFC 9000 s12.3.
+pub const Space = enum { initial, handshake, application };
+
 /// Largest connection id QUIC v1 allows.
 pub const max_cid_len = 20;
 
@@ -238,9 +244,6 @@ pub fn open(out: []u8, packet: []u8, keys: crypto.Keys, largest_pn: ?u64) Error!
     // XOR is its own inverse; bounds already checked above.
     errdefer protectHeader(packet[0 .. hdr.pn_offset + pn_len], hdr.pn_offset, mask) catch unreachable;
 
-    // Reserved bits must be zero once unprotected.
-    // Source: RFC 9000 s17.2.
-    if (packet[0] & 0x0c != 0) return error.ProtocolViolation;
     if (length < pn_len + Aes128Gcm.tag_length) return error.PacketTooShort;
 
     const truncated = std.mem.readVarInt(u64, packet[hdr.pn_offset..][0..pn_len], .big);
@@ -257,6 +260,11 @@ pub fn open(out: []u8, packet: []u8, keys: crypto.Keys, largest_pn: ?u64) Error!
     Aes128Gcm.decrypt(out[0..ct.len], ct, tag, aad, nonce(keys.iv, pn), keys.key) catch {
         return error.AuthenticationFailed;
     };
+
+    // Checked only now that the packet is authenticated.
+    // Source: RFC 9000 s17.2.
+    if (packet[0] & 0x0c != 0) return error.ProtocolViolation;
+
     return .{ .header = hdr, .pn = pn, .payload = out[0..ct.len], .len = end };
 }
 
@@ -422,8 +430,6 @@ pub fn openShort(
     const pn_len = try unprotectHeader(packet, hdr.pn_offset, mask);
     errdefer protectHeader(packet[0 .. hdr.pn_offset + pn_len], hdr.pn_offset, mask) catch unreachable;
 
-    if (packet[0] & short_reserved != 0) return error.ProtocolViolation;
-
     const truncated = std.mem.readVarInt(u64, packet[hdr.pn_offset..][0..pn_len], .big);
     const pn = decodePacketNumber(largest_pn, truncated, pn_len);
 
@@ -438,6 +444,14 @@ pub fn openShort(
     Aes128Gcm.decrypt(out[0..ct.len], ct, tag, aad, nonce(keys.iv, pn), keys.key) catch {
         return error.AuthenticationFailed;
     };
+
+    // Reserved bits are checked after removing both packet and header
+    // protection. Acting on what header protection alone revealed makes a
+    // fatal error of anything that fails to decrypt, such as a stateless reset
+    // or a packet under keys we do not have.
+    // Source: RFC 9000 s17.3.1.
+    if (packet[0] & short_reserved != 0) return error.ProtocolViolation;
+
     return .{
         .dcid = hdr.dcid,
         .key_phase = packet[0] & key_phase_bit != 0,
@@ -751,9 +765,35 @@ test "seals and opens a 1-RTT packet" {
     try testing.expectEqualSlices(u8, &payload, opened.payload);
 }
 
-// Masking is XOR, so flipping a reserved bit in the protected byte flips it in
-// the unprotected one. Reported ahead of the authentication failure it also
-// causes.
+/// `sealShort` with a reserved bit set, which nothing legitimate sends. Byte 0
+/// is part of the aad, so the bit has to be there before the packet is sealed
+/// for the result to still authenticate.
+fn sealShortReserved(out: []u8, b: ShortBuild, payload: []const u8, keys: crypto.Keys) !usize {
+    const pn_offset = 1 + b.dcid.len;
+    const header_len = pn_offset + b.pn_len;
+
+    out[0] = 0x40 | @as(u8, @intCast(b.pn_len - 1)) | 0x10;
+    @memcpy(out[1..][0..b.dcid.len], b.dcid);
+    var pn_be: [8]u8 = undefined;
+    std.mem.writeInt(u64, &pn_be, b.pn, .big);
+    @memcpy(out[pn_offset..][0..b.pn_len], pn_be[8 - b.pn_len ..]);
+
+    var tag: [Aes128Gcm.tag_length]u8 = undefined;
+    Aes128Gcm.encrypt(
+        out[header_len..][0..payload.len],
+        &tag,
+        payload,
+        out[0..header_len],
+        nonce(keys.iv, b.pn),
+        keys.key,
+    );
+    @memcpy(out[header_len + payload.len ..][0..Aes128Gcm.tag_length], &tag);
+
+    const so = sampleOffset(pn_offset);
+    try protectHeader(out[0..header_len], pn_offset, crypto.headerMask(keys.hp, out[so..][0..crypto.sample_len].*));
+    return header_len + payload.len + Aes128Gcm.tag_length;
+}
+
 test "1-RTT headers are refused when they are not one, and reserved bits are a violation" {
     const dcid = hex(testdata.other_dcid);
     const keys = clientKeys(testdata.other_dcid);
@@ -774,12 +814,21 @@ test "1-RTT headers are refused when they are not one, and reserved bits are a v
     var out: [256]u8 = undefined;
 
     // Reserved bits are 0x18 in a short header, one bit over from the long
-    // header's 0x0c.
+    // header's 0x0c. Set before sealing, so the packet authenticates and the
+    // check is reached.
+    const res_n = try sealShortReserved(&buf, .{ .dcid = &dcid, .pn = 1, .pn_len = 4 }, &payload, keys);
+    try testing.expectError(error.ProtocolViolation, openShort(&out, buf[0..res_n], dcid.len, keys, null));
+
+    // Masking is XOR, so flipping the bit in the protected byte flips it in the
+    // unprotected one, but it also puts byte 0 out of step with the aad it was
+    // sealed under. Failing to authenticate is what must be reported: acting on
+    // the bit first makes a fatal error of every packet that does not decrypt.
+    // Source: RFC 9000 s17.3.1.
     const short_n = try sealShort(&buf, .{ .dcid = &dcid, .pn = 1, .pn_len = 4 }, &payload, keys);
     buf[0] ^= 0x10;
-    try testing.expectError(error.ProtocolViolation, openShort(&out, buf[0..short_n], dcid.len, keys, null));
+    try testing.expectError(error.AuthenticationFailed, openShort(&out, buf[0..short_n], dcid.len, keys, null));
 
     const long_n = try seal(&buf, .{ .kind = .handshake, .dcid = &dcid, .pn = 1, .pn_len = 4 }, &payload, keys);
     buf[0] ^= 0x08;
-    try testing.expectError(error.ProtocolViolation, open(&out, buf[0..long_n], keys, null));
+    try testing.expectError(error.AuthenticationFailed, open(&out, buf[0..long_n], keys, null));
 }

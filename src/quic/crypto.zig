@@ -15,9 +15,11 @@ pub const initial_salt = [_]u8{
     0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a,
 };
 
+pub const Secret = [Hkdf.prk_length]u8;
+
 pub const Secrets = struct {
-    client: [Hkdf.prk_length]u8,
-    server: [Hkdf.prk_length]u8,
+    client: Secret,
+    server: Secret,
 };
 
 /// Both directions' secrets, from the client's *original* DCID. The server
@@ -47,12 +49,28 @@ pub const Keys = struct {
 };
 
 /// Source: RFC 9001 s5.1.
-pub fn keysFromSecret(secret: [Hkdf.prk_length]u8) Keys {
+pub fn keysFromSecret(secret: Secret) Keys {
     return .{
         .key = expandLabel(Hkdf, secret, "quic key", "", @sizeOf(Key)),
         .iv = expandLabel(Hkdf, secret, "quic iv", "", @sizeOf(Iv)),
         .hp = expandLabel(Hkdf, secret, "quic hp", "", @sizeOf(Key)),
     };
+}
+
+/// The next generation of a 1-RTT secret. Each key update derives from the
+/// secret it replaces, so both ends can move without saying anything beyond the
+/// Key Phase bit. The header protection key is not updated, which is why
+/// `keysFromSecret` on the result must keep the old `hp`.
+/// Source: RFC 9001 s6.1.
+pub fn nextSecret(secret: Secret) Secret {
+    return expandLabel(Hkdf, secret, "quic ku", "", Hkdf.prk_length);
+}
+
+/// The keys for the generation after `keys`, protected by `secret`.
+pub fn updatedKeys(secret: Secret, hp: Key) Keys {
+    var next = keysFromSecret(secret);
+    next.hp = hp;
+    return next;
 }
 
 pub const sample_len = 16;

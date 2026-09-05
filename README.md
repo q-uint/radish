@@ -40,6 +40,8 @@ radish fetch-deps  <manifest> [dir]                     resolve `.rad` dependenc
 radish serve       <port> [sessions]                    answer inbound connections (one at a time)
 radish quic ping   <host> <port>                        2.x: handshake, then a gossip ping/pong
 radish quic subscribe <host> <port> [messages]          2.x: listen to gossip (default 200)
+radish quic clone  <host> <port> <rid> <dir>            2.x: clone a repo into <dir> (bare)
+  --require-verified                                    exit non-zero if any remote fails verification
 radish quic probe  <host> <port> [alpn] [sni]           2.x: send an Initial, read the reply
 ```
 
@@ -125,9 +127,13 @@ and short headers, the frames a handshake needs, and mutual authentication with
 raw public keys, through to HANDSHAKE_DONE. A public server refuses raw public
 keys, so the peer has to be iroh; `nix build .#radicle-ng` provides one.
 
-One stream runs on top, with flow control and resends of what goes
-unacknowledged; 2.x gossip rides it, reusing the 1.x message codec. Not started:
-congestion control, RFC 9002 loss recovery, key update, and the server side.
+One stream runs on top, with flow control, key updates, RFC 9002 loss recovery
+and NewReno. 2.x gossip runs over it, reusing the 1.x message codec, and so does
+git protocol v2: the `radicle/git/1` ALPN carries git bytes unframed, so cloning
+is the same ls-refs, packfile, index and verify as 1.x over a different session.
+A 12 MB packfile clones and verifies against a local node.
+
+Not started: the server side, which is also what sends a stateless reset.
 
 ## Build
 

@@ -157,7 +157,8 @@ test "a stream past the buffer or too gappy is refused" {
     var r = Reassembler.init(&small);
     try testing.expectError(error.StreamTooLong, r.push(2, &.{ 1, 2, 3 }));
 
-    var buf: [64]u8 = @splat(0);
+    // Room for a one-byte range every four bytes, plus the one too many.
+    var buf: [(Reassembler.max_ranges + 1) * 4]u8 = @splat(0);
     var g = Reassembler.init(&buf);
     for (0..Reassembler.max_ranges) |i| try g.push(i * 4, &.{0xaa});
     try testing.expectError(error.StreamGaps, g.push(Reassembler.max_ranges * 4, &.{0xaa}));

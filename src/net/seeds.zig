@@ -50,6 +50,10 @@ pub const Collector = struct {
         }
     }
 
+    /// A message that does not decode names no inventory, so it is skipped
+    /// rather than ending the subscription.
+    pub fn onUndecodable(_: *Collector, _: anyerror) void {}
+
     fn add(self: *Collector, node: [32]u8) !void {
         for (self.found.items) |seen| {
             if (std.mem.eql(u8, &seen, &node)) return;
@@ -62,13 +66,30 @@ pub const Collector = struct {
     }
 };
 
+/// One advertised address: how it would be dialed, and the kind it arrived as,
+/// which is what says whether radish can dial it at all.
+pub const Addr = struct {
+    kind: protocol.Address.Kind,
+    text: []u8,
+};
+
 /// One discovered peer: its node id plus the addresses it advertised. Hosts
 /// are copied out of the decode scratch, which the next frame overwrites.
 pub const Peer = struct {
     node: [32]u8,
     alias: []u8,
-    addrs: [][]u8,
+    addrs: []Addr,
 };
+
+/// Whether radish can dial this kind: Noise over TCP needs a host and a port,
+/// which an iroh address does not carry, and onion and i2p need a proxy.
+fn dialable(kind: protocol.Address.Kind) bool {
+    return switch (kind) {
+        .ipv4, .ipv6, .dns => true,
+        .onion, .i2p, .iroh => false,
+        _ => false,
+    };
+}
 
 /// Watches for both halves of "where can I fetch `want`": the inventory
 /// announcements naming who holds it, and the node announcements carrying an
@@ -95,18 +116,24 @@ pub const Locator = struct {
         self.peers.onMessage(msg);
     }
 
-    /// A node that announced `want` and published a dialable address, or null
-    /// while nothing has satisfied both. Nodes advertising no address are
-    /// skipped: they hold the repo but cannot be reached.
+    /// A node that announced `want` and published an address we can dial, or
+    /// null while nothing has satisfied both. A node whose addresses are all
+    /// undialable holds the repo but cannot be reached, so it is skipped.
     pub fn located(self: *const Locator) ?Located {
         for (self.seeds.seeds()) |nid| {
             for (self.peers.peers()) |p| {
                 if (!std.mem.eql(u8, &p.node, &nid)) continue;
-                if (p.addrs.len == 0) continue;
-                return .{ .node = nid, .addr = p.addrs[0] };
+                for (p.addrs) |a| {
+                    if (dialable(a.kind)) return .{ .node = nid, .addr = a.text };
+                }
             }
         }
         return null;
+    }
+
+    pub fn onUndecodable(self: *Locator, e: anyerror) void {
+        self.seeds.onUndecodable(e);
+        self.peers.onUndecodable(e);
     }
 };
 
@@ -131,7 +158,7 @@ pub const PeerCollector = struct {
 
     pub fn deinit(self: *PeerCollector) void {
         for (self.found.items) |p| {
-            for (p.addrs) |a| self.allocator.free(a);
+            for (p.addrs) |a| self.allocator.free(a.text);
             self.allocator.free(p.addrs);
             self.allocator.free(p.alias);
         }
@@ -149,14 +176,21 @@ pub const PeerCollector = struct {
         self.record(ann) catch {};
     }
 
+    /// As `Collector.onUndecodable`: one message we cannot read is not the end
+    /// of the subscription.
+    pub fn onUndecodable(_: *PeerCollector, _: anyerror) void {}
+
     fn record(self: *PeerCollector, ann: protocol.NodeAnnounced) !void {
-        var addrs: std.ArrayList([]u8) = .empty;
+        var addrs: std.ArrayList(Addr) = .empty;
         errdefer {
-            for (addrs.items) |a| self.allocator.free(a);
+            for (addrs.items) |a| self.allocator.free(a.text);
             addrs.deinit(self.allocator);
         }
         for (ann.addresses()) |addr| {
-            try addrs.append(self.allocator, try formatAddress(self.allocator, addr));
+            try addrs.append(self.allocator, .{
+                .kind = addr.kind,
+                .text = try formatAddress(self.allocator, addr),
+            });
         }
         const alias = try self.allocator.dupe(u8, ann.alias);
         errdefer self.allocator.free(alias);
@@ -324,8 +358,40 @@ test "collects each peer once, owning the addresses it advertised" {
     const p = c.peers()[0];
     try testing.expectEqualStrings("one", p.alias);
     try testing.expectEqual(@as(usize, 2), p.addrs.len);
-    try testing.expectEqualStrings("seed.example:8776", p.addrs[0]);
-    try testing.expectEqualStrings("10.0.0.7:8776", p.addrs[1]);
+    try testing.expectEqualStrings("seed.example:8776", p.addrs[0].text);
+    try testing.expectEqualStrings("10.0.0.7:8776", p.addrs[1].text);
+}
+
+// An iroh address renders as no host and no port, so handing one back as a
+// dial target cannot parse.
+test "locator passes over an address it cannot dial" {
+    const want = rid.RepoId.fromOid(oidOf(1));
+    var l = Locator.init(testing.allocator, want);
+    defer l.deinit();
+
+    const node: [32]u8 = @splat(0xAA);
+    l.onMessage(announcement(node, "iroh only", &.{
+        .{ .kind = .iroh, .host = &.{}, .port = 0 },
+    }));
+    l.onMessage(.{ .inventory_announced = .{
+        .node = node,
+        .inventory = &.{oidOf(1)},
+        .timestamp = 0,
+    } });
+    try testing.expectEqual(@as(?Located, null), l.located());
+
+    // Announcing both: the dialable one comes back, whichever came first.
+    const both: [32]u8 = @splat(0xBB);
+    l.onMessage(announcement(both, "both", &.{
+        .{ .kind = .iroh, .host = &.{}, .port = 0 },
+        .{ .kind = .dns, .host = "seed.example", .port = 8776 },
+    }));
+    l.onMessage(.{ .inventory_announced = .{
+        .node = both,
+        .inventory = &.{oidOf(1)},
+        .timestamp = 0,
+    } });
+    try testing.expectEqualStrings("seed.example:8776", l.located().?.addr);
 }
 
 // A seed is usable only when both halves have arrived: the inventory saying

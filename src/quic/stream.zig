@@ -54,6 +54,10 @@ pub const Receiver = struct {
     window: Window,
     /// The offset a FIN put the end of the stream at, once one has arrived.
     final: ?u64 = null,
+    /// Set by a RESET_STREAM: the peer has abandoned its half, so what has
+    /// arrived is all there will be and it is not a whole stream.
+    /// Source: RFC 9000 s19.4.
+    reset: bool = false,
 
     pub fn init(buf: []u8, limit: u64) Receiver {
         return .{
@@ -138,6 +142,10 @@ pub const Sender = struct {
         len: usize,
         fin: bool,
         acked: bool = false,
+        /// Whether this chunk has gone out again since the last thing the peer
+        /// acknowledged, so a burst of loss works through the chunks rather
+        /// than repeating the oldest.
+        resent: bool = false,
     };
 
     pub fn init(buf: []u8) Sender {
@@ -168,9 +176,17 @@ pub const Sender = struct {
 
     /// Marks what the peer acknowledged and frees the run of it at the front.
     pub fn ack(self: *Sender, acked: *const frame.NumberSet) void {
+        var news = false;
         for (self.chunks[0..self.count]) |*c| {
-            if (acked.contains(c.pn)) c.acked = true;
+            if (c.acked or !acked.contains(c.pn)) continue;
+            c.acked = true;
+            news = true;
         }
+        // Something got through, so whatever is still outstanding is worth
+        // resending again rather than counting as already tried.
+        if (news) for (self.chunks[0..self.count]) |*c| {
+            c.resent = false;
+        };
 
         var done: usize = 0;
         var freed: usize = 0;
@@ -193,8 +209,21 @@ pub const Sender = struct {
         return self.buf.len - self.len;
     }
 
-    /// The oldest chunk still outstanding, to send again.
+    /// The oldest chunk still outstanding that has not gone out again since
+    /// the last acknowledgement, so successive repairs walk the outstanding
+    /// data instead of resending the front of it over and over. Null once
+    /// every outstanding chunk has been tried again.
     pub fn unacked(self: *Sender) ?*Chunk {
+        for (self.chunks[0..self.count]) |*c| {
+            if (!c.acked and !c.resent) return c;
+        }
+        return null;
+    }
+
+    /// The oldest chunk still outstanding, tried again or not: a probe has to
+    /// carry something to be a probe.
+    /// Source: RFC 9002 s6.2.4.
+    pub fn oldestUnacked(self: *Sender) ?*Chunk {
         for (self.chunks[0..self.count]) |*c| {
             if (!c.acked) return c;
         }

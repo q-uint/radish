@@ -72,9 +72,9 @@ pub fn sendAnnouncement(
 }
 
 /// Connects, handshakes, sends Subscribe-all, and reads up to `max_frames`
-/// gossip frames, invoking `handler.onMessage(msg)` for each. `handler` is any
-/// value with an `onMessage(protocol.Message) void` method. Returns the number
-/// of frames read.
+/// gossip frames, invoking `handler.onMessage(msg)` for each and
+/// `handler.onUndecodable(err)` for one that does not decode. Returns the
+/// number of frames read.
 pub fn subscribe(
     io: std.Io,
     host: []const u8,
@@ -92,6 +92,10 @@ pub fn subscribe(
 /// The subscribe conversation over an already-handshaked pair: send
 /// Subscribe-all, then read frames until `max_frames` or end of stream.
 /// Split from `subscribe` so it can be driven from in-memory buffers.
+///
+/// A frame that does not decode is handed over as such: announcements are
+/// relayed from nodes we did not choose, so one unknown address kind must not
+/// cost us the rest of the run.
 pub fn subscribeOver(
     r: *std.Io.Reader,
     w: *std.Io.Writer,
@@ -108,11 +112,14 @@ pub fn subscribeOver(
     var oids: [protocol.INVENTORY_LIMIT][20]u8 = undefined;
     var frames: usize = 0;
     while (frames < max_frames) : (frames += 1) {
-        const msg = protocol.decodeFrameStreaming(r, &scratch, &oids) catch |e| switch (e) {
+        const framed = protocol.readFramedMessage(r, &scratch, &oids) catch |e| switch (e) {
             error.EndOfStream => break,
             else => return e,
         };
-        handler.onMessage(msg);
+        switch (framed) {
+            .message => |m| handler.onMessage(m),
+            .undecodable => |e| handler.onUndecodable(e),
+        }
     }
     return frames;
 }
@@ -272,6 +279,7 @@ const Recorder = struct {
     git_frames: usize = 0,
     git_bytes: usize = 0,
     controls: usize = 0,
+    undecodable: usize = 0,
 
     pub fn onMessage(self: *Recorder, msg: protocol.Message) void {
         switch (msg) {
@@ -279,6 +287,10 @@ const Recorder = struct {
             .inventory_announced => self.inventories += 1,
             else => {},
         }
+    }
+
+    pub fn onUndecodable(self: *Recorder, _: anyerror) void {
+        self.undecodable += 1;
     }
 
     pub fn onGit(self: *Recorder, data: []const u8) void {
@@ -290,6 +302,40 @@ const Recorder = struct {
         self.controls += 1;
     }
 };
+
+/// A gossip frame carrying `body`: version ++ stream ++ varint(len) ++ body,
+/// where both varints are one byte at these sizes.
+fn gossipFrame(out: []u8, body: []const u8) []u8 {
+    @memcpy(out[0..4], &protocol.VERSION_STRING);
+    out[4] = @intCast(protocol.StreamId.gossip_out.value);
+    out[5] = @intCast(body.len);
+    @memcpy(out[6..][0..body.len], body);
+    return out[0 .. 6 + body.len];
+}
+
+// Announcements are relayed from nodes we did not choose, so a payload we
+// cannot decode has to cost one frame rather than the whole run.
+test "a frame that does not decode is reported, and the frames after it still read" {
+    var out_buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&out_buf);
+
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    var fb: [64]u8 = undefined;
+    // A node announcement with nothing behind its type id.
+    try frames.appendSlice(testing.allocator, gossipFrame(&fb, &.{
+        0x00,
+        @backingInt(protocol.MessageType.node_announcement),
+    }));
+    const good = try protocol.encodePingFrame(testing.allocator, .{ .ponglen = 0, .zeroes = 0 });
+    defer testing.allocator.free(good);
+    try frames.appendSlice(testing.allocator, good);
+    var r = std.Io.Reader.fixed(frames.items);
+
+    var rec = Recorder{ .alloc = testing.allocator };
+    try testing.expectEqual(@as(usize, 2), try subscribeOver(&r, &w, 100, &rec));
+    try testing.expectEqual(@as(usize, 1), rec.undecodable);
+}
 
 // A stream that runs out is the common case against a node with nothing more
 // to say, and must end the loop rather than surface as an error.

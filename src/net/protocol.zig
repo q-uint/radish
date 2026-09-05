@@ -322,10 +322,16 @@ fn readZeroBytes(r: *codec.Reader) !u16 {
     return n;
 }
 
-/// Reads exactly one frame from an Io.Reader stream and returns its gossip
-/// message. `scratch` must be large enough for the payload; `oid_buf` receives
-/// decoded inventory oids (copied out of the length-prefixed wire form).
-pub fn decodeFrameStreaming(r: *std.Io.Reader, scratch: []u8, oid_buf: [][20]u8) !Message {
+/// One frame's gossip message, or what decoding it failed with.
+pub const FramedMessage = union(enum) {
+    message: Message,
+    undecodable: anyerror,
+};
+
+/// Reads one frame off a stream. Contents that do not decode are not fatal,
+/// unlike a bad version or length: the length prefix already put the reader on
+/// the next frame, so an unknown field costs one frame, not the connection.
+pub fn readFramedMessage(r: *std.Io.Reader, scratch: []u8, oid_buf: [][20]u8) !FramedMessage {
     const version = try r.takeArray(4);
     if (!std.mem.eql(u8, version, &VERSION_STRING)) return error.BadVersion;
     _ = try readStreamVarint(r); // stream id
@@ -333,7 +339,20 @@ pub fn decodeFrameStreaming(r: *std.Io.Reader, scratch: []u8, oid_buf: [][20]u8)
     if (len > scratch.len) return error.FrameTooLarge;
     const payload = scratch[0..@intCast(len)];
     try r.readSliceAll(payload);
-    return decodeMessage(payload, oid_buf);
+    if (decodeMessage(payload, oid_buf)) |message| {
+        return .{ .message = message };
+    } else |e| {
+        return .{ .undecodable = e };
+    }
+}
+
+/// As `readFramedMessage`, raising an undecodable payload instead. For the
+/// readers that answer a peer rather than watch it.
+pub fn decodeFrameStreaming(r: *std.Io.Reader, scratch: []u8, oid_buf: [][20]u8) !Message {
+    return switch (try readFramedMessage(r, scratch, oid_buf)) {
+        .message => |m| m,
+        .undecodable => |e| e,
+    };
 }
 
 /// A raw frame off the wire, tagged by stream kind. `payload` (gossip/git)

@@ -22,6 +22,10 @@ pub const FakePeer = struct {
     dcid: []const u8,
     /// One key both ways, so what we seal is what the client opens.
     keys: crypto.Keys,
+    /// The secret behind `keys`, which `updateKeys` derives the next from.
+    secret: crypto.Secret,
+    /// The Key Phase bit our packets carry.
+    key_phase: bool = false,
     /// Where the opening datagram came from, and so where answers go.
     client_addr: std.Io.net.IpAddress = undefined,
     /// Our packet numbers and our half of the stream, both of which only go up.
@@ -30,13 +34,19 @@ pub const FakePeer = struct {
     datagram: [client.max_receive_datagram]u8 = undefined,
     payload: [client.max_receive_datagram]u8 = undefined,
 
+    /// What this peer would prove a lost connection with. Fixed: a test only
+    /// needs it to match what `confirm` handed the client.
+    pub const reset_token: [16]u8 = @splat(0x5e);
+
     pub fn bind(io: std.Io, dcid: []const u8) !FakePeer {
         var local = try std.Io.net.IpAddress.resolve(io, "127.0.0.1", 0);
+        const secret = crypto.initialSecrets(dcid).client;
         return .{
             .io = io,
             .sock = try local.bind(io, .{ .mode = .dgram }),
             .dcid = dcid,
-            .keys = crypto.keysFromSecret(crypto.initialSecrets(dcid).client),
+            .keys = crypto.keysFromSecret(secret),
+            .secret = secret,
         };
     }
 
@@ -62,7 +72,11 @@ pub const FakePeer = struct {
     /// Gives `c` the state a finished handshake would have left it in.
     pub fn confirm(self: *const FakePeer, c: *conn.Conn, idle_ms: u64) void {
         c.hs.app_keys = .{ .send = self.keys, .recv = self.keys };
+        // The secrets those keys came from, which a key update derives from.
+        c.hs.accepted.application = .{ .client = self.secret, .server = self.secret };
         c.hs.confirmed = true;
+        c.hs.recovery.confirmed = true;
+        c.hs.peer_reset_token = reset_token;
         c.hs.peer_idle_ms = idle_ms;
         // What our transport parameters would have opened.
         c.hs.send_data.extend(c.stream_buf.len);
@@ -79,6 +93,44 @@ pub const FakePeer = struct {
         self.confirm(c, idle_ms);
     }
 
+    /// Opens one datagram the connection sent us and returns its frames. The
+    /// client addresses us with a zero-length connection id, since `confirm`
+    /// never gave it one.
+    pub fn receiveFrames(self: *FakePeer, out: []u8) ![]const u8 {
+        return self.receiveFramesIn(out, accept_timeout_ms);
+    }
+
+    /// The same, waiting only `timeout_ms`: for asking whether anything is
+    /// there without paying the full wait when nothing is.
+    pub fn receiveFramesIn(self: *FakePeer, out: []u8, timeout_ms: u64) ![]const u8 {
+        const got = try self.sock.receiveTimeout(self.io, &self.datagram, .{ .duration = .{
+            .raw = .fromNanoseconds(@intCast(timeout_ms * std.time.ns_per_ms)),
+            .clock = .awake,
+        } });
+        const opened = try packet.openShort(out, got.data, 0, self.keys, null);
+        return opened.payload;
+    }
+
+    /// Moves to the next generation of keys and flips the phase our packets
+    /// carry, which is all a peer says about a key update.
+    /// Source: RFC 9001 s6.1.
+    pub fn updateKeys(self: *FakePeer) void {
+        self.secret = crypto.nextSecret(self.secret);
+        self.keys = crypto.updatedKeys(self.secret, self.keys.hp);
+        self.key_phase = !self.key_phase;
+    }
+
+    /// A datagram no key will open. Ending in `token` it is a stateless reset,
+    /// which is all that tells one from noise, and without one it is noise.
+    /// The leading bytes are random in a real one.
+    /// Source: RFC 9000 s10.3.
+    pub fn sendUnopenable(self: *FakePeer, token: ?[16]u8) !void {
+        var out: [64]u8 = @splat(0x33);
+        out[0] = 0x40; // short header, fixed bit set
+        if (token) |t| @memcpy(out[out.len - t.len ..], &t);
+        try self.sock.send(self.io, &self.client_addr, &out);
+    }
+
     /// Seals `payload` as one 1-RTT packet and sends it. Frames put in
     /// together arrive together.
     pub fn sendFrames(self: *FakePeer, payload: []const u8) !void {
@@ -88,6 +140,7 @@ pub const FakePeer = struct {
             .pn = self.pn,
             // Four bytes, so no payload is too short to sample.
             .pn_len = 4,
+            .key_phase = self.key_phase,
         }, payload, self.keys);
         self.pn += 1;
         try self.sock.send(self.io, &self.client_addr, out[0..n]);
