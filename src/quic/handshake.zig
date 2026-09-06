@@ -66,6 +66,42 @@ fn writeFields(w: *std.Io.Writer, ch: ClientHello) !void {
     try w.writeAll(ch.extensions);
 }
 
+/// The server's half of the exchange. `session_id` echoes what the client
+/// sent, which TLS 1.3 keeps only to look like a resumption to middleboxes.
+/// Source: RFC 8446 s4.1.3.
+pub const ServerHelloOut = struct {
+    random: Random,
+    session_id: []const u8 = &.{},
+    cipher_suite: u16,
+    /// Our key share and the selected version, already encoded.
+    extensions: []const u8,
+};
+
+pub fn writeServerHello(out: []u8, sh: ServerHelloOut) Error![]u8 {
+    var w = std.Io.Writer.fixed(out);
+    writeServerFields(&w, sh) catch return error.BufferTooSmall;
+    return w.buffered();
+}
+
+fn writeServerFields(w: *std.Io.Writer, sh: ServerHelloOut) !void {
+    const body_len = 2 + @sizeOf(Random) + 1 + sh.session_id.len + 2 + 1 + 2 + sh.extensions.len;
+    try w.writeInt(u8, @backingInt(HandshakeType.server_hello), .big);
+    try w.writeInt(u24, @intCast(body_len), .big);
+
+    try w.writeInt(u16, legacy_version, .big);
+    try w.writeAll(&sh.random);
+
+    try w.writeInt(u8, @intCast(sh.session_id.len), .big);
+    try w.writeAll(sh.session_id);
+
+    try w.writeInt(u16, sh.cipher_suite, .big);
+    // legacy_compression_method: null.
+    try w.writeInt(u8, 0, .big);
+
+    try w.writeInt(u16, @intCast(sh.extensions.len), .big);
+    try w.writeAll(sh.extensions);
+}
+
 /// Writes one extension as `type ++ u16 len ++ body`.
 pub fn writeExtension(w: *std.Io.Writer, ext_type: u16, body: []const u8) !void {
     try w.writeInt(u16, ext_type, .big);
@@ -101,6 +137,26 @@ pub fn writeKeyShare(w: *std.Io.Writer, public_key: PublicKey) !void {
     try w.writeInt(u16, @backingInt(NamedGroup.x25519), .big);
     try w.writeInt(u16, public_key.len, .big);
     try w.writeAll(&public_key);
+}
+
+/// The server's key_share: one entry, with none of the list prefix a
+/// ClientHello carries.
+/// Source: RFC 8446 s4.2.8.
+pub fn writeServerKeyShare(w: *std.Io.Writer, public_key: PublicKey) !void {
+    try w.writeInt(u16, @backingInt(ExtensionType.key_share), .big);
+    try w.writeInt(u16, 2 + 2 + public_key.len, .big);
+    try w.writeInt(u16, @backingInt(NamedGroup.x25519), .big);
+    try w.writeInt(u16, public_key.len, .big);
+    try w.writeAll(&public_key);
+}
+
+/// supported_versions naming the one version selected, which is a single
+/// value where a ClientHello sends a list.
+/// Source: RFC 8446 s4.2.1.
+pub fn writeSelectedVersion(w: *std.Io.Writer) !void {
+    try w.writeInt(u16, @backingInt(ExtensionType.supported_versions), .big);
+    try w.writeInt(u16, 2, .big);
+    try w.writeInt(u16, @backingInt(ProtocolVersion.tls_1_3), .big);
 }
 
 /// supported_versions offering TLS 1.3 only.
