@@ -12,8 +12,8 @@ pub const profile = @import("profile.zig");
 pub const frame = @import("frame.zig");
 pub const tls = @import("tls.zig");
 pub const handshake = @import("handshake.zig");
-pub const client = @import("client.zig");
-pub const conn = @import("conn.zig");
+pub const connection = @import("connection.zig");
+pub const endpoint = @import("endpoint.zig");
 pub const testdata = @import("testdata.zig");
 
 test {
@@ -26,6 +26,6 @@ test {
     _ = frame;
     _ = tls;
     _ = handshake;
-    _ = client;
-    _ = conn;
+    _ = connection;
+    _ = endpoint;
 }

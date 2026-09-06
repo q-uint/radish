@@ -2,7 +2,7 @@
 //! control.
 //!
 //! Nothing here reads a clock. Every entry point takes the time it happens at,
-//! in milliseconds, so `conn.zig` passes real time and a test passes its own.
+//! in milliseconds, so `endpoint.zig` passes real time and a test passes its own.
 const std = @import("std");
 
 const packet = @import("packet.zig");

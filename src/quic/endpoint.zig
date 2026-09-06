@@ -1,12 +1,12 @@
-//! A QUIC connection over a UDP socket: the handshake driven to completion,
-//! then stream data.
+//! One endpoint: a UDP socket, the timers a connection runs on, and the
+//! connection state it drives.
 //!
-//! Every buffer lives in the struct and is pointed at by the handshaker, so a
-//! `Conn` must be initialized where it will stay, never returned by value.
+//! Every buffer lives in the struct and is pointed at by the connection, so an
+//! `Endpoint` must be initialized where it will stay, never returned by value.
 const std = @import("std");
 
 const dial = @import("../net/dial.zig");
-const client = @import("client.zig");
+const connection = @import("connection.zig");
 const packet = @import("packet.zig");
 const profile = @import("profile.zig");
 const recovery = @import("recovery.zig");
@@ -20,7 +20,7 @@ pub const Error = error{
     DatagramTooLarge,
     SendStalled,
     HandshakeUnconfirmed,
-} || client.Error;
+} || connection.Error;
 
 /// Where the connection reads time. A test supplies its own so a timer can be
 /// driven to expiry without waiting for it.
@@ -70,12 +70,12 @@ pub const Options = struct {
     capture: ?*std.Io.Writer = null,
 };
 
-pub const Conn = struct {
+pub const Endpoint = struct {
     io: std.Io,
     sock: std.Io.net.Socket,
     addr: std.Io.net.IpAddress,
     opts: Options,
-    hs: client.Handshaker,
+    conn: connection.Connection,
 
     /// The ClientHello as sent, for retransmitting it.
     hello: []const u8 = &.{},
@@ -116,32 +116,32 @@ pub const Conn = struct {
     /// handshake flight carries a certificate, so it gets room to spare.
     initial_crypto: [4 * 1024]u8 = undefined,
     handshake_crypto: [16 * 1024]u8 = undefined,
-    stream_buf: [client.default_window]u8 = undefined,
+    stream_buf: [connection.default_window]u8 = undefined,
     /// Everything the sender can have outstanding at once.
-    send_buf: [stream.Sender.max_chunks * client.max_stream_chunk]u8 = undefined,
-    hello_buf: [client.max_client_hello]u8 = undefined,
-    messages: [client.max_flight]u8 = undefined,
+    send_buf: [stream.Sender.max_chunks * connection.max_stream_chunk]u8 = undefined,
+    hello_buf: [connection.max_client_hello]u8 = undefined,
+    messages: [connection.max_flight]u8 = undefined,
     /// Received datagrams, and the copy decryption works on so `last` keeps the
     /// bytes as they arrived.
-    datagram: [client.max_receive_datagram]u8 = undefined,
-    work: [client.max_receive_datagram]u8 = undefined,
-    plain: [client.max_receive_datagram]u8 = undefined,
+    datagram: [connection.max_receive_datagram]u8 = undefined,
+    work: [connection.max_receive_datagram]u8 = undefined,
+    plain: [connection.max_receive_datagram]u8 = undefined,
 
     /// Binds a socket and sends the first flight. `self` must already be where
     /// it will live, and may hold anything: every field is set here, since a
     /// caller that allocated the struct never ran the field defaults.
-    pub fn open(self: *Conn, io: std.Io, opts: Options) !void {
+    pub fn open(self: *Endpoint, io: std.Io, opts: Options) !void {
         self.* = .{
             .io = io,
             .opts = opts,
             .sock = undefined,
             .addr = undefined,
-            .hs = undefined,
+            .conn = undefined,
         };
         const kp = try std.crypto.dh.X25519.KeyPair.generateDeterministic(opts.secret);
 
-        var datagram: [client.max_initial_datagram]u8 = undefined;
-        const initial = try client.initialDatagram(&datagram, &self.hello_buf, .{
+        var datagram: [connection.max_initial_datagram]u8 = undefined;
+        const initial = try connection.initialDatagram(&datagram, &self.hello_buf, .{
             .dcid = opts.dcid,
             .scid = opts.dcid,
             .random = opts.random,
@@ -166,7 +166,7 @@ pub const Conn = struct {
         self.last_arrival_ms = self.now_ms;
         self.last_stream_ms = self.now_ms;
         self.opened_ms = self.now_ms;
-        self.hs = client.Handshaker.init(.{
+        self.conn = connection.Connection.init(.{
             .original_dcid = opts.dcid,
             .our_scid = opts.dcid,
             .client_hello = initial.client_hello,
@@ -179,11 +179,11 @@ pub const Conn = struct {
         // Both fields hold something from here on, whatever the send does.
         self.ready = true;
         self.sock_open = true;
-        self.hs.now_ms = self.now_ms;
-        self.hs.profile = &self.profile;
+        self.conn.now_ms = self.now_ms;
+        self.conn.profile = &self.profile;
         // The ClientHello is packet 0 of the Initial space and carries CRYPTO,
         // so it is what the first probe timeout waits on.
-        self.hs.recovery.onSent(.initial, 0, initial.len, self.now_ms);
+        self.conn.recovery.onSent(.initial, 0, initial.len, self.now_ms);
 
         try self.sendDatagram(datagram[0..initial.len]);
     }
@@ -195,15 +195,15 @@ pub const Conn = struct {
     ///
     /// Safe to call on a connection that never opened, and safe to call twice,
     /// so a caller can defer it before the connection exists.
-    pub fn close(self: *Conn) void {
+    pub fn close(self: *Endpoint) void {
         if (!self.sock_open) return;
         self.sock_open = false;
         // A peer that reset us holds nothing to release, and would answer a
         // goodbye with another reset.
         // Source: RFC 9000 s10.3.
-        if (self.hs.app_keys != null and self.hs.closed == null and !self.hs.stateless_reset) {
-            var out: [client.max_initial_datagram]u8 = undefined;
-            if (self.hs.sealClose(&out, "done") catch null) |n| {
+        if (self.conn.app_keys != null and self.conn.closed == null and !self.conn.stateless_reset) {
+            var out: [connection.max_initial_datagram]u8 = undefined;
+            if (self.conn.sealClose(&out, "done") catch null) |n| {
                 self.sendDatagram(out[0..n]) catch {};
             }
         }
@@ -212,9 +212,9 @@ pub const Conn = struct {
 
     /// Why the peer closed, or null when it did not or the connection never got
     /// far enough to hear it.
-    pub fn peerClose(self: *const Conn) ?*const client.Close {
+    pub fn peerClose(self: *const Endpoint) ?*const connection.Close {
         if (!self.ready) return null;
-        if (self.hs.closed) |*reason| return reason;
+        if (self.conn.closed) |*reason| return reason;
         return null;
     }
 
@@ -230,25 +230,25 @@ pub const Conn = struct {
 
     /// Opens a connection and drives the handshake to confirmation, which is
     /// where every exchange over it starts.
-    pub fn establish(self: *Conn, io: std.Io, opts: Options) !void {
+    pub fn establish(self: *Endpoint, io: std.Io, opts: Options) !void {
         try self.open(io, opts);
         errdefer self.close();
         try self.handshake();
-        if (!self.hs.confirmed) return error.HandshakeUnconfirmed;
+        if (!self.conn.confirmed) return error.HandshakeUnconfirmed;
     }
 
     /// Reads datagrams until the handshake is confirmed, the peer closes, or
     /// the datagram budget runs out.
-    pub fn handshake(self: *Conn) !void {
+    pub fn handshake(self: *Endpoint) !void {
         while (self.datagrams < self.opts.max_datagrams) {
             if (try self.service() != .arrived) break;
-            if (self.hs.confirmed) return;
+            if (self.conn.confirmed) return;
         }
         if (self.datagrams == 0) return error.NoReply;
     }
 
     /// One datagram in, and whatever it obliges us to send back out.
-    pub fn service(self: *Conn) !Serviced {
+    pub fn service(self: *Endpoint) !Serviced {
         const arrived = self.receive() orelse {
             self.profile.silent += 1;
             return .silent;
@@ -259,7 +259,7 @@ pub const Conn = struct {
         self.profile.bytes_in += arrived.len;
         self.last = arrived;
         self.now_ms = self.opts.clock.nowMs(self.io);
-        self.hs.now_ms = self.now_ms;
+        self.conn.now_ms = self.now_ms;
         if (self.opts.capture) |w| {
             w.print("{x}\n", .{arrived}) catch {};
             w.flush() catch {};
@@ -267,12 +267,12 @@ pub const Conn = struct {
 
         // The furthest byte the peer has sent, not what the reader has taken:
         // this is about the transfer moving, not about who is draining it.
-        const before = self.hs.stream.highest;
+        const before = self.conn.stream.highest;
         if (arrived.len > self.work.len) {
             self.last_err = error.DatagramTooLarge;
         } else {
             @memcpy(self.work[0..arrived.len], arrived);
-            if (self.hs.push(&self.plain, self.work[0..arrived.len])) {
+            if (self.conn.push(&self.plain, self.work[0..arrived.len])) {
                 // Only a datagram that opened counts as the peer still being
                 // there. Anything can be sent at us, and garbage that reset the
                 // idle timeout would hold the connection open forever.
@@ -290,22 +290,22 @@ pub const Conn = struct {
                 if (e == error.PeerClosed or e == error.StatelessReset) return .closed;
             }
         }
-        if (self.hs.stream.highest != before) self.last_stream_ms = self.now_ms;
+        if (self.conn.stream.highest != before) self.last_stream_ms = self.now_ms;
 
         // Acknowledge before reading on: an unacknowledged flight makes the
         // peer retransmit it, and the ACK is what ends that.
-        var out: [client.max_initial_datagram]u8 = undefined;
+        var out: [connection.max_initial_datagram]u8 = undefined;
         for ([_]packet.Space{ .initial, .handshake, .application }) |space| {
-            const n = try self.hs.sealAck(&out, space) orelse continue;
+            const n = try self.conn.sealAck(&out, space) orelse continue;
             self.sendDatagram(out[0..n]) catch {};
         }
 
         // Both need 1-RTT keys, so there is nothing owed until they exist.
-        if (self.hs.app_keys != null) {
-            if (try self.hs.sealPathResponse(&out)) |n| {
+        if (self.conn.app_keys != null) {
+            if (try self.conn.sealPathResponse(&out)) |n| {
                 self.sendDatagram(out[0..n]) catch {};
             }
-            if (try self.hs.sealMaxData(&out)) |n| {
+            if (try self.conn.sealMaxData(&out)) |n| {
                 self.sendDatagram(out[0..n]) catch {};
             }
         }
@@ -314,12 +314,12 @@ pub const Conn = struct {
         // for that before confirming the handshake. Writing the flight advances
         // the transcript, so there is one attempt at it and no more, whatever
         // happens to the packet.
-        if (self.hs.done() and !self.hs.flight_sent) send: {
-            self.flight = self.hs.writeFlight(&self.messages, self.opts.identity) catch |e| {
+        if (self.conn.done() and !self.conn.flight_sent) send: {
+            self.flight = self.conn.writeFlight(&self.messages, self.opts.identity) catch |e| {
                 self.last_err = e;
                 break :send;
             };
-            const n = self.hs.sealFlight(&out, self.flight.?) catch |e| {
+            const n = self.conn.sealFlight(&out, self.flight.?) catch |e| {
                 self.last_err = e;
                 break :send;
             };
@@ -332,14 +332,14 @@ pub const Conn = struct {
 
         // An ACK can reveal that something earlier never landed. Repairing it
         // now beats waiting for a timer that is only there for silence.
-        if (self.hs.takeLost()) _ = self.repair(&out, false);
+        if (self.conn.takeLost()) _ = self.repair(&out, false);
         return .arrived;
     }
 
     /// Waits for a datagram, doing what the clock owes while nothing comes.
     /// Null when there is nothing left to wait for, or once a tick has gone by
     /// so the caller can look around.
-    fn receive(self: *Conn) ?[]const u8 {
+    fn receive(self: *Endpoint) ?[]const u8 {
         const started = self.opts.clock.nowMs(self.io);
         while (true) {
             self.now_ms = self.opts.clock.nowMs(self.io);
@@ -372,18 +372,18 @@ pub const Conn = struct {
 
     /// How long to sit in the next read: until the earliest thing owed, and
     /// never past one tick.
-    fn waitMs(self: *const Conn) u64 {
+    fn waitMs(self: *const Endpoint) u64 {
         var wait = self.opts.timeout_ms;
-        if (self.hs.recovery.timer()) |t| wait = @min(wait, t.afterMs(self.now_ms));
+        if (self.conn.recovery.timer()) |t| wait = @min(wait, t.afterMs(self.now_ms));
         // An ACK held back for a second packet that never comes still has to
         // go before the peer's patience runs out.
-        if (self.hs.ackDeadlineMs()) |at| wait = @min(wait, at -| self.now_ms);
+        if (self.conn.ackDeadlineMs()) |at| wait = @min(wait, at -| self.now_ms);
 
         // Deadlines too, so neither rests on a tick being shorter than they are.
-        const idle = self.hs.idleTimeoutMs();
+        const idle = self.conn.idleTimeoutMs();
         const quiet = self.now_ms -| self.last_arrival_ms;
         wait = @min(wait, idle -| quiet);
-        if (self.hs.app_keys != null) {
+        if (self.conn.app_keys != null) {
             const since_ping = self.now_ms -| @max(self.last_arrival_ms, self.last_ping_ms);
             wait = @min(wait, (idle / 2) -| since_ping);
         }
@@ -391,36 +391,36 @@ pub const Conn = struct {
     }
 
     /// The recovery timer, if it is already due.
-    fn due(self: *const Conn) ?recovery.Timer {
-        const t = self.hs.recovery.timer() orelse return null;
+    fn due(self: *const Endpoint) ?recovery.Timer {
+        const t = self.conn.recovery.timer() orelse return null;
         return if (t.afterMs(self.now_ms) == 0) t else null;
     }
 
     /// Acts on the silence so far. False when the connection is finished with:
     /// the peer has stopped answering, or probing has run out of attempts.
     /// Source: RFC 9002 s6.1.2, s6.2.4.
-    fn onTimeout(self: *Conn) bool {
+    fn onTimeout(self: *Endpoint) bool {
         self.now_ms = self.opts.clock.nowMs(self.io);
-        self.hs.now_ms = self.now_ms;
+        self.conn.now_ms = self.now_ms;
         // Past the idle timeout there is nothing left to resend to.
         if (self.stalled()) return false;
 
-        var out: [client.max_initial_datagram]u8 = undefined;
+        var out: [connection.max_initial_datagram]u8 = undefined;
         // Whatever else the silence means, an ACK that has run out of time
         // goes first: no datagram is coming to carry it.
-        if (self.hs.sealAck(&out, .application) catch null) |n| {
+        if (self.conn.sealAck(&out, .application) catch null) |n| {
             self.sendDatagram(out[0..n]) catch {};
             return true;
         }
         if (self.due()) |t| {
             switch (t.kind) {
                 // The reordering window passed, so what it held open is lost.
-                .loss => _ = self.hs.recovery.onLossTimer(t.space, self.now_ms),
+                .loss => _ = self.conn.recovery.onLossTimer(t.space, self.now_ms),
                 // Nothing acknowledged for a whole probe timeout. A run of
                 // them means the peer is not there.
                 .probe => {
-                    self.hs.recovery.onProbe();
-                    if (self.hs.recovery.backoff > self.opts.max_retries) return false;
+                    self.conn.recovery.onProbe();
+                    if (self.conn.recovery.backoff > self.opts.max_retries) return false;
                 },
             }
             if (self.repair(&out, t.kind == .probe)) return true;
@@ -433,16 +433,16 @@ pub const Conn = struct {
     /// whether anything was. `probing` must put something on the wire even if
     /// all of it has already been tried.
     /// Source: RFC 9000 s13.3, RFC 9002 s6.2.4.
-    fn repair(self: *Conn, out: []u8, probing: bool) bool {
-        if (self.hs.confirmed) {
+    fn repair(self: *Endpoint, out: []u8, probing: bool) bool {
+        if (self.conn.confirmed) {
             self.now_ms = self.opts.clock.nowMs(self.io);
-            self.hs.now_ms = self.now_ms;
+            self.conn.now_ms = self.now_ms;
             // A burst of loss in one go rather than a chunk per timeout. Each
             // chunk goes at most once per acknowledgement, so this ends.
             var sent = false;
             for (0..stream.Sender.max_chunks) |_| {
-                if (!self.hs.recovery.canSend(client.min_initial_datagram)) break;
-                const n = self.hs.resendStream(out, false) catch null orelse break;
+                if (!self.conn.recovery.canSend(connection.min_initial_datagram)) break;
+                const n = self.conn.resendStream(out, false) catch null orelse break;
                 if (!self.emit(out[0..n])) break;
                 sent = true;
             }
@@ -451,17 +451,17 @@ pub const Conn = struct {
             // so the oldest goes again. A probe may exceed the window.
             // Source: RFC 9002 s7.5.
             if (!probing) return false;
-            const n = self.hs.resendStream(out, true) catch null orelse return false;
+            const n = self.conn.resendStream(out, true) catch null orelse return false;
             return self.emit(out[0..n]);
         }
         if (self.flight) |f| {
-            const n = self.hs.sealFlight(out, f) catch null orelse return false;
+            const n = self.conn.sealFlight(out, f) catch null orelse return false;
             return self.emit(out[0..n]);
         }
         // An acknowledged Initial arrived, so silence is about something else
         // and resending would only add noise.
-        if (self.hs.acked(.initial).contains(0)) return false;
-        const n = self.hs.sealInitialRetransmit(out, self.hello) catch null orelse return false;
+        if (self.conn.acked(.initial).contains(0)) return false;
+        const n = self.conn.sealInitialRetransmit(out, self.hello) catch null orelse return false;
         return self.emit(out[0..n]);
     }
 
@@ -469,22 +469,22 @@ pub const Conn = struct {
     /// put up with, which leaves room for a second before it gives up on us.
     /// Whether one went out.
     /// Source: RFC 9000 s10.1.
-    fn keepalive(self: *Conn, out: []u8) bool {
-        if (self.hs.app_keys == null) return false;
+    fn keepalive(self: *Endpoint, out: []u8) bool {
+        if (self.conn.app_keys == null) return false;
         const since = self.now_ms -| @max(self.last_arrival_ms, self.last_ping_ms);
-        if (since < self.hs.idleTimeoutMs() / 2) return false;
+        if (since < self.conn.idleTimeoutMs() / 2) return false;
         self.last_ping_ms = self.now_ms;
-        const n = self.hs.sealPing(out) catch null orelse return false;
+        const n = self.conn.sealPing(out) catch null orelse return false;
         return self.emit(out[0..n]);
     }
 
-    fn emit(self: *Conn, datagram: []const u8) bool {
+    fn emit(self: *Endpoint, datagram: []const u8) bool {
         self.sendDatagram(datagram) catch return false;
         return true;
     }
 
     /// Every datagram leaves through here, so the counters see all of them.
-    fn sendDatagram(self: *Conn, datagram: []const u8) !void {
+    fn sendDatagram(self: *Endpoint, datagram: []const u8) !void {
         try self.sock.send(self.io, &self.addr, datagram);
         self.profile.datagrams_out += 1;
         self.profile.bytes_out += datagram.len;
@@ -496,18 +496,18 @@ pub const Conn = struct {
     ///
     /// The loop runs at least once so that empty `data` with `fin` set closes
     /// the stream on its own.
-    pub fn send(self: *Conn, data: []const u8, fin: bool) !void {
+    pub fn send(self: *Endpoint, data: []const u8, fin: bool) !void {
         var rest = data;
         while (true) {
             const room = @min(
-                client.max_stream_chunk,
-                @min(self.hs.sendRoom(), self.hs.sender.room()),
+                connection.max_stream_chunk,
+                @min(self.conn.sendRoom(), self.conn.sender.room()),
             );
             // The peer's windows say what it will hold. The congestion window
             // says what the path will carry, counted as a whole datagram,
             // since that is what goes out and what the window is measured in.
             // Source: RFC 9002 s7.
-            if (room == 0 or !self.hs.recovery.canSend(client.min_initial_datagram)) {
+            if (room == 0 or !self.conn.recovery.canSend(connection.min_initial_datagram)) {
                 switch (try self.service()) {
                     .arrived => {},
                     // A peer that has closed will never take more, so the room
@@ -519,12 +519,12 @@ pub const Conn = struct {
             }
 
             const take = @min(rest.len, room);
-            var out: [client.max_initial_datagram]u8 = undefined;
+            var out: [connection.max_initial_datagram]u8 = undefined;
             // Stamped with the clock as of now: what a packet is sent at is
             // what its round trip is later measured against.
             self.now_ms = self.opts.clock.nowMs(self.io);
-            self.hs.now_ms = self.now_ms;
-            const n = try self.hs.sealStream(&out, rest[0..take], fin and take == rest.len);
+            self.conn.now_ms = self.now_ms;
+            const n = try self.conn.sealStream(&out, rest[0..take], fin and take == rest.len);
             try self.sendDatagram(out[0..n]);
 
             rest = rest[take..];
@@ -533,66 +533,67 @@ pub const Conn = struct {
     }
 
     /// Stream bytes in order and not yet consumed.
-    pub fn readable(self: *const Conn) []const u8 {
-        return self.hs.stream.readable();
+    pub fn readable(self: *const Endpoint) []const u8 {
+        return self.conn.stream.readable();
     }
 
     /// Whether the peer has finished its half of the stream and all of it has
-    /// been read. Not `Handshaker.done`, which is about the handshake.
-    pub fn streamDone(self: *const Conn) bool {
-        return self.hs.stream.done();
+    /// been read. Not `connection.Connection.done`, which is about the
+    /// handshake.
+    pub fn streamDone(self: *const Endpoint) bool {
+        return self.conn.stream.done();
     }
 
     /// Whether the peer abandoned its half of the stream.
-    pub fn streamReset(self: *const Conn) bool {
-        return self.ready and self.hs.stream.reset;
+    pub fn streamReset(self: *const Endpoint) bool {
+        return self.ready and self.conn.stream.reset;
     }
 
     /// Whether the peer proved it has thrown away this connection. Nothing more
     /// can be sent on it, not even a goodbye.
     /// Source: RFC 9000 s10.3.
-    pub fn wasReset(self: *const Conn) bool {
-        return self.ready and self.hs.stateless_reset;
+    pub fn wasReset(self: *const Endpoint) bool {
+        return self.ready and self.conn.stateless_reset;
     }
 
     /// Whether the silence has run past what the peer said it would wait, at
     /// which point it has dropped us and nothing more is coming.
-    pub fn stalled(self: *const Conn) bool {
-        return self.ready and self.now_ms -| self.last_arrival_ms >= self.hs.idleTimeoutMs();
+    pub fn stalled(self: *const Endpoint) bool {
+        return self.ready and self.now_ms -| self.last_arrival_ms >= self.conn.idleTimeoutMs();
     }
 
     /// Whether the stream has stopped moving for as long as the peer would
     /// wait, which is a transfer that will not finish even though the
     /// connection is alive: a peer blocked on something it will not get keeps
     /// pinging, so `stalled` never fires on its own.
-    pub fn streamStalled(self: *const Conn) bool {
-        return self.ready and self.now_ms -| self.last_stream_ms >= self.hs.idleTimeoutMs();
+    pub fn streamStalled(self: *const Endpoint) bool {
+        return self.ready and self.now_ms -| self.last_stream_ms >= self.conn.idleTimeoutMs();
     }
 
     /// What the last datagram went wrong with. `service` records these rather
     /// than raising them, since one unreadable datagram is not the end of the
     /// connection. A stall afterwards usually has its reason here.
-    pub fn lastError(self: *const Conn) ?anyerror {
+    pub fn lastError(self: *const Endpoint) ?anyerror {
         return self.last_err;
     }
 
     /// Whether the handshake got all the way to confirmation.
-    pub fn confirmed(self: *const Conn) bool {
-        return self.ready and self.hs.confirmed;
+    pub fn confirmed(self: *const Endpoint) bool {
+        return self.ready and self.conn.confirmed;
     }
 
     /// What the peer told us about itself, or null before there is a handshake
     /// to have told us anything.
-    pub fn accepted(self: *const Conn) ?*const client.Accepted {
+    pub fn accepted(self: *const Endpoint) ?*const connection.Accepted {
         if (!self.ready) return null;
-        return &self.hs.accepted;
+        return &self.conn.accepted;
     }
 
     /// The counters, with the round trip and window folded in as they stand.
-    pub fn profiled(self: *Conn) *const profile.Profile {
+    pub fn profiled(self: *Endpoint) *const profile.Profile {
         if (self.ready) {
-            self.profile.rtt_ms = self.hs.recovery.rtt.smoothed_ms;
-            self.profile.cwnd = self.hs.recovery.cc.window;
+            self.profile.rtt_ms = self.conn.recovery.rtt.smoothed_ms;
+            self.profile.cwnd = self.conn.recovery.cc.window;
         }
         // When the bytes stopped arriving, which is the transfer whether the
         // peer ended it with a FIN or by closing the connection.
@@ -600,8 +601,8 @@ pub const Conn = struct {
         return &self.profile;
     }
 
-    pub fn consume(self: *Conn, n: usize) void {
-        self.hs.stream.consume(n);
+    pub fn consume(self: *Endpoint, n: usize) void {
+        self.conn.stream.consume(n);
     }
 };
 
@@ -610,7 +611,7 @@ const crypto = @import("crypto.zig");
 const testdata = @import("testdata.zig");
 
 test "opening sets every field, whatever the memory held" {
-    const c = try testing.allocator.create(Conn);
+    const c = try testing.allocator.create(Endpoint);
     defer testing.allocator.destroy(c);
     // What an allocator hands back is not zeroed, and field defaults do not run
     // for it, so `open` has to write everything itself.
@@ -629,21 +630,21 @@ test "opening sets every field, whatever the memory held" {
     });
     defer c.close();
 
-    try testing.expectEqual(client.min_initial_datagram, c.sent);
+    try testing.expectEqual(connection.min_initial_datagram, c.sent);
     try testing.expectEqual(@as(usize, 0), c.datagrams);
     try testing.expectEqual(@as(usize, 0), c.received);
     try testing.expectEqual(@as(?anyerror, null), c.last_err);
     try testing.expectEqual(@as(usize, 0), c.last.len);
     try testing.expect(!c.flight_out);
-    try testing.expect(!c.hs.confirmed);
+    try testing.expect(!c.conn.confirmed);
 }
 
 test "closing is safe however far opening got, and sends one goodbye at most" {
-    const unopened = try testing.allocator.create(Conn);
+    const unopened = try testing.allocator.create(Endpoint);
     defer testing.allocator.destroy(unopened);
     @memset(std.mem.asBytes(unopened), 0xaa);
 
-    // Rejected before the socket or the handshaker exist, so both still hold
+    // Rejected before the socket or the connection exist, so both still hold
     // whatever the allocator handed back.
     try testing.expectError(error.InvalidHostName, unopened.open(testing.io, .{
         .host = "not a host",
@@ -655,10 +656,10 @@ test "closing is safe however far opening got, and sends one goodbye at most" {
         .identity = try Ed25519.KeyPair.generateDeterministic(@splat(4)),
     }));
     try testing.expect(!unopened.ready);
-    try testing.expectEqual(@as(?*const client.Close, null), unopened.peerClose());
+    try testing.expectEqual(@as(?*const connection.Close, null), unopened.peerClose());
     unopened.close();
 
-    const c = try testing.allocator.create(Conn);
+    const c = try testing.allocator.create(Endpoint);
     defer testing.allocator.destroy(c);
     @memset(std.mem.asBytes(c), 0xaa);
 
@@ -686,7 +687,7 @@ test "closing is safe however far opening got, and sends one goodbye at most" {
 /// A connection on a clock the test moves, with the state a finished handshake
 /// would have left: keys, confirmation, and nothing outstanding, since what the
 /// handshake sent stops being tracked once it completes.
-fn clocked(c: *Conn, dcid: []const u8, at: *const u64) !void {
+fn clocked(c: *Endpoint, dcid: []const u8, at: *const u64) !void {
     @memset(std.mem.asBytes(c), 0xaa);
     try c.open(testing.io, .{
         .host = "127.0.0.1",
@@ -701,22 +702,22 @@ fn clocked(c: *Conn, dcid: []const u8, at: *const u64) !void {
         .clock = .{ .fixed = at },
     });
     const keys = crypto.keysFromSecret(crypto.initialSecrets(dcid).client);
-    c.hs.app_keys = .{ .send = keys, .recv = keys };
-    c.hs.confirmed = true;
-    c.hs.recovery.confirmed = true;
-    c.hs.recovery.discard(.initial);
+    c.conn.app_keys = .{ .send = keys, .recv = keys };
+    c.conn.confirmed = true;
+    c.conn.recovery.confirmed = true;
+    c.conn.recovery.discard(.initial);
 }
 
 test "a quiet connection is held open by halves, then given up at the idle timeout" {
     const dcid = [_]u8{ 0xc0, 0xff, 0xee, 0x02 };
-    const c = try testing.allocator.create(Conn);
+    const c = try testing.allocator.create(Endpoint);
     defer testing.allocator.destroy(c);
 
     var at: u64 = 1_000_000;
     try clocked(c, &dcid, &at);
     defer c.close();
 
-    const idle = c.hs.idleTimeoutMs();
+    const idle = c.conn.idleTimeoutMs();
     const opened = at;
 
     // Just short of half the timeout, nothing is owed.
@@ -729,7 +730,7 @@ test "a quiet connection is held open by halves, then given up at the idle timeo
     at = opened + idle / 2 + 1;
     try testing.expect(c.onTimeout());
     try testing.expectEqual(at, c.last_ping_ms);
-    try testing.expectEqual(@as(usize, 1), c.hs.recovery.tracker(.application).count);
+    try testing.expectEqual(@as(usize, 1), c.conn.recovery.tracker(.application).count);
 
     // A keepalive does not count as the connection being busy, so the silence
     // still runs out on schedule. `stalled` reads the clock as the connection
@@ -741,7 +742,7 @@ test "a quiet connection is held open by halves, then given up at the idle timeo
 
 test "a peer that stops answering is written off after a run of probes" {
     const dcid = [_]u8{ 0xc0, 0xff, 0xee, 0x05 };
-    const c = try testing.allocator.create(Conn);
+    const c = try testing.allocator.create(Endpoint);
     defer testing.allocator.destroy(c);
 
     var at: u64 = 1_000_000;
@@ -749,13 +750,13 @@ test "a peer that stops answering is written off after a run of probes" {
     defer c.close();
 
     // One ack-eliciting packet outstanding, which is what a probe is about.
-    var out: [client.max_initial_datagram]u8 = undefined;
-    _ = try c.hs.sealPing(&out);
+    var out: [connection.max_initial_datagram]u8 = undefined;
+    _ = try c.conn.sealPing(&out);
 
     // Jump to each timeout as it comes due. Every probe doubles the wait, so
     // this is seconds of silence rather than the full idle timeout.
     var probes: usize = 0;
-    while (c.hs.recovery.timer()) |t| {
+    while (c.conn.recovery.timer()) |t| {
         at = t.at_ms;
         if (!c.onTimeout()) break;
         probes += 1;
@@ -764,5 +765,5 @@ test "a peer that stops answering is written off after a run of probes" {
     // Each expiry probes. The one after the budget is spent gives up instead.
     try testing.expectEqual(c.opts.max_retries, probes);
     try testing.expect(!c.stalled());
-    try testing.expect(at - 1_000_000 < c.hs.idleTimeoutMs());
+    try testing.expect(at - 1_000_000 < c.conn.idleTimeoutMs());
 }

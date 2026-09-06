@@ -1,4 +1,5 @@
-//! The client side of a QUIC handshake, from the first flight through 1-RTT.
+//! One QUIC connection: the handshake either end drives, then the packet
+//! number spaces, streams, acknowledgements and keys it leaves behind.
 const std = @import("std");
 
 const codec = @import("../codec.zig");
@@ -149,7 +150,7 @@ pub const Config = struct {
     /// disables SNI so the endpoint id stays out of the ClientHello, so leave it
     /// null there.
     server_name: ?[]const u8 = null,
-    /// The flow control limits to advertise. `Handshaker.Options.stream_buf`
+    /// The flow control limits to advertise. `Connection.Options.stream_buf`
     /// has to be this long, since it is where the peer's bytes land.
     window: u64 = default_window,
 };
@@ -369,10 +370,10 @@ pub const Role = enum {
     }
 };
 
-/// A client handshake in progress. Keys for the Handshake packet number space
-/// only exist once the ServerHello has been read, so the two CRYPTO streams and
-/// the transcript outlive any single datagram.
-pub const Handshaker = struct {
+/// A handshake in progress, from either side. Keys for the Handshake packet
+/// number space only exist once the hello the role waits on has been read, so
+/// the two CRYPTO streams and the transcript outlive any single datagram.
+pub const Connection = struct {
     /// Everything the ServerHello yields at once.
     pub const Derived = struct {
         /// The master secret, and so the application keys, still need this
@@ -503,7 +504,7 @@ pub const Handshaker = struct {
     /// every ack-eliciting packet sealed here and every ACK opened here.
     recovery: recovery.Recovery = recovery.Recovery.init(min_initial_datagram),
     /// The clock as the connection last read it, in milliseconds. Nothing here
-    /// reads it: `conn.zig` sets it each turn, and the sealing paths stamp what
+    /// reads it: `endpoint.zig` sets it each turn, and the sealing paths stamp what
     /// they send with it.
     now_ms: u64 = 0,
     /// When the ACK a held-back packet is owed runs out of time, or null when
@@ -569,7 +570,7 @@ pub const Handshaker = struct {
     phase: Phase = .wait_server_hello,
 
     /// True once the server's Finished has been verified.
-    pub fn done(self: *const Handshaker) bool {
+    pub fn done(self: *const Connection) bool {
         return self.phase == .connected;
     }
 
@@ -595,9 +596,9 @@ pub const Handshaker = struct {
         send_buf: []u8 = &.{},
     };
 
-    pub fn init(opts: Options) Handshaker {
+    pub fn init(opts: Options) Connection {
         const initial = crypto.initialSecrets(opts.original_dcid);
-        var self: Handshaker = .{
+        var self: Connection = .{
             .role = opts.role,
             .secret = opts.secret,
             .initial_keys = .{
@@ -620,7 +621,7 @@ pub const Handshaker = struct {
     /// Opens every packet in one datagram, in order, feeding their CRYPTO
     /// frames to the matching stream. `datagram` is decrypted in place;
     /// `scratch` receives each packet's plaintext.
-    pub fn push(self: *Handshaker, scratch: []u8, datagram: []u8) Error!void {
+    pub fn push(self: *Connection, scratch: []u8, datagram: []u8) Error!void {
         var rest = datagram;
         while (rest.len > 0) {
             if (!packet.isLongHeader(rest[0])) {
@@ -676,7 +677,7 @@ pub const Handshaker = struct {
     /// saying it has lost us.
     /// Source: RFC 9001 s6.3, RFC 9000 s10.3.1.
     fn openApp(
-        self: *Handshaker,
+        self: *Connection,
         scratch: []u8,
         rest: []u8,
         datagram: []const u8,
@@ -710,7 +711,7 @@ pub const Handshaker = struct {
     /// since leaking the token would let anyone who can inject a datagram end
     /// the connection at will.
     /// Source: RFC 9000 s10.3, s10.3.1.
-    fn isStatelessReset(self: *const Handshaker, datagram: []const u8) bool {
+    fn isStatelessReset(self: *const Connection, datagram: []const u8) bool {
         const token = self.peer_reset_token orelse return false;
         if (datagram.len < min_stateless_reset_len) return false;
         if (packet.isLongHeader(datagram[0])) return false;
@@ -725,7 +726,7 @@ pub const Handshaker = struct {
     /// carries over, and the receive keys being replaced are kept as
     /// `prev_recv` for whatever is still in flight under them.
     /// Source: RFC 9001 s6.1, s6.2, s6.3.
-    fn openUpdated(self: *Handshaker, scratch: []u8, rest: []u8) Error!packet.OpenedShort {
+    fn openUpdated(self: *Connection, scratch: []u8, rest: []u8) Error!packet.OpenedShort {
         const app = self.accepted.application orelse return error.KeysUnavailable;
         const dir = self.app_keys orelse return error.KeysUnavailable;
 
@@ -757,7 +758,7 @@ pub const Handshaker = struct {
     }
 
     /// Frames from a 1-RTT packet.
-    fn appFrames(self: *Handshaker, payload: []const u8) Error!void {
+    fn appFrames(self: *Connection, payload: []const u8) Error!void {
         var it = frame.Iterator.init(payload);
         while (try it.next()) |f| {
             switch (f) {
@@ -818,7 +819,7 @@ pub const Handshaker = struct {
     /// Sends `data` on the stream, sealed as 1-RTT. The offset advances by what
     /// goes out, so successive calls continue the same stream.
     /// Source: RFC 9000 s19.8.
-    pub fn sealStream(self: *Handshaker, out: []u8, data: []const u8, fin: bool) Error!usize {
+    pub fn sealStream(self: *Connection, out: []u8, data: []const u8, fin: bool) Error!usize {
         if (data.len > max_stream_chunk) return error.StreamChunkTooLong;
         // Both limits bind, and neither is spent until the packet is built.
         if (data.len > self.sendRoom()) return error.FlowControlBlocked;
@@ -836,7 +837,7 @@ pub const Handshaker = struct {
     /// is outstanding; `force` starts from the oldest again whether or not it
     /// has already been tried, which is what a probe needs.
     /// Source: RFC 9000 s13.3, RFC 9002 s6.2.4.
-    pub fn resendStream(self: *Handshaker, out: []u8, force: bool) Error!?usize {
+    pub fn resendStream(self: *Connection, out: []u8, force: bool) Error!?usize {
         self.sender.ack(&self.app_acked);
         const chunk = (if (force)
             self.sender.oldestUnacked()
@@ -857,7 +858,7 @@ pub const Handshaker = struct {
     }
 
     fn sealStreamAt(
-        self: *Handshaker,
+        self: *Connection,
         out: []u8,
         pn: u64,
         offset: u64,
@@ -885,7 +886,7 @@ pub const Handshaker = struct {
     /// An application CONNECTION_CLOSE, so the peer can release what it holds
     /// for us instead of waiting out its idle timeout.
     /// Source: RFC 9000 s10.2.
-    pub fn sealClose(self: *Handshaker, out: []u8, reason: []const u8) Error!usize {
+    pub fn sealClose(self: *Connection, out: []u8, reason: []const u8) Error!usize {
         const keys = (self.app_keys orelse return error.HandshakeIncomplete).send;
         var payload: [128]u8 = undefined;
         var pw = std.Io.Writer.fixed(&payload);
@@ -903,7 +904,7 @@ pub const Handshaker = struct {
     /// A PING, which carries nothing and only asks to be acknowledged. Sent
     /// before the idle timeout to hold a quiet connection open.
     /// Source: RFC 9000 s19.2, s10.1.
-    pub fn sealPing(self: *Handshaker, out: []u8) Error!usize {
+    pub fn sealPing(self: *Connection, out: []u8) Error!usize {
         const keys = (self.app_keys orelse return error.HandshakeIncomplete).send;
         var payload: [codec.max_varint_len]u8 = @splat(0);
         var pw = std.Io.Writer.fixed(&payload);
@@ -922,19 +923,19 @@ pub const Handshaker = struct {
     /// When the connection dies without traffic: the lower of the two
     /// advertised timeouts, or zero when neither side set one.
     /// Source: RFC 9000 s10.1.
-    pub fn idleTimeoutMs(self: *const Handshaker) u64 {
+    pub fn idleTimeoutMs(self: *const Connection) u64 {
         if (self.peer_idle_ms == 0) return idle_timeout_ms;
         return @min(idle_timeout_ms, self.peer_idle_ms);
     }
 
     /// How much the peer will still take from us.
-    pub fn sendRoom(self: *const Handshaker) u64 {
+    pub fn sendRoom(self: *const Connection) u64 {
         return @min(self.send_data.room(), self.send_stream.room());
     }
 
     /// Whether the last grant is neither acknowledged nor still in flight,
     /// which leaves loss as the only explanation for it.
-    fn grantLost(self: *const Handshaker) bool {
+    fn grantLost(self: *const Connection) bool {
         const pn = self.grant_pn orelse return false;
         if (self.app_acked.contains(pn)) return false;
         return !self.recovery.outstanding(.application, pn);
@@ -944,7 +945,7 @@ pub const Handshaker = struct {
     /// or null when there is nothing worth sending. One stream, so the
     /// connection limit and the stream limit move together.
     /// Source: RFC 9000 s4.1.
-    pub fn sealMaxData(self: *Handshaker, out: []u8) Error!?usize {
+    pub fn sealMaxData(self: *Connection, out: []u8) Error!?usize {
         const keys = (self.app_keys orelse return error.HandshakeIncomplete).send;
         if (!self.stream.wantsGrant() and !self.grant_asked and !self.grantLost()) return null;
         self.grant_asked = false;
@@ -976,7 +977,7 @@ pub const Handshaker = struct {
 
     /// A PATH_RESPONSE echoing the challenge the peer sent, sealed as 1-RTT.
     /// Source: RFC 9000 s8.2.
-    pub fn sealPathResponse(self: *Handshaker, out: []u8) Error!?usize {
+    pub fn sealPathResponse(self: *Connection, out: []u8) Error!?usize {
         const challenge = self.path_challenge orelse return null;
         const keys = (self.app_keys orelse return error.HandshakeIncomplete).send;
         const pn = self.takePacketNumber(.application);
@@ -1000,7 +1001,7 @@ pub const Handshaker = struct {
     /// never resent as-is: the information goes in a new packet, and repeating a
     /// number would repeat an AEAD nonce and be discarded as a duplicate anyway.
     /// Source: RFC 9000 s13.3, s12.3.
-    pub fn sealInitialRetransmit(self: *Handshaker, out: []u8, client_hello: []const u8) Error!usize {
+    pub fn sealInitialRetransmit(self: *Connection, out: []u8, client_hello: []const u8) Error!usize {
         var payload: [min_initial_datagram]u8 = undefined;
         var pw = std.Io.Writer.fixed(&payload);
         writeCryptoFrame(&pw, 0, client_hello) catch return error.BufferTooSmall;
@@ -1032,12 +1033,12 @@ pub const Handshaker = struct {
     /// are worth this: an ACK or a CONNECTION_CLOSE is never repeated and never
     /// counted against the window.
     /// Source: RFC 9002 s2, s7.
-    fn tracked(self: *Handshaker, space: packet.Space, pn: u64, n: usize) usize {
+    fn tracked(self: *Connection, space: packet.Space, pn: u64, n: usize) usize {
         self.recovery.onSent(space, pn, n, self.now_ms);
         return n;
     }
 
-    pub fn received(self: *Handshaker, space: packet.Space) *frame.Received {
+    pub fn received(self: *Connection, space: packet.Space) *frame.Received {
         return switch (space) {
             .initial => &self.initial_received,
             .handshake => &self.handshake_received,
@@ -1045,7 +1046,7 @@ pub const Handshaker = struct {
         };
     }
 
-    pub fn acked(self: *Handshaker, space: packet.Space) *frame.NumberSet {
+    pub fn acked(self: *Connection, space: packet.Space) *frame.NumberSet {
         return switch (space) {
             .initial => &self.initial_acked,
             .handshake => &self.handshake_acked,
@@ -1057,7 +1058,7 @@ pub const Handshaker = struct {
     /// actually sent, which also catches an acknowledgement of a packet that
     /// never existed.
     /// Source: RFC 9000 s13.1.
-    fn recordAck(self: *Handshaker, space: packet.Space, a: frame.Ack) Error!void {
+    fn recordAck(self: *Connection, space: packet.Space, a: frame.Ack) Error!void {
         const next = self.nextPacketNumber(space).*;
         if (a.largest >= next) return error.ProtocolViolation;
 
@@ -1098,19 +1099,19 @@ pub const Handshaker = struct {
     /// down by the exponent the peer advertised, so scaling it back up is what
     /// recovers the value it meant.
     /// Source: RFC 9000 s19.3.
-    fn ackDelayMs(self: *const Handshaker, delay: u64) u64 {
+    fn ackDelayMs(self: *const Connection, delay: u64) u64 {
         const scaled = delay *| (@as(u64, 1) << self.peer_ack_exponent);
         return scaled / std.time.us_per_ms;
     }
 
     /// Whether loss detection has found something since the caller last asked.
     /// Repairing it is the caller's: only it can put bytes back on the wire.
-    pub fn takeLost(self: *Handshaker) bool {
+    pub fn takeLost(self: *Connection) bool {
         defer self.lost = false;
         return self.lost;
     }
 
-    fn nextPacketNumber(self: *Handshaker, space: packet.Space) *u64 {
+    fn nextPacketNumber(self: *Connection, space: packet.Space) *u64 {
         return switch (space) {
             .initial => &self.next_initial_pn,
             .handshake => &self.next_handshake_pn,
@@ -1119,7 +1120,7 @@ pub const Handshaker = struct {
     }
 
     /// Consumes the next packet number in `space`.
-    fn takePacketNumber(self: *Handshaker, space: packet.Space) u64 {
+    fn takePacketNumber(self: *Connection, space: packet.Space) u64 {
         const slot = self.nextPacketNumber(space);
         defer slot.* += 1;
         return slot.*;
@@ -1129,7 +1130,7 @@ pub const Handshaker = struct {
     /// there is waiting to be acknowledged. Sent in the same space it covers,
     /// under that space's own keys.
     /// Source: RFC 9000 s13.2.
-    pub fn sealAck(self: *Handshaker, out: []u8, space: packet.Space) Error!?usize {
+    pub fn sealAck(self: *Connection, out: []u8, space: packet.Space) Error!?usize {
         const tracker = self.received(space);
         if (!tracker.ack_eliciting) return null;
         if (!self.ackDue(space)) return null;
@@ -1217,7 +1218,7 @@ pub const Handshaker = struct {
     /// out, which is what stops a bulk transfer from answering every datagram
     /// with one of its own.
     /// Source: RFC 9000 s13.2.1, s13.2.2.
-    fn ackDue(self: *const Handshaker, space: packet.Space) bool {
+    fn ackDue(self: *const Connection, space: packet.Space) bool {
         if (space != .application) return true;
         if (self.app_received.pending >= ack_threshold) return true;
         if (self.app_received.out_of_order) return true;
@@ -1226,12 +1227,12 @@ pub const Handshaker = struct {
 
     /// When the application space's held-back ACK must go, or null when
     /// nothing is waiting on one.
-    pub fn ackDeadlineMs(self: *const Handshaker) ?u64 {
+    pub fn ackDeadlineMs(self: *const Connection) ?u64 {
         if (!self.app_received.ack_eliciting) return null;
         return self.ack_deadline_ms;
     }
 
-    fn frames(self: *Handshaker, kind: packet.Kind, opened: packet.Opened) Error!void {
+    fn frames(self: *Connection, kind: packet.Kind, opened: packet.Opened) Error!void {
         if (kind == .initial and self.accepted.scid_len == 0) {
             self.accepted.scid_len = opened.header.scid.len;
             @memcpy(self.accepted.scid_buf[0..self.accepted.scid_len], opened.header.scid);
@@ -1259,7 +1260,7 @@ pub const Handshaker = struct {
 
     /// Hands every newly complete message to `message`, advancing the stream's
     /// read watermark by whole messages so the next pass starts on a boundary.
-    fn drain(self: *Handshaker, crypto_stream: *const reassembly.Reassembler, read: *usize) Error!void {
+    fn drain(self: *Connection, crypto_stream: *const reassembly.Reassembler, read: *usize) Error!void {
         var it = handshake.MessageIterator.init(crypto_stream.contiguous()[read.*..]);
         while (it.next()) |msg| {
             // Consumed before dispatch: `message` hashes into the transcript
@@ -1269,7 +1270,7 @@ pub const Handshaker = struct {
         }
     }
 
-    fn message(self: *Handshaker, msg: handshake.Message) Error!void {
+    fn message(self: *Connection, msg: handshake.Message) Error!void {
         switch (msg.type) {
             .certificate, .certificate_verify, .finished => {},
             else => return switch (self.role) {
@@ -1281,7 +1282,7 @@ pub const Handshaker = struct {
     }
 
     /// Source: RFC 8446 s4.1.2.
-    fn serverMessage(self: *Handshaker, msg: handshake.Message) Error!void {
+    fn serverMessage(self: *Connection, msg: handshake.Message) Error!void {
         if (msg.type != .client_hello) return error.UnexpectedMessage;
         if (self.phase != .wait_client_hello) return error.UnexpectedMessage;
 
@@ -1320,7 +1321,7 @@ pub const Handshaker = struct {
         while (shares.pos < shares.buf.len) {
             const group = try shares.readU16();
             const key = try shares.take(try shares.readU16());
-            if (group == @backingInt(std.crypto.tls.NamedGroup.x25519)) {
+            if (group == @backingInt(NamedGroup.x25519)) {
                 return .{ .group = .x25519, .key = key };
             }
         }
@@ -1337,7 +1338,7 @@ pub const Handshaker = struct {
 
     /// The first protocol the client offered. Enough for radicle's two, which
     /// a server speaks both of.
-    fn selectAlpn(self: *Handshaker, body: []const u8) Error!void {
+    fn selectAlpn(self: *Connection, body: []const u8) Error!void {
         var r = codec.Reader{ .buf = body };
         var list = codec.Reader{ .buf = try r.take(try r.readU16()) };
         const name = try list.take(try list.readU8());
@@ -1346,7 +1347,7 @@ pub const Handshaker = struct {
         self.accepted.alpn_len = name.len;
     }
 
-    fn clientMessage(self: *Handshaker, msg: handshake.Message) Error!void {
+    fn clientMessage(self: *Connection, msg: handshake.Message) Error!void {
         switch (msg.type) {
             .server_hello => {
                 if (self.phase != .wait_server_hello) return error.UnexpectedMessage;
@@ -1395,7 +1396,7 @@ pub const Handshaker = struct {
         }
     }
 
-    fn authMessage(self: *Handshaker, msg: handshake.Message) Error!void {
+    fn authMessage(self: *Connection, msg: handshake.Message) Error!void {
         switch (msg.type) {
             .certificate => {
                 switch (self.phase) {
@@ -1450,7 +1451,7 @@ pub const Handshaker = struct {
     ///
     /// Advances the transcript, so it can only be called once.
     /// Source: RFC 8446 s4.4.
-    pub fn writeFlight(self: *Handshaker, out: []u8, key: Ed25519.KeyPair) Error![]const u8 {
+    pub fn writeFlight(self: *Connection, out: []u8, key: Ed25519.KeyPair) Error![]const u8 {
         if (!self.done()) return error.HandshakeIncomplete;
         // The transcript advances past the flight, so a second call would sign
         // and MAC over the wrong prefix. Retransmission resends these bytes.
@@ -1496,7 +1497,7 @@ pub const Handshaker = struct {
     /// A `writeFlight` stream sealed into a Handshake packet, addressed to the
     /// id the server gave us. The packet number is fresh each time, so resending
     /// is calling this again with the same bytes.
-    pub fn sealFlight(self: *Handshaker, out: []u8, flight: []const u8) Error!usize {
+    pub fn sealFlight(self: *Connection, out: []u8, flight: []const u8) Error!usize {
         const hs = self.accepted.handshake orelse return error.HandshakeIncomplete;
         const pn = self.takePacketNumber(.handshake);
 
@@ -1518,7 +1519,7 @@ pub const Handshaker = struct {
     /// Checks the peer's signature over the transcript through Certificate.
     /// Only the raw public key profile is verifiable: an X.509 chain signs with
     /// ECDSA or RSA, neither of which radish has.
-    fn certificateVerify(self: *Handshaker, body: []const u8) Error!void {
+    fn certificateVerify(self: *Connection, body: []const u8) Error!void {
         const cv = try handshake.parseCertificateVerify(body);
         if (cv.algorithm != @backingInt(SignatureScheme.ed25519)) return error.UnsupportedSignature;
         if (cv.signature.len != Ed25519.Signature.encoded_length) return error.BadCertificateVerify;
@@ -1537,7 +1538,7 @@ pub const Handshaker = struct {
         self.accepted.peer_verified = true;
     }
 
-    fn encryptedExtensions(self: *Handshaker, body: []const u8) Error!void {
+    fn encryptedExtensions(self: *Connection, body: []const u8) Error!void {
         var r = codec.Reader{ .buf = body };
         var it = handshake.ExtensionIterator.init(try r.take(try r.readU16()));
         while (try it.next()) |e| switch (e.type) {
@@ -1586,7 +1587,7 @@ pub const Handshaker = struct {
     /// the packets. Nothing else authenticates them: they travel in cleartext
     /// headers, so only this comparison ties them to the handshake.
     /// Source: RFC 9000 s7.3.
-    fn transportParams(self: *Handshaker, body: []const u8) Error!void {
+    fn transportParams(self: *Connection, body: []const u8) Error!void {
         var it = handshake.TransportParamIterator.init(body);
         while (try it.next()) |p| switch (p.id) {
             .initial_source_connection_id => {
@@ -1633,7 +1634,7 @@ const testing = std.testing;
 const testdata = @import("testdata.zig");
 const hex = testdata.hex;
 
-/// Buffers a handshaker borrows, declared by the caller because they outlive
+/// Buffers a connection borrows, declared by the caller because they outlive
 /// the call that made it. The send buffer holds two full packets' worth, for
 /// the tests that fill the sender.
 const TestBufs = struct {
@@ -1642,9 +1643,9 @@ const TestBufs = struct {
     send: [2 * max_stream_chunk]u8 = undefined,
 };
 
-/// A handshaker addressing itself, for tests that only drive one side.
-fn testHandshaker(dcid: []const u8, bufs: *TestBufs) Handshaker {
-    return Handshaker.init(.{
+/// A connection addressing itself, for tests that only drive one side.
+fn testConnection(dcid: []const u8, bufs: *TestBufs) Connection {
+    return Connection.init(.{
         .original_dcid = dcid,
         .our_scid = dcid,
         .client_hello = "",
@@ -1656,8 +1657,8 @@ fn testHandshaker(dcid: []const u8, bufs: *TestBufs) Handshaker {
 
 /// The same, with application keys in place so the 1-RTT paths run. One key
 /// both ways, so a packet we seal is one we can also open.
-fn appHandshaker(dcid: []const u8, bufs: *TestBufs, stream_buf: []u8) Handshaker {
-    var h = Handshaker.init(.{
+fn appConnection(dcid: []const u8, bufs: *TestBufs, stream_buf: []u8) Connection {
+    var h = Connection.init(.{
         .original_dcid = dcid,
         .our_scid = dcid,
         .client_hello = "",
@@ -1711,7 +1712,7 @@ test "walks a coalesced flight and reads a raw public key certificate" {
     var sh: [90]u8 = undefined;
     _ = try std.fmt.hexToBytes(&sh, testdata.rfc8448_server_hello_hex);
 
-    // The keys the server would use, derived the same way the Handshaker will.
+    // The keys the server would use, derived the same way the Connection will.
     var t: handshake.Transcript = .{};
     t.update(initial.client_hello);
     t.update(&sh);
@@ -1830,7 +1831,7 @@ test "walks a coalesced flight and reads a raw public key certificate" {
     var plain: [2048]u8 = undefined;
     var initial_crypto: [4096]u8 = undefined;
     var handshake_crypto: [4096]u8 = undefined;
-    var h = Handshaker.init(.{
+    var h = Connection.init(.{
         .original_dcid = &dcid,
         .our_scid = &dcid,
         .client_hello = initial.client_hello,
@@ -1932,8 +1933,8 @@ test "walks a coalesced flight and reads a raw public key certificate" {
 
 /// A server that has read the Initial header, which is where the client's
 /// source connection id comes from, and is waiting on the ClientHello.
-fn serverHandshaker(dcid: []const u8, bufs: *TestBufs) Handshaker {
-    var h = Handshaker.init(.{
+fn serverConnection(dcid: []const u8, bufs: *TestBufs) Connection {
+    var h = Connection.init(.{
         .role = .server,
         .original_dcid = dcid,
         .our_scid = dcid,
@@ -1964,7 +1965,7 @@ test "a server reads what a ClientHello offered, and refuses one without raw pub
     });
 
     var bufs: TestBufs = .{};
-    var h = serverHandshaker(&dcid, &bufs);
+    var h = serverConnection(&dcid, &bufs);
     var it = handshake.MessageIterator.init(initial.client_hello);
     try h.message(it.next().?);
 
@@ -1973,7 +1974,7 @@ test "a server reads what a ClientHello offered, and refuses one without raw pub
     try testing.expectEqualSlices(u8, &kp.public_key, &h.keying.offered);
     // What the client said it would hold, and so what we may send it.
     try testing.expectEqual(@as(u64, 4096), h.send_stream.limit);
-    try testing.expectEqual(Handshaker.Phase.wait_certificate, h.phase);
+    try testing.expectEqual(Connection.Phase.wait_certificate, h.phase);
 
     // The same hello with an X.509 chain in place of a raw key: neither end
     // here can read a certificate chain, so there is nothing to fall back to.
@@ -1982,7 +1983,7 @@ test "a server reads what a ClientHello offered, and refuses one without raw pub
     try handshake.writeKeyShare(&ew, kp.public_key);
     try handshake.writeExtension(
         &ew,
-        @backingInt(std.crypto.tls.ExtensionType.server_certificate_type),
+        @backingInt(ExtensionType.server_certificate_type),
         &.{ 1, 0 },
     );
 
@@ -1994,7 +1995,7 @@ test "a server reads what a ClientHello offered, and refuses one without raw pub
     });
 
     var bad_bufs: TestBufs = .{};
-    var bad = serverHandshaker(&dcid, &bad_bufs);
+    var bad = serverConnection(&dcid, &bad_bufs);
     var bad_it = handshake.MessageIterator.init(ch);
     try testing.expectError(error.UnsupportedCertificateType, bad.message(bad_it.next().?));
 }
@@ -2061,7 +2062,7 @@ test "builds an Initial datagram we can open again" {
 test "packets that cannot be opened are reported" {
     const dcid = hex(testdata.other_dcid);
     var bufs: TestBufs = .{};
-    var h = testHandshaker(&dcid, &bufs);
+    var h = testConnection(&dcid, &bufs);
 
     var scratch: [512]u8 = undefined;
     var payload: [32]u8 = @splat(0);
@@ -2096,7 +2097,7 @@ test "stream data survives a 1-RTT round trip" {
     var bufs: TestBufs = .{};
     // Small, so reading one message crosses the half the grant waits for.
     var stream_buf: [8]u8 = undefined;
-    var h = appHandshaker(&dcid, &bufs, &stream_buf);
+    var h = appConnection(&dcid, &bufs, &stream_buf);
     const keys = crypto.keysFromSecret(crypto.initialSecrets(&dcid).client);
 
     // What the peer's transport parameters would have opened.
@@ -2145,7 +2146,7 @@ test "stream data survives a 1-RTT round trip" {
 test "an ACK's delay is scaled by the exponent the peer advertised" {
     const dcid = hex(testdata.other_dcid);
     var bufs: TestBufs = .{};
-    var h = testHandshaker(&dcid, &bufs);
+    var h = testConnection(&dcid, &bufs);
 
     // The default exponent is 3, so a unit is 8 microseconds.
     try testing.expectEqual(@as(u64, 8), h.ackDelayMs(1000));
@@ -2161,7 +2162,7 @@ test "unacknowledged stream data goes again under a new number" {
     const dcid = hex(testdata.other_dcid);
     var bufs: TestBufs = .{};
     var stream_buf: [64]u8 = undefined;
-    var h = appHandshaker(&dcid, &bufs, &stream_buf);
+    var h = appConnection(&dcid, &bufs, &stream_buf);
     const keys = crypto.keysFromSecret(crypto.initialSecrets(&dcid).client);
 
     h.send_data.extend(64);
@@ -2198,7 +2199,7 @@ test "sending stops at the limit the peer gave" {
     const dcid = hex(testdata.other_dcid);
     var bufs: TestBufs = .{};
     var stream_buf: [64]u8 = undefined;
-    var h = appHandshaker(&dcid, &bufs, &stream_buf);
+    var h = appConnection(&dcid, &bufs, &stream_buf);
 
     var out: [256]u8 = undefined;
     // Nothing may be sent until the peer's parameters open a window.
@@ -2235,9 +2236,9 @@ test "sending stops at the limit the peer gave" {
 test "a handshake message out of turn is refused" {
     const dcid = hex(testdata.other_dcid);
     var bufs: TestBufs = .{};
-    var h = testHandshaker(&dcid, &bufs);
+    var h = testConnection(&dcid, &bufs);
 
-    try testing.expectEqual(Handshaker.Phase.wait_server_hello, h.phase);
+    try testing.expectEqual(Connection.Phase.wait_server_hello, h.phase);
 
     var msg: [64]u8 = undefined;
     var mw = std.Io.Writer.fixed(&msg);
@@ -2260,7 +2261,7 @@ test "acknowledges an Initial the server can open" {
     const dcid = hex(testdata.other_dcid);
     const server_scid = hex("aabbccdd");
     var bufs: TestBufs = .{};
-    var h = testHandshaker(&dcid, &bufs);
+    var h = testConnection(&dcid, &bufs);
 
     // Nothing has arrived, so nothing is owed.
     var out: [max_initial_datagram]u8 = undefined;
@@ -2308,7 +2309,7 @@ test "a bulk transfer is acknowledged every second packet, not every packet" {
     const dcid = hex(testdata.other_dcid);
     var bufs: TestBufs = .{};
     var stream_buf: [4096]u8 = undefined;
-    var h = appHandshaker(&dcid, &bufs, &stream_buf);
+    var h = appConnection(&dcid, &bufs, &stream_buf);
 
     var out: [max_initial_datagram]u8 = undefined;
 
@@ -2329,7 +2330,7 @@ test "a held ACK goes once the delay runs out, or at once when a packet is out o
     const dcid = hex(testdata.other_dcid);
     var bufs: TestBufs = .{};
     var stream_buf: [4096]u8 = undefined;
-    var h = appHandshaker(&dcid, &bufs, &stream_buf);
+    var h = appConnection(&dcid, &bufs, &stream_buf);
 
     var out: [max_initial_datagram]u8 = undefined;
     h.now_ms = 1_000;
@@ -2354,7 +2355,7 @@ test "a held ACK goes once the delay runs out, or at once when a packet is out o
 test "an ack-eliciting flag with nothing behind it clears instead of spending a number" {
     const dcid = hex(testdata.other_dcid);
     var bufs: TestBufs = .{};
-    var h = testHandshaker(&dcid, &bufs);
+    var h = testConnection(&dcid, &bufs);
 
     const before = h.next_initial_pn;
     h.received(.initial).ack_eliciting = true;
@@ -2368,7 +2369,7 @@ test "an ack-eliciting flag with nothing behind it clears instead of spending a 
 test "retransmitting the ClientHello uses a fresh packet number" {
     const dcid = hex(testdata.other_dcid);
     var bufs: TestBufs = .{};
-    var h = testHandshaker(&dcid, &bufs);
+    var h = testConnection(&dcid, &bufs);
 
     const hello: [32]u8 = @splat(0xaa);
     var out: [max_initial_datagram]u8 = undefined;

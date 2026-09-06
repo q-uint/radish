@@ -20,7 +20,7 @@ const request_buffer = 64 * 1024;
 pub const Session = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
-    conn: *quic.conn.Conn,
+    endpoint: *quic.endpoint.Endpoint,
     /// The repo being fetched, which the intro line names.
     rid: []const u8,
     intro_sent: bool = false,
@@ -34,17 +34,17 @@ pub const Session = struct {
     pub fn connect(
         io: std.Io,
         allocator: std.mem.Allocator,
-        conn: *quic.conn.Conn,
-        opts: quic.conn.Options,
+        ep: *quic.endpoint.Endpoint,
+        opts: quic.endpoint.Options,
         rid: []const u8,
     ) !Session {
         var with_alpn = opts;
         with_alpn.alpn = gossip.alpn_git;
-        try conn.establish(io, with_alpn);
+        try ep.establish(io, with_alpn);
         return .{
             .io = io,
             .allocator = allocator,
-            .conn = conn,
+            .endpoint = ep,
             .rid = rid,
             .pending = try allocator.alloc(u8, request_buffer),
         };
@@ -54,7 +54,7 @@ pub const Session = struct {
     /// with, since `service` records those rather than raising them, and only
     /// `StreamStalled` when nothing did.
     fn failure(self: *Session) anyerror {
-        return self.conn.lastError() orelse error.StreamStalled;
+        return self.endpoint.lastError() orelse error.StreamStalled;
     }
 
     /// Frees the request buffer. The connection is the caller's.
@@ -80,7 +80,7 @@ pub const Session = struct {
 
     fn flushGit(self: *Session) !void {
         if (self.pending_len == 0) return;
-        try self.conn.send(self.pending[0..self.pending_len], false);
+        try self.endpoint.send(self.pending[0..self.pending_len], false);
         self.pending_len = 0;
     }
 
@@ -91,40 +91,40 @@ pub const Session = struct {
 
         // Bytes already in hand come first, however the connection ended: a
         // close travels in the same packet as the stream data before it.
-        while (self.conn.readable().len == 0) {
-            if (self.conn.streamDone()) return 0;
+        while (self.endpoint.readable().len == 0) {
+            if (self.endpoint.streamDone()) return 0;
             // A reset is the peer abandoning what it was sending, so what
             // arrived is a fragment however much of it there is.
-            if (self.conn.streamReset()) return error.PeerResetStream;
+            if (self.endpoint.streamReset()) return error.PeerResetStream;
             // A stateless reset says the peer no longer knows this connection,
             // so nothing more will ever arrive on it.
-            if (self.conn.wasReset()) return error.StatelessReset;
-            if (self.conn.peerClose()) |close| {
+            if (self.endpoint.wasReset()) return error.StatelessReset;
+            if (self.endpoint.peerClose()) |close| {
                 // A close in place of a FIN ends the stream too, but only a
                 // clean one: an aborted fetch reported as EOF would hand the
                 // caller a truncated pack as if it were whole.
                 if (close.error_code != 0) return error.PeerClosed;
                 return 0;
             }
-            switch (try self.conn.service()) {
+            switch (try self.endpoint.service()) {
                 // Both re-test the loop above: a close is not the end while
                 // there are still bytes it arrived with.
                 .arrived, .closed => {},
                 // Quiet is not the end: a node enumerating objects for a
                 // packfile says nothing for a while. Only its own idle timeout
                 // settles that the connection is gone.
-                .silent => if (self.conn.stalled()) return self.failure(),
+                .silent => if (self.endpoint.stalled()) return self.failure(),
             }
             // A peer that keeps the connection alive while sending nothing
             // leaves `stalled` false forever, so the stream gets its own
             // deadline.
-            if (self.conn.streamStalled()) return self.failure();
+            if (self.endpoint.streamStalled()) return self.failure();
         }
 
-        const have = self.conn.readable();
+        const have = self.endpoint.readable();
         const n = @min(buf.len, have.len);
         @memcpy(buf[0..n], have[0..n]);
-        self.conn.consume(n);
+        self.endpoint.consume(n);
         return n;
     }
 };
@@ -142,7 +142,7 @@ fn testSession(d: *fakepeer.Dialed, pending: []u8) Session {
     return .{
         .io = testing.io,
         .allocator = testing.allocator,
-        .conn = d.conn,
+        .endpoint = d.endpoint,
         .rid = test_rid,
         .pending = pending,
     };
@@ -183,7 +183,7 @@ test "a stream longer than the window arrives once the reader drains" {
 
     // Three windows' worth, which a packfile passes in the first megabyte.
     const chunk_len = 1200;
-    const total = chunk_len * (3 * quic.client.default_window / chunk_len);
+    const total = chunk_len * (3 * quic.connection.default_window / chunk_len);
     var chunk: [chunk_len]u8 = undefined;
 
     var sent: u64 = 0;
@@ -229,14 +229,14 @@ test "a stream survives the peer updating keys mid-transfer" {
 
     // Our own keys moved too, so the phase we send is the one the peer now
     // expects to see acknowledged.
-    try testing.expect(d.conn.hs.key_phase);
+    try testing.expect(d.endpoint.conn.key_phase);
 
     // And a second update, which is only allowed once the first completed.
     d.peer.updateKeys();
     try d.peer.sendStream("third", false);
     try testing.expectEqual(@as(usize, 5), try s.readGit(&buf));
     try testing.expectEqualStrings("third", buf[0..5]);
-    try testing.expect(!d.conn.hs.key_phase);
+    try testing.expect(!d.endpoint.conn.key_phase);
 }
 
 test "a stateless reset ends the stream, and no goodbye goes back" {
@@ -252,12 +252,12 @@ test "a stateless reset ends the stream, and no goodbye goes back" {
     // Nothing about it opens, and only the token tells it from noise.
     try d.peer.sendUnopenable(fakepeer.FakePeer.reset_token);
     try testing.expectError(error.StatelessReset, s.readGit(&buf));
-    try testing.expect(d.conn.wasReset());
+    try testing.expect(d.endpoint.wasReset());
 
     // The peer holds nothing to release, so nothing answers the reset and
     // closing says no goodbye. What is queued is the acknowledgement of the
     // stream bytes, from before any of this.
-    d.conn.close();
+    d.endpoint.close();
     var frames: [512]u8 = undefined;
     while (d.peer.receiveFramesIn(&frames, 20)) |payload| {
         var it = quic.frame.Iterator.init(payload);
@@ -344,7 +344,7 @@ test "a reset naming another stream leaves ours running" {
 
     var buf: [64]u8 = undefined;
     try testing.expectEqual(@as(usize, 4), try s.readGit(&buf));
-    try testing.expect(!d.conn.streamReset());
+    try testing.expect(!d.endpoint.streamReset());
     try testing.expectEqual(@as(usize, 0), try s.readGit(&buf));
 }
 
@@ -355,10 +355,10 @@ test "a chunk the peer never acknowledged goes out again under a new number" {
     // Four chunks, so a hole sits three behind the largest and is lost by
     // packet threshold rather than by a timer.
     // Source: RFC 9002 s6.1.1.
-    const chunk = quic.client.max_stream_chunk;
+    const chunk = quic.connection.max_stream_chunk;
     var data: [4 * chunk]u8 = undefined;
     for (&data, 0..) |*b, i| b.* = @truncate(i);
-    try d.conn.send(&data, false);
+    try d.endpoint.send(&data, false);
 
     var out: [2048]u8 = undefined;
     var pns: [4]u64 = undefined;
@@ -374,7 +374,7 @@ test "a chunk the peer never acknowledged goes out again under a new number" {
 
     // Everything but the first, which leaves it three behind the largest.
     try d.peer.ackOnly(pns[1..4]);
-    _ = try d.conn.service();
+    _ = try d.endpoint.service();
 
     // The resend carries the same offset under a number of its own.
     const again = try d.peer.receivePacketIn(&out, 500);
@@ -394,15 +394,15 @@ test "a peer saying it is blocked gets a grant it has not earned" {
     // Nothing has been read, so no grant is due on the reader's account and
     // none would go out on its own.
     var out: [512]u8 = undefined;
-    try testing.expect(!d.conn.hs.stream.wantsGrant());
-    try testing.expectEqual(@as(?usize, null), try d.conn.hs.sealMaxData(&out));
+    try testing.expect(!d.endpoint.conn.stream.wantsGrant());
+    try testing.expectEqual(@as(?usize, null), try d.endpoint.conn.sealMaxData(&out));
 
     var frames: [32]u8 = undefined;
     var w = std.Io.Writer.fixed(&frames);
     try codec.writeVarint(&w, @backingInt(quic.frame.Type.data_blocked));
     try codec.writeVarint(&w, 0);
     try d.peer.sendFrames(w.buffered());
-    _ = try d.conn.service();
+    _ = try d.endpoint.service();
 
     // The frame is ack-eliciting, so an ACK comes first and the grant follows.
     var seen_max_data = false;
@@ -416,7 +416,7 @@ test "a peer saying it is blocked gets a grant it has not earned" {
     }
     try testing.expect(seen_max_data);
     // Answered and cleared, so asking again takes another frame.
-    try testing.expect(!d.conn.hs.grant_asked);
+    try testing.expect(!d.endpoint.conn.grant_asked);
 }
 
 test "a FIN ends the stream without waiting for a timeout" {

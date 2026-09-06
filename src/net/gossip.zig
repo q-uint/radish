@@ -8,7 +8,7 @@ const codec = @import("../codec.zig");
 const protocol = @import("protocol.zig");
 const quic = @import("../quic/mod.zig");
 
-pub const Error = error{ MessageTooLong, NoAnswer } || quic.conn.Error;
+pub const Error = error{ MessageTooLong, NoAnswer } || quic.endpoint.Error;
 
 /// The gossip ALPN. A connection carrying anything else is a different
 /// protocol, and the node routes on this.
@@ -63,8 +63,8 @@ pub fn next(buf: []const u8, oid_buf: [][20]u8) Error!?Framed {
 pub fn ping(
     io: std.Io,
     allocator: std.mem.Allocator,
-    c: *quic.conn.Conn,
-    opts: quic.conn.Options,
+    c: *quic.endpoint.Endpoint,
+    opts: quic.endpoint.Options,
     zeroes: u16,
 ) !protocol.Pong {
     try c.establish(io, opts);
@@ -106,8 +106,8 @@ pub fn ping(
 pub fn subscribe(
     io: std.Io,
     allocator: std.mem.Allocator,
-    c: *quic.conn.Conn,
-    opts: quic.conn.Options,
+    c: *quic.endpoint.Endpoint,
+    opts: quic.endpoint.Options,
     max_messages: usize,
     handler: anytype,
 ) !usize {
@@ -118,7 +118,7 @@ pub fn subscribe(
 /// The subscription itself, on a connection that is already up.
 pub fn subscribeOn(
     allocator: std.mem.Allocator,
-    c: *quic.conn.Conn,
+    c: *quic.endpoint.Endpoint,
     max_messages: usize,
     handler: anytype,
 ) !usize {
@@ -206,7 +206,7 @@ test "messages arriving with a close are read first, and one that does not decod
     try d.peer.sendStreamAndClose(w.buffered(), false, 0, "done");
 
     var counter = Counter{};
-    try testing.expectEqual(@as(usize, 2), try subscribeOn(testing.allocator, d.conn, 8, &counter));
+    try testing.expectEqual(@as(usize, 2), try subscribeOn(testing.allocator, d.endpoint, 8, &counter));
     try testing.expectEqual(@as(usize, 1), counter.messages);
     try testing.expectEqual(@as(usize, 1), counter.undecodable);
     // The length prefix put the reader exactly on the message after it.
@@ -225,11 +225,11 @@ test "a close with an error code ends the run as a failure" {
     var counter = Counter{};
     try testing.expectError(
         error.PeerClosed,
-        subscribeOn(testing.allocator, d.conn, 8, &counter),
+        subscribeOn(testing.allocator, d.endpoint, 8, &counter),
     );
     // Still handed over: the message arrived, whatever followed it.
     try testing.expectEqual(@as(usize, 1), counter.messages);
-    try testing.expectEqualStrings("internal error", d.conn.peerClose().?.reason());
+    try testing.expectEqualStrings("internal error", d.endpoint.peerClose().?.reason());
 }
 
 test "a message arriving in pieces reads once it is whole" {

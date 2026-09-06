@@ -135,7 +135,9 @@ git protocol v2: the `radicle/git/1` ALPN carries git bytes unframed, so cloning
 is the same ls-refs, packfile, index and verify as 1.x over a different session.
 A 12 MB packfile clones and verifies against a local node.
 
-Not started: the server side, which is also what sends a stateless reset.
+The server side is started, not finished: the handshake is split by role and
+reads a ClientHello, and the ServerHello writers are there, but nothing answers
+one yet and nothing listens. Sending a stateless reset waits on it too.
 
 ## Build
 

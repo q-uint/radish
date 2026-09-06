@@ -477,7 +477,7 @@ const ServePrinter = struct {
 /// connection id, which RFC 9000 s7.2 wants unpredictable, and the fixed
 /// identity so the node keeps seeing the same peer. `quic probe` overrides the
 /// fresh parts, since a recorded exchange has to replay.
-fn quicDial(init: std.process.Init, host: []const u8, port: u16) !radish.quic.conn.Options {
+fn quicDial(init: std.process.Init, host: []const u8, port: u16) !radish.quic.endpoint.Options {
     const arena = init.arena.allocator();
     var seed: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&seed, radish.quic.testdata.fixed_identity_seed);
@@ -486,7 +486,7 @@ fn quicDial(init: std.process.Init, host: []const u8, port: u16) !radish.quic.co
     const dcid = try arena.alloc(u8, 8);
     try init.io.randomSecure(dcid);
 
-    var opts: radish.quic.conn.Options = .{
+    var opts: radish.quic.endpoint.Options = .{
         .host = host,
         .port = port,
         .alpn = radish.net.gossip.alpn_gossip,
@@ -501,7 +501,7 @@ fn quicDial(init: std.process.Init, host: []const u8, port: u16) !radish.quic.co
 }
 
 /// The node id a set of options presents.
-fn quicNodeId(arena: std.mem.Allocator, opts: radish.quic.conn.Options) ![]u8 {
+fn quicNodeId(arena: std.mem.Allocator, opts: radish.quic.endpoint.Options) ![]u8 {
     return radish.NodeId.fromPublicKey(opts.identity.public_key.toBytes()).encode(arena);
 }
 
@@ -512,7 +512,7 @@ fn quicPing(init: std.process.Init, host: []const u8, port: u16) !void {
     const opts = try quicDial(init, host, port);
     std.debug.print("quic ping {s}:{d} as {s}\n", .{ host, port, try quicNodeId(arena, opts) });
 
-    const c = try arena.create(quic.conn.Conn);
+    const c = try arena.create(quic.endpoint.Endpoint);
     defer c.close();
     const pong = radish.net.gossip.ping(init.io, arena, c, opts, 8) catch |e| {
         std.debug.print("quic ping failed: {s}\n", .{@errorName(e)});
@@ -540,7 +540,7 @@ fn quicSubscribe(init: std.process.Init, host: []const u8, port: u16, max: usize
     std.debug.print("quic subscribe {s}:{d} as {s}\n", .{ host, port, try quicNodeId(arena, opts) });
 
     var printer = GossipPrinter{ .arena = arena };
-    const c = try arena.create(quic.conn.Conn);
+    const c = try arena.create(quic.endpoint.Endpoint);
     defer c.close();
     const seen = radish.net.gossip.subscribe(init.io, arena, c, opts, max, &printer) catch |e| {
         std.debug.print("quic subscribe failed: {s}\n", .{@errorName(e)});
@@ -586,7 +586,7 @@ fn quicCapture(init: std.process.Init, host: []const u8, port: u16, max: usize) 
     opts.capture = &out.interface;
 
     var printer = GossipPrinter{ .arena = arena };
-    const c = try arena.create(quic.conn.Conn);
+    const c = try arena.create(quic.endpoint.Endpoint);
     defer c.close();
     // However the capture ends, the reason belongs with the recording.
     defer if (c.peerClose()) |close| {
@@ -604,7 +604,7 @@ fn quicFetchProbe(init: std.process.Init, host: []const u8, port: u16, rid: []co
     const opts = try quicDial(init, host, port);
     std.debug.print("quic fetch-probe {s}:{d} {s}\n", .{ host, port, rid });
 
-    const c = try arena.create(quic.conn.Conn);
+    const c = try arena.create(quic.endpoint.Endpoint);
     defer c.close();
     var session = radish.net.gitstream.Session.connect(
         init.io,
@@ -650,9 +650,9 @@ fn quicClone(
     const opts = try quicDial(init, host, port);
     std.debug.print("quic clone {s} from {s}:{d} into {s}...\n", .{ rid, host, port, dir });
 
-    const c = try arena.create(quic.conn.Conn);
+    const c = try arena.create(quic.endpoint.Endpoint);
     defer c.close();
-    const started = (quic.conn.Clock{ .awake = {} }).nowMs(init.io);
+    const started = (quic.endpoint.Clock{ .awake = {} }).nowMs(init.io);
     // Printed whether or not the clone worked: a failure is when the counters
     // are most worth seeing.
     defer if (show_profile) printProfile(init, c, started);
@@ -669,10 +669,10 @@ fn quicClone(
     return report(result, rid, dir, require_verified);
 }
 
-fn printProfile(init: std.process.Init, c: *radish.quic.conn.Conn, started_ms: u64) void {
+fn printProfile(init: std.process.Init, c: *radish.quic.endpoint.Endpoint, started_ms: u64) void {
     var buf: [1024]u8 = undefined;
     var w = std.Io.File.stderr().writer(init.io, &buf);
-    const elapsed = (radish.quic.conn.Clock{ .awake = {} }).nowMs(init.io) -| started_ms;
+    const elapsed = (radish.quic.endpoint.Clock{ .awake = {} }).nowMs(init.io) -| started_ms;
     c.profiled().report(&w.interface, elapsed) catch return;
     w.interface.flush() catch {};
 }
@@ -701,7 +701,7 @@ fn quicProbe(init: std.process.Init, host: []const u8, port: u16, alpn: []const 
     });
 
     // Every buffer the connection reports from lives in here, so it stays put.
-    const c = try arena.create(quic.conn.Conn);
+    const c = try arena.create(quic.endpoint.Endpoint);
     c.open(init.io, opts) catch |e| {
         std.debug.print("probe failed: {s}\n", .{@errorName(e)});
         return e;

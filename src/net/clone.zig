@@ -82,17 +82,17 @@ pub fn overNoise(
     return overSession(io, allocator, session, rid, into_path);
 }
 
-/// Clones from a 2.x node: the git ALPN on a QUIC stream. `conn` is the
+/// Clones from a 2.x node: the git ALPN on a QUIC stream. `ep` is the
 /// caller's so that a failure can still be asked what the peer closed with.
 pub fn overQuic(
     io: std.Io,
     allocator: std.mem.Allocator,
-    conn: *quic.conn.Conn,
-    opts: quic.conn.Options,
+    ep: *quic.endpoint.Endpoint,
+    opts: quic.endpoint.Options,
     rid: []const u8,
     into_path: []const u8,
 ) !CloneResult {
-    var session = try gitstream.Session.connect(io, allocator, conn, opts, rid);
+    var session = try gitstream.Session.connect(io, allocator, ep, opts, rid);
     defer session.deinit();
     return overSession(io, allocator, &session, rid, into_path);
 }

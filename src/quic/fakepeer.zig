@@ -6,8 +6,8 @@
 //! one would have left.
 const std = @import("std");
 
-const client = @import("client.zig");
-const conn = @import("conn.zig");
+const connection = @import("connection.zig");
+const endpoint = @import("endpoint.zig");
 const crypto = @import("crypto.zig");
 const frame = @import("frame.zig");
 const packet = @import("packet.zig");
@@ -31,11 +31,11 @@ pub const FakePeer = struct {
     /// Our packet numbers and our half of the stream, both of which only go up.
     pn: u64 = 0,
     offset: u64 = 0,
-    datagram: [client.max_receive_datagram]u8 = undefined,
-    payload: [client.max_receive_datagram]u8 = undefined,
+    datagram: [connection.max_receive_datagram]u8 = undefined,
+    payload: [connection.max_receive_datagram]u8 = undefined,
 
     /// What this peer would prove a lost connection with. Fixed: a test only
-    /// needs it to match what `confirm` handed the client.
+    /// needs it to match what `confirm` handed the connection.
     pub const reset_token: [16]u8 = @splat(0x5e);
 
     pub fn bind(io: std.Io, dcid: []const u8) !FakePeer {
@@ -70,21 +70,21 @@ pub const FakePeer = struct {
     }
 
     /// Gives `c` the state a finished handshake would have left it in.
-    pub fn confirm(self: *const FakePeer, c: *conn.Conn, idle_ms: u64) void {
-        c.hs.app_keys = .{ .send = self.keys, .recv = self.keys };
+    pub fn confirm(self: *const FakePeer, c: *endpoint.Endpoint, idle_ms: u64) void {
+        c.conn.app_keys = .{ .send = self.keys, .recv = self.keys };
         // The secrets those keys came from, which a key update derives from.
-        c.hs.accepted.application = .{ .client = self.secret, .server = self.secret };
-        c.hs.confirmed = true;
-        c.hs.recovery.confirmed = true;
-        c.hs.peer_reset_token = reset_token;
-        c.hs.peer_idle_ms = idle_ms;
+        c.conn.accepted.application = .{ .client = self.secret, .server = self.secret };
+        c.conn.confirmed = true;
+        c.conn.recovery.confirmed = true;
+        c.conn.peer_reset_token = reset_token;
+        c.conn.peer_idle_ms = idle_ms;
         // What our transport parameters would have opened.
-        c.hs.send_data.extend(c.stream_buf.len);
-        c.hs.send_stream.extend(c.stream_buf.len);
+        c.conn.send_data.extend(c.stream_buf.len);
+        c.conn.send_stream.extend(c.stream_buf.len);
     }
 
     /// Opens a connection pointed at us, faked through to confirmation.
-    pub fn dial(self: *FakePeer, c: *conn.Conn, opts: conn.Options, idle_ms: u64) !void {
+    pub fn dial(self: *FakePeer, c: *endpoint.Endpoint, opts: endpoint.Options, idle_ms: u64) !void {
         var pointed = opts;
         pointed.host = "127.0.0.1";
         pointed.port = self.port();
@@ -150,7 +150,7 @@ pub const FakePeer = struct {
     /// Seals `payload` as one 1-RTT packet and sends it. Frames put in
     /// together arrive together.
     pub fn sendFrames(self: *FakePeer, payload: []const u8) !void {
-        var out: [client.max_receive_datagram]u8 = undefined;
+        var out: [connection.max_receive_datagram]u8 = undefined;
         const n = try packet.sealShort(&out, .{
             .dcid = self.dcid,
             .pn = self.pn,
@@ -207,7 +207,7 @@ const fixture_timeout_ms = 20;
 /// itself, and what is under test points at it.
 pub const Dialed = struct {
     peer: FakePeer,
-    conn: *conn.Conn,
+    endpoint: *endpoint.Endpoint,
 
     /// `idle_ms` is the timeout the peer would have advertised.
     pub fn init(io: std.Io, idle_ms: u64) !*Dialed {
@@ -215,9 +215,9 @@ pub const Dialed = struct {
         errdefer std.testing.allocator.destroy(self);
         self.* = .{
             .peer = try FakePeer.bind(io, &fixture_dcid),
-            .conn = try std.testing.allocator.create(conn.Conn),
+            .endpoint = try std.testing.allocator.create(endpoint.Endpoint),
         };
-        try self.peer.dial(self.conn, .{
+        try self.peer.dial(self.endpoint, .{
             // Host and port come from `dial`.
             .host = "",
             .port = 0,
@@ -232,9 +232,9 @@ pub const Dialed = struct {
     }
 
     pub fn deinit(self: *Dialed) void {
-        self.conn.close();
+        self.endpoint.close();
         self.peer.deinit();
-        std.testing.allocator.destroy(self.conn);
+        std.testing.allocator.destroy(self.endpoint);
         std.testing.allocator.destroy(self);
     }
 };

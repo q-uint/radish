@@ -541,6 +541,53 @@ test "parses the RFC 8448 ServerHello" {
     try testing.expectError(error.NotServerHello, parseServerHello(&ch));
 }
 
+// A server's key_share is one entry and its supported_versions one version,
+// where a client sends a list of each, so the two are the whole of what this
+// ServerHello carries.
+// Source: RFC 8446 s4.2.8, s4.2.1.
+test "RFC 8448 ServerHello bytes, and one echoing a session id" {
+    const share = hex("c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f");
+
+    var ext_buf: [64]u8 = undefined;
+    var ew = std.Io.Writer.fixed(&ext_buf);
+    try writeServerKeyShare(&ew, share);
+    try writeSelectedVersion(&ew);
+
+    var expected: [90]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, testdata.rfc8448_server_hello_hex);
+
+    var out: [128]u8 = undefined;
+    const got = try writeServerHello(&out, .{
+        // 4 header + 2 version.
+        .random = expected[6..38].*,
+        .cipher_suite = 0x1301,
+        .extensions = ew.buffered(),
+    });
+    try testing.expectEqualSlices(u8, &expected, got);
+
+    // The fixture echoes no session id, and echoing one is the only thing that
+    // shifts every field after it. A real ClientHello sends one.
+    // Source: RFC 8446 s4.1.3.
+    const sh = try writeServerHello(&out, .{
+        .random = @splat(0x5a),
+        .session_id = &.{ 1, 2, 3, 4 },
+        .cipher_suite = 0x1301,
+        .extensions = ew.buffered(),
+    });
+
+    const parsed = try parseServerHello(sh);
+    try testing.expectEqual(@as(u16, 0x1301), parsed.cipher_suite);
+    try testing.expectEqual(@as(?u16, 0x0304), try parsed.selectedVersion());
+    try testing.expect(!parsed.isHelloRetryRequest());
+
+    const ks = (try parsed.keyShare()).?;
+    try testing.expectEqual(NamedGroup.x25519, ks.group);
+    try testing.expectEqualSlices(u8, &share, ks.key);
+
+    // The whole message and nothing after it, so a flight can be walked.
+    try testing.expectEqual(sh.len, parsed.len);
+}
+
 test "extensions are type, length, body, and key_share and supported_versions round trip" {
     var ext_buf: [16]u8 = undefined;
     var ext_w = std.Io.Writer.fixed(&ext_buf);
