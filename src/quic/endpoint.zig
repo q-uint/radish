@@ -160,7 +160,7 @@ pub const Endpoint = struct {
         };
 
         self.sock = try local.bind(io, .{ .mode = .dgram });
-        self.hello = initial.client_hello;
+        self.hello = initial.hello;
         self.sent = initial.len;
         self.now_ms = opts.clock.nowMs(io);
         self.last_arrival_ms = self.now_ms;
@@ -169,7 +169,7 @@ pub const Endpoint = struct {
         self.conn = connection.Connection.init(.{
             .original_dcid = opts.dcid,
             .our_scid = opts.dcid,
-            .client_hello = initial.client_hello,
+            .client_hello = initial.hello,
             .secret = opts.secret,
             .initial_buf = &self.initial_crypto,
             .handshake_buf = &self.handshake_crypto,
@@ -626,7 +626,7 @@ test "opening sets every field, whatever the memory held" {
         .secret = testdata.hex(testdata.fixed_x25519_secret),
         .random = testdata.hex(testdata.fixed_hello_random),
         .dcid = &.{ 0xc0, 0xff, 0xee, 0x01 },
-        .identity = try Ed25519.KeyPair.generateDeterministic(@splat(4)),
+        .identity = try Ed25519.KeyPair.generateDeterministic(testdata.hex(testdata.fixed_identity_seed)),
     });
     defer c.close();
 
@@ -653,7 +653,7 @@ test "closing is safe however far opening got, and sends one goodbye at most" {
         .secret = testdata.hex(testdata.fixed_x25519_secret),
         .random = testdata.hex(testdata.fixed_hello_random),
         .dcid = &.{ 0xc0, 0xff, 0xee, 0x03 },
-        .identity = try Ed25519.KeyPair.generateDeterministic(@splat(4)),
+        .identity = try Ed25519.KeyPair.generateDeterministic(testdata.hex(testdata.fixed_identity_seed)),
     }));
     try testing.expect(!unopened.ready);
     try testing.expectEqual(@as(?*const connection.Close, null), unopened.peerClose());
@@ -670,7 +670,7 @@ test "closing is safe however far opening got, and sends one goodbye at most" {
         .secret = testdata.hex(testdata.fixed_x25519_secret),
         .random = testdata.hex(testdata.fixed_hello_random),
         .dcid = &.{ 0xc0, 0xff, 0xee, 0x04 },
-        .identity = try Ed25519.KeyPair.generateDeterministic(@splat(4)),
+        .identity = try Ed25519.KeyPair.generateDeterministic(testdata.hex(testdata.fixed_identity_seed)),
     });
     try testing.expect(c.sock_open);
 
@@ -698,7 +698,7 @@ fn clocked(c: *Endpoint, dcid: []const u8, at: *const u64) !void {
         .secret = testdata.hex(testdata.fixed_x25519_secret),
         .random = testdata.hex(testdata.fixed_hello_random),
         .dcid = dcid,
-        .identity = try Ed25519.KeyPair.generateDeterministic(@splat(4)),
+        .identity = try Ed25519.KeyPair.generateDeterministic(testdata.hex(testdata.fixed_identity_seed)),
         .clock = .{ .fixed = at },
     });
     const keys = crypto.keysFromSecret(crypto.initialSecrets(dcid).client);

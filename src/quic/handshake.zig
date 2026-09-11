@@ -23,6 +23,15 @@ pub const legacy_version: u16 = 0x0303;
 /// Fixed at 32 bytes by RFC 8446 s4.1.2.
 pub const Random = [32]u8;
 
+/// A certificate_request_context sits behind a u8 length, which is its bound.
+/// Source: RFC 8446 s4.3.2.
+pub const max_request_context = std.math.maxInt(u8);
+
+/// Room for one message's extension block. Every extension either side writes
+/// is a fixed field or a name we bound ourselves, so this is slack, not a
+/// limit either end could reach.
+pub const max_extensions = 1024;
+
 pub const PublicKey = [std.crypto.dh.X25519.public_length]u8;
 
 pub const ClientHello = struct {
@@ -222,6 +231,10 @@ pub const ServerHello = struct {
 
 pub const ParsedClientHello = struct {
     random: Random,
+    /// Kept so a server can refuse a non-empty one, which over QUIC means the
+    /// client asked for middlebox compatibility mode.
+    /// Source: RFC 9001 s8.4.
+    session_id: []const u8,
     cipher_suites: []const u8,
     extensions: []const u8,
     /// Bytes this message occupies, so a CRYPTO frame holding more than one
@@ -250,12 +263,13 @@ pub fn parseClientHello(msg: []const u8) Error!ParsedClientHello {
 
     _ = try r.readU16(); // legacy_version
     const random: Random = (try r.take(@sizeOf(Random)))[0..@sizeOf(Random)].*;
-    _ = try r.take(try r.readU8()); // legacy_session_id
+    const session_id = try r.take(try r.readU8());
     const suites = try r.take(try r.readU16());
     _ = try r.take(try r.readU8()); // legacy_compression_methods
 
     return .{
         .random = random,
+        .session_id = session_id,
         .cipher_suites = suites,
         .extensions = try r.take(try r.readU16()),
         .len = len,
@@ -398,6 +412,34 @@ pub fn writeMessage(w: *std.Io.Writer, t: HandshakeType, body: []const u8) !void
     try w.writeInt(u8, @backingInt(t), .big);
     try w.writeInt(u24, @intCast(body.len), .big);
     try w.writeAll(body);
+}
+
+/// The server's half of the negotiation that the ServerHello could not carry,
+/// since only this one is encrypted.
+/// Source: RFC 8446 s4.3.1.
+pub fn writeEncryptedExtensions(w: *std.Io.Writer, extensions: []const u8) !void {
+    var body: [2 + max_extensions]u8 = undefined;
+    var bw = std.Io.Writer.fixed(&body);
+    try bw.writeInt(u16, @intCast(extensions.len), .big);
+    try bw.writeAll(extensions);
+    try writeMessage(w, .encrypted_extensions, bw.buffered());
+}
+
+/// Asks the peer to authenticate. `context` comes back in its Certificate, and
+/// the extensions have to name the signature schemes we will accept.
+/// Source: RFC 8446 s4.3.2.
+pub fn writeCertificateRequest(
+    w: *std.Io.Writer,
+    context: []const u8,
+    extensions: []const u8,
+) !void {
+    var body: [1 + max_request_context + 2 + max_extensions]u8 = undefined;
+    var bw = std.Io.Writer.fixed(&body);
+    try bw.writeInt(u8, @intCast(context.len), .big);
+    try bw.writeAll(context);
+    try bw.writeInt(u16, @intCast(extensions.len), .big);
+    try bw.writeAll(extensions);
+    try writeMessage(w, .certificate_request, bw.buffered());
 }
 
 pub const CertificateVerify = struct {
@@ -569,7 +611,7 @@ test "RFC 8448 ServerHello bytes, and one echoing a session id" {
     // shifts every field after it. A real ClientHello sends one.
     // Source: RFC 8446 s4.1.3.
     const sh = try writeServerHello(&out, .{
-        .random = @splat(0x5a),
+        .random = hex(testdata.fixed_server_hello_random),
         .session_id = &.{ 1, 2, 3, 4 },
         .cipher_suite = 0x1301,
         .extensions = ew.buffered(),

@@ -33,6 +33,9 @@ pub const Error = error{
     HandshakeIncomplete,
     UnexpectedMessage,
     UnsupportedCertificateType,
+    /// ALPN named nothing both ends speak, which QUIC has no connection for.
+    /// Source: RFC 9001 s8.1.
+    NoApplicationProtocol,
     KeysUnavailable,
     FlightAlreadySent,
     TransportParameterError,
@@ -40,6 +43,7 @@ pub const Error = error{
     StreamChunkTooLong,
     KeyUpdateError,
     StatelessReset,
+    AmplificationLimited,
 } || packet.Error || handshake.Error || frame.Error || stream.Error;
 
 /// The shortest datagram that could be a stateless reset: a short header, a
@@ -134,10 +138,42 @@ pub const max_stream_chunk = min_initial_datagram -
 /// Source: RFC 9000 s18.2.
 pub const max_receive_datagram = 2048;
 
-/// Room for our handshake flight. Certificate, CertificateVerify and Finished
-/// are all fixed size for a raw public key and ed25519, the largest part being
-/// the Certificate's request context.
-pub const max_flight = 512;
+/// Room for our handshake flight, measured at the largest either role writes:
+/// a server's, which is a client's with EncryptedExtensions and a
+/// CertificateRequest in front of it. Every part is fixed for a raw public key
+/// and ed25519 except the two the peer's hello sizes.
+pub const max_flight = blk: {
+    const cid: [packet.max_cid_len]u8 = @splat(0);
+    const alpn: [max_alpn]u8 = @splat('a');
+    const context: [handshake.max_request_context]u8 = @splat(0);
+    const signature: [Ed25519.Signature.encoded_length]u8 = @splat(0);
+    const verify_data: [std.crypto.hash.sha2.Sha256.digest_length]u8 = @splat(0);
+
+    var ext: [handshake.max_extensions]u8 = undefined;
+    var ew = std.Io.Writer.fixed(&ext);
+    writeServerExtensions(&ew, &alpn, &cid, &cid, std.math.maxInt(u62)) catch unreachable;
+
+    var buf: [min_initial_datagram]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    handshake.writeEncryptedExtensions(&w, ew.buffered()) catch unreachable;
+    handshake.writeCertificateRequest(&w, &.{}, &certificate_request_extensions) catch unreachable;
+    handshake.writeRawPublicKeyCertificate(&w, &context, @splat(0)) catch unreachable;
+    handshake.writeCertificateVerify(
+        &w,
+        @backingInt(SignatureScheme.ed25519),
+        &signature,
+    ) catch unreachable;
+    handshake.writeMessage(&w, .finished, &verify_data) catch unreachable;
+    break :blk w.buffered().len;
+};
+
+/// The longest ALPN we write or keep. radicle's are `radicle/gossip/1` and
+/// `radicle/git/1`, with room to spare for whatever else a peer offers.
+pub const max_alpn = 64;
+
+/// The longest SNI hostname, which is a DNS name.
+/// Source: RFC 1035 s2.3.4.
+pub const max_server_name = 255;
 
 pub const Config = struct {
     /// Chosen by the client and used to derive both sides' Initial keys.
@@ -155,13 +191,69 @@ pub const Config = struct {
     window: u64 = default_window,
 };
 
+/// Room for the transport parameters below: six with a varint value, then the
+/// two connection ids. Each is an id and a length around its body, all varints
+/// taken at their full width.
+const max_transport_params = 6 * (3 * codec.max_varint_len) +
+    2 * (2 * codec.max_varint_len + packet.max_cid_len);
+
+/// The transport parameters, as the one extension that carries them. Only a
+/// server sends `original_dcid`: it is the id the client first addressed, and
+/// echoing it is how the client knows nothing rewrote its Initial.
+/// Source: RFC 9000 s7.3, s18.2.
+fn writeTransportParams(
+    w: *std.Io.Writer,
+    role: Role,
+    window: u64,
+    scid: []const u8,
+    original_dcid: ?[]const u8,
+) !void {
+    var params: [max_transport_params]u8 = undefined;
+    var pw = std.Io.Writer.fixed(&params);
+    try handshake.writeIntTransportParam(&pw, .initial_max_data, window);
+    try handshake.writeIntTransportParam(&pw, .initial_max_stream_data_bidi_local, window);
+    try handshake.writeIntTransportParam(&pw, .initial_max_stream_data_bidi_remote, window);
+    // The streams the peer may open toward us: the one radish handles is always
+    // the client's, so a server allows it and a client allows none.
+    // Source: RFC 9000 s18.2.
+    try handshake.writeIntTransportParam(&pw, .initial_max_streams_bidi, switch (role) {
+        .client => 0,
+        .server => 1,
+    });
+    // What we can hold. The default is 65527, and a peer that probes its way up
+    // to it sends datagrams this side reads as truncated garbage.
+    // Source: RFC 9000 s18.2.
+    try handshake.writeIntTransportParam(&pw, .max_udp_payload_size, max_receive_datagram);
+    try handshake.writeIntTransportParam(&pw, .max_idle_timeout, idle_timeout_ms);
+    try handshake.writeTransportParam(&pw, .initial_source_connection_id, scid);
+    if (original_dcid) |dcid| {
+        try handshake.writeTransportParam(&pw, .original_destination_connection_id, dcid);
+    }
+    try handshake.writeExtension(w, @backingInt(ExtensionType.quic_transport_parameters), pw.buffered());
+}
+
+/// The one protocol we are naming, as ALPN wants it: a list of one.
+fn writeAlpn(w: *std.Io.Writer, name: []const u8) !void {
+    // The list length, then the one name behind its own.
+    var alpn: [2 + 1 + max_alpn]u8 = undefined;
+    var aw = std.Io.Writer.fixed(&alpn);
+    try aw.writeInt(u16, @intCast(name.len + 1), .big);
+    try aw.writeInt(u8, @intCast(name.len), .big);
+    try aw.writeAll(name);
+    try handshake.writeExtension(
+        w,
+        @backingInt(ExtensionType.application_layer_protocol_negotiation),
+        aw.buffered(),
+    );
+}
+
 /// Writes the extensions a QUIC ClientHello carries. ALPN is mandatory, and so
 /// is quic_transport_parameters.
 /// Source: RFC 9001 s8.
 fn writeExtensions(w: *std.Io.Writer, cfg: Config) !void {
     if (cfg.server_name) |name| {
-        // list length, name type 0 (host_name), then the name.
-        var sni: [256]u8 = undefined;
+        // list length, name type 0 (host_name), then the name behind its length.
+        var sni: [2 + 1 + 2 + max_server_name]u8 = undefined;
         var sw = std.Io.Writer.fixed(&sni);
         try sw.writeInt(u16, @intCast(name.len + 3), .big);
         try sw.writeInt(u8, 0, .big);
@@ -182,40 +274,104 @@ fn writeExtensions(w: *std.Io.Writer, cfg: Config) !void {
     try handshake.writeExtension(w, @backingInt(ExtensionType.client_certificate_type), &certificate_types);
     try handshake.writeExtension(w, @backingInt(ExtensionType.server_certificate_type), &certificate_types);
 
-    var alpn: [64]u8 = undefined;
-    var aw = std.Io.Writer.fixed(&alpn);
-    try aw.writeInt(u16, @intCast(cfg.alpn.len + 1), .big);
-    try aw.writeInt(u8, @intCast(cfg.alpn.len), .big);
-    try aw.writeAll(cfg.alpn);
-    try handshake.writeExtension(w, @backingInt(ExtensionType.application_layer_protocol_negotiation), aw.buffered());
-
-    var params: [64]u8 = undefined;
-    var pw = std.Io.Writer.fixed(&params);
-    try handshake.writeIntTransportParam(&pw, .initial_max_data, cfg.window);
-    try handshake.writeIntTransportParam(&pw, .initial_max_stream_data_bidi_local, cfg.window);
-    try handshake.writeIntTransportParam(&pw, .initial_max_stream_data_bidi_remote, cfg.window);
-    // None: only the one stream we open ourselves is handled, and this limit
-    // covers the streams a peer opens toward us.
-    // Source: RFC 9000 s18.2.
-    try handshake.writeIntTransportParam(&pw, .initial_max_streams_bidi, 0);
-    // What we can hold. The default is 65527, and a peer that probes its way up
-    // to it sends datagrams this side reads as truncated garbage.
-    // Source: RFC 9000 s18.2.
-    try handshake.writeIntTransportParam(&pw, .max_udp_payload_size, max_receive_datagram);
-    try handshake.writeIntTransportParam(&pw, .max_idle_timeout, idle_timeout_ms);
-    try handshake.writeTransportParam(&pw, .initial_source_connection_id, cfg.scid);
-    try handshake.writeExtension(w, @backingInt(ExtensionType.quic_transport_parameters), pw.buffered());
+    try writeAlpn(w, cfg.alpn);
+    try writeTransportParams(w, .client, cfg.window, cfg.scid, null);
 }
 
-/// Enough for a ClientHello with an SNI and one x25519 key share.
-pub const max_client_hello = 768;
+/// What a server answers with, in the one message of its flight that is not
+/// encrypted under keys the ClientHello could reach: the certificate types it
+/// selected, the protocol it took from the client's list, and its own transport
+/// parameters.
+/// Source: RFC 8446 s4.3.1, RFC 9001 s8.
+fn writeServerExtensions(
+    w: *std.Io.Writer,
+    alpn: []const u8,
+    scid: []const u8,
+    original_dcid: []const u8,
+    window: u64,
+) !void {
+    // One type each, selected from the lists the client offered.
+    // Source: RFC 7250 s4.1.
+    try handshake.writeExtension(w, @backingInt(ExtensionType.client_certificate_type), &.{raw_public_key});
+    try handshake.writeExtension(w, @backingInt(ExtensionType.server_certificate_type), &.{raw_public_key});
+
+    try writeAlpn(w, alpn);
+    try writeTransportParams(w, .server, window, scid, original_dcid);
+}
+
+/// A CertificateRequest has to say what it will accept, and ed25519 is the
+/// only thing radish can verify.
+/// Source: RFC 8446 s4.3.2.
+const certificate_request_extensions = blk: {
+    var buf: [4 + signature_algorithms.len]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    handshake.writeExtension(
+        &w,
+        @backingInt(ExtensionType.signature_algorithms),
+        &signature_algorithms,
+    ) catch unreachable;
+    break :blk buf;
+};
+
+/// The extensions a ClientHello carries, measured at their largest: both of the
+/// ones that vary written as long as we would ever write them, and the window
+/// wide enough to spend a full varint. Measuring also bounds-checks the buffers
+/// `writeExtensions` writes through, since a short one fails to compile here.
+const max_client_extensions = blk: {
+    const name: [max_server_name]u8 = @splat('a');
+    const alpn: [max_alpn]u8 = @splat('a');
+    const scid: [packet.max_cid_len]u8 = @splat(0);
+
+    var buf: [min_initial_datagram]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    writeExtensions(&w, .{
+        .dcid = &scid,
+        .scid = &scid,
+        .random = @splat(0),
+        .public_key = @splat(0),
+        .alpn = &alpn,
+        .server_name = &name,
+        .window = std.math.maxInt(u62),
+    }) catch unreachable;
+    break :blk w.buffered().len;
+};
+
+/// The largest ClientHello we write: those extensions and the fixed fields
+/// around them. Measured, so it cannot drift from the writers.
+pub const max_client_hello = blk: {
+    const ext: [max_client_extensions]u8 = @splat(0);
+    var buf: [min_initial_datagram]u8 = undefined;
+    const ch = handshake.writeClientHello(&buf, .{
+        .random = @splat(0),
+        .cipher_suites = &.{cipher_suite},
+        .extensions = &ext,
+    }) catch unreachable;
+    break :blk ch.len;
+};
+
+/// What `sealServerHello` builds, measured by building one, so it cannot drift
+/// from the writers. Exact rather than a bound: nothing in it varies.
+pub const max_server_hello = blk: {
+    var ext: [min_initial_datagram]u8 = undefined;
+    var ew = std.Io.Writer.fixed(&ext);
+    handshake.writeServerKeyShare(&ew, @splat(0)) catch unreachable;
+    handshake.writeSelectedVersion(&ew) catch unreachable;
+
+    var out: [min_initial_datagram]u8 = undefined;
+    const sh = handshake.writeServerHello(&out, .{
+        .random = @splat(0),
+        .cipher_suite = cipher_suite,
+        .extensions = ew.buffered(),
+    }) catch unreachable;
+    break :blk sh.len;
+};
 
 pub const Initial = struct {
     /// Bytes written to `out`.
     len: usize,
-    /// The ClientHello as sent, borrowing from `hello_buf`. The transcript
-    /// needs it, and the sealed packet does not give it back.
-    client_hello: []const u8,
+    /// The hello as sent, borrowing from `hello_buf`. The transcript needs it
+    /// and so does a retransmission, and the sealed packet gives back neither.
+    hello: []const u8,
 };
 
 /// Grows `frames_len` until the sealed packet reaches the floor a client must
@@ -234,10 +390,26 @@ fn paddedInitialLen(out: []u8, build: packet.Build, frames_len: usize) Error!usi
     }
 }
 
-/// Builds the ClientHello, wraps it in a CRYPTO frame, pads to the minimum
-/// datagram size, and seals it as Initial packet number 0.
+/// One handshake message alone in an Initial: a CRYPTO frame at offset 0,
+/// padded to the floor every datagram carrying an ack-eliciting Initial is
+/// expanded to, whichever end sends it.
+/// Source: RFC 9000 s14.1.
+fn sealInitialCrypto(out: []u8, build: packet.Build, keys: crypto.Keys, message: []const u8) Error!usize {
+    var payload: [min_initial_datagram]u8 = undefined;
+    var pw = std.Io.Writer.fixed(&payload);
+    writeCryptoFrame(&pw, 0, message) catch return error.BufferTooSmall;
+    const frames_len = pw.buffered().len;
+
+    const payload_len = try paddedInitialLen(out, build, frames_len);
+    if (payload_len > payload.len) return error.BufferTooSmall;
+    pw.splatByteAll(0, payload_len - frames_len) catch return error.BufferTooSmall;
+
+    return packet.seal(out, build, pw.buffered(), keys);
+}
+
+/// Builds the ClientHello and seals it as Initial packet number 0.
 pub fn initialDatagram(out: []u8, hello_buf: []u8, cfg: Config) Error!Initial {
-    var ext: [512]u8 = undefined;
+    var ext: [max_client_extensions]u8 = undefined;
     var ew = std.Io.Writer.fixed(&ext);
     writeExtensions(&ew, cfg) catch return error.BufferTooSmall;
 
@@ -246,13 +418,6 @@ pub fn initialDatagram(out: []u8, hello_buf: []u8, cfg: Config) Error!Initial {
         .cipher_suites = &.{cipher_suite},
         .extensions = ew.buffered(),
     });
-
-    // CRYPTO frame at offset 0, then PADDING to the datagram minimum. The
-    // padding is sized so the sealed packet lands exactly on the floor.
-    var payload: [min_initial_datagram]u8 = undefined;
-    var fw = std.Io.Writer.fixed(&payload);
-    writeCryptoFrame(&fw, 0, ch) catch return error.BufferTooSmall;
-    const frames_len = fw.buffered().len;
 
     const keys = crypto.keysFromSecret(crypto.initialSecrets(cfg.dcid).client);
     const build: packet.Build = .{
@@ -263,16 +428,16 @@ pub fn initialDatagram(out: []u8, hello_buf: []u8, cfg: Config) Error!Initial {
         .pn_len = packet.max_pn_len,
     };
 
-    const payload_len = try paddedInitialLen(out, build, frames_len);
-    if (payload_len > payload.len) return error.BufferTooSmall;
-
-    fw.splatByteAll(0, payload_len - frames_len) catch return error.BufferTooSmall;
-
     return .{
-        .len = try packet.seal(out, build, fw.buffered(), keys),
-        .client_hello = ch,
+        .len = try sealInitialCrypto(out, build, keys, ch),
+        .hello = ch,
     };
 }
+
+/// The longest CONNECTION_CLOSE reason we send or keep. It is diagnostic text
+/// on a connection that is already over, so both directions truncate to it
+/// rather than treat a longer one as a failure.
+pub const max_close_reason = 256;
 
 /// Why the peer closed. `frame.ConnectionClose` borrows the buffer the packet
 /// was decrypted into, so this keeps its own copy and stays valid once that
@@ -280,7 +445,7 @@ pub fn initialDatagram(out: []u8, hello_buf: []u8, cfg: Config) Error!Initial {
 pub const Close = struct {
     error_code: u64,
     frame_type: ?u64,
-    reason_buf: [256]u8 = undefined,
+    reason_buf: [max_close_reason]u8 = undefined,
     reason_len: usize = 0,
 
     pub fn reason(self: *const Close) []const u8 {
@@ -311,7 +476,7 @@ pub const Accepted = struct {
     /// Set once `peer_key` has signed the transcript, so the key is the peer's
     /// and not merely something the peer sent.
     peer_verified: bool = false,
-    alpn_buf: [64]u8 = undefined,
+    alpn_buf: [max_alpn]u8 = undefined,
     alpn_len: usize = 0,
 
     /// The connection id the server wants us to address it by from now on.
@@ -461,15 +626,26 @@ pub const Connection = struct {
     /// Source: RFC 9000 s7.3, s17.3.
     our_scid: [packet.max_cid_len]u8 = undefined,
     our_cid_len: usize,
-    /// Set when EncryptedExtensions names raw_public_key. X.509 is the default
-    /// when the extension is absent, which radish treats as fatal rather than
-    /// continue with a peer it cannot authenticate.
+    /// Set when the peer's hello names raw_public_key in both directions. X.509
+    /// is the default when the extension is absent, which radish treats as fatal
+    /// rather than continue with a peer it cannot authenticate.
     /// Source: RFC 7250 s4.1, s4.2.
     negotiated_raw_key: bool = false,
+    /// What a server accepts, in the order it prefers. Empty on a client, which
+    /// named its one protocol in the ClientHello and does not select.
+    /// Source: RFC 9001 s8.1.
+    alpns: []const []const u8 = &.{},
 
     /// HANDSHAKE_DONE, so the server accepted our flight. It only ever travels
-    /// in a 1-RTT packet.
+    /// in a 1-RTT packet. A server sets this the moment the handshake completes
+    /// rather than on hearing anything back.
+    /// Source: RFC 9001 s4.1.2.
     confirmed: bool = false,
+    /// A server owes the client a HANDSHAKE_DONE, and owes it again until one
+    /// is acknowledged. `handshake_done_pn` is the packet the last one went in.
+    /// Source: RFC 9000 s13.3.
+    handshake_done_owed: bool = false,
+    handshake_done_pn: ?u64 = null,
     /// `writeFlight` has run, so the transcript now includes our flight.
     flight_sent: bool = false,
     /// Owed back to the peer as a PATH_RESPONSE.
@@ -531,6 +707,15 @@ pub const Connection = struct {
     /// on it, since only the caller can put the bytes back on the wire.
     lost: bool = false,
 
+    /// Every payload byte this connection has been handed, whether or not any
+    /// of it opened, and every byte sealed for it. A server may send three
+    /// times what it has received until the address is validated, which happens
+    /// the moment a Handshake packet from the peer opens.
+    /// Source: RFC 9000 s8, s8.1.
+    received_bytes: u64 = 0,
+    sent_bytes: u64 = 0,
+    address_validated: bool = false,
+
     /// What has arrived in each space, for acknowledging it and for recovering
     /// the next truncated packet number.
     initial_received: frame.Received = .{},
@@ -538,8 +723,8 @@ pub const Connection = struct {
     app_received: frame.Received = .{},
 
     /// The next number to send in each space. Reusing one repeats an AEAD nonce
-    /// under the same key. The Initial space starts at 1: `initialDatagram` sent
-    /// the ClientHello as 0.
+    /// under the same key. A client starts the Initial space at 1, since
+    /// `initialDatagram` sent the ClientHello as 0; `init` puts a server to 0.
     /// Source: RFC 9000 s12.3, RFC 9001 s5.3.
     next_initial_pn: u64 = 1,
     next_handshake_pn: u64 = 0,
@@ -560,9 +745,14 @@ pub const Connection = struct {
 
     /// The context a CertificateRequest asked us to echo. `requested` is what
     /// says the server wants client authentication.
-    request_buf: [255]u8 = undefined,
+    request_buf: [handshake.max_request_context]u8 = undefined,
     request_len: usize = 0,
     requested: bool = false,
+
+    /// The flow control limit we advertise, which `stream_buf` has to be long
+    /// enough to hold. A client already sent it in the ClientHello; a server
+    /// sends it in EncryptedExtensions, so it has to keep it until then.
+    window: u64 = default_window,
 
     accepted: Accepted = .{},
     /// Set alongside `error.PeerClosed`.
@@ -583,6 +773,9 @@ pub const Connection = struct {
         our_scid: []const u8,
         /// Opens the transcript.
         client_hello: []const u8,
+        /// What a server accepts from a ClientHello's ALPN list, preferred
+        /// first. A client leaves it empty.
+        alpns: []const []const u8 = &.{},
         secret: tls.SecretKey,
         /// Hold the reassembled CRYPTO streams, borrowed for the handshake's
         /// life. One per packet number space.
@@ -594,23 +787,32 @@ pub const Connection = struct {
         stream_buf: []u8 = &.{},
         /// Holds what we send there until the peer acknowledges it.
         send_buf: []u8 = &.{},
+        /// The limit to advertise, which has to match `Config.window` on a
+        /// client and `stream_buf`'s length on either.
+        window: u64 = default_window,
     };
 
     pub fn init(opts: Options) Connection {
         const initial = crypto.initialSecrets(opts.original_dcid);
         var self: Connection = .{
             .role = opts.role,
+            .alpns = opts.alpns,
             .secret = opts.secret,
             .initial_keys = .{
                 .send = crypto.keysFromSecret(opts.role.ours(initial)),
                 .recv = crypto.keysFromSecret(opts.role.theirs(initial)),
             },
             .our_cid_len = opts.our_scid.len,
+            .window = opts.window,
             .initial_crypto = reassembly.Reassembler.init(opts.initial_buf),
             .handshake_crypto = reassembly.Reassembler.init(opts.handshake_buf),
             .stream = stream.Receiver.init(opts.stream_buf, opts.stream_buf.len),
             .sender = stream.Sender.init(opts.send_buf),
         };
+        if (opts.role == .server) {
+            self.next_initial_pn = 0;
+            self.phase = .wait_client_hello;
+        }
         self.original_dcid_len = opts.original_dcid.len;
         @memcpy(self.original_dcid[0..self.original_dcid_len], opts.original_dcid);
         @memcpy(self.our_scid[0..opts.our_scid.len], opts.our_scid);
@@ -622,6 +824,10 @@ pub const Connection = struct {
     /// frames to the matching stream. `datagram` is decrypted in place;
     /// `scratch` receives each packet's plaintext.
     pub fn push(self: *Connection, scratch: []u8, datagram: []u8) Error!void {
+        // Counted before anything is read: the budget covers every byte a
+        // datagram brought, including one whose packets are all discarded.
+        // Source: RFC 9000 s8.1.
+        self.received_bytes +|= datagram.len;
         var rest = datagram;
         while (rest.len > 0) {
             if (!packet.isLongHeader(rest[0])) {
@@ -661,6 +867,10 @@ pub const Connection = struct {
             const opened = try packet.open(scratch, rest, keys, tracker.largest());
             try self.frames(hdr.kind, opened);
             tracker.record(opened.pn);
+            // A Handshake packet only opens for a peer that read our Initial,
+            // which is proof it is at the address it claimed.
+            // Source: RFC 9000 s8.1.
+            if (hdr.kind == .handshake) self.address_validated = true;
             rest = rest[opened.len..];
 
             try self.drain(&self.initial_crypto, &self.initial_read);
@@ -772,6 +982,9 @@ pub const Connection = struct {
                     if (m.id == stream.first_client_bidi) self.send_stream.extend(m.max);
                 },
                 .handshake_done => {
+                    // Only a server sends it.
+                    // Source: RFC 9000 s19.20.
+                    if (self.role == .server) return error.ProtocolViolation;
                     self.confirmed = true;
                     // Only now may the application space be probed: before it,
                     // an acknowledgement might not be readable by either side.
@@ -888,17 +1101,20 @@ pub const Connection = struct {
     /// Source: RFC 9000 s10.2.
     pub fn sealClose(self: *Connection, out: []u8, reason: []const u8) Error!usize {
         const keys = (self.app_keys orelse return error.HandshakeIncomplete).send;
-        var payload: [128]u8 = undefined;
+        // The frame is three varints around the reason.
+        var payload: [3 * codec.max_varint_len + max_close_reason]u8 = undefined;
         var pw = std.Io.Writer.fixed(&payload);
-        // NO_ERROR: leaving is not a failure.
-        frame.writeConnectionClose(&pw, 0, reason) catch return error.BufferTooSmall;
+        // NO_ERROR: leaving is not a failure. A long reason is cut to what the
+        // peer would keep of it anyway.
+        const text = reason[0..@min(reason.len, max_close_reason)];
+        frame.writeConnectionClose(&pw, 0, text) catch return error.BufferTooSmall;
 
-        return packet.sealShort(out, .{
+        return self.counted(try packet.sealShort(out, .{
             .dcid = self.accepted.scid(),
             .pn = self.takePacketNumber(.application),
             .pn_len = packet.max_pn_len,
             .key_phase = self.key_phase,
-        }, pw.buffered(), keys);
+        }, pw.buffered(), keys));
     }
 
     /// A PING, which carries nothing and only asks to be acknowledged. Sent
@@ -975,6 +1191,41 @@ pub const Connection = struct {
         return self.tracked(.application, pn, n);
     }
 
+    /// Whether the last HANDSHAKE_DONE is neither acknowledged nor still in
+    /// flight, which leaves loss as the only explanation for it.
+    fn handshakeDoneLost(self: *const Connection) bool {
+        const pn = self.handshake_done_pn orelse return false;
+        if (self.app_acked.contains(pn)) return false;
+        return !self.recovery.outstanding(.application, pn);
+    }
+
+    /// HANDSHAKE_DONE, which is how a server tells the client the handshake is
+    /// confirmed. It carries nothing and travels only in a 1-RTT packet. Null
+    /// when none is owed; a lost one is owed again until it is acknowledged.
+    /// Source: RFC 9000 s19.20, s13.3, RFC 9001 s4.1.2.
+    pub fn sealHandshakeDone(self: *Connection, out: []u8) Error!?usize {
+        if (self.role != .server) return null;
+        if (!self.handshake_done_owed and !self.handshakeDoneLost()) return null;
+        const keys = (self.app_keys orelse return error.HandshakeIncomplete).send;
+
+        var payload: [codec.max_varint_len]u8 = undefined;
+        var pw = std.Io.Writer.fixed(&payload);
+        codec.writeVarint(&pw, @backingInt(frame.Type.handshake_done)) catch
+            return error.BufferTooSmall;
+
+        const pn = self.takePacketNumber(.application);
+        const n = try packet.sealShort(out, .{
+            .dcid = self.accepted.scid(),
+            .pn = pn,
+            .pn_len = packet.max_pn_len,
+            .key_phase = self.key_phase,
+        }, pw.buffered(), keys);
+
+        self.handshake_done_owed = false;
+        self.handshake_done_pn = pn;
+        return self.tracked(.application, pn, n);
+    }
+
     /// A PATH_RESPONSE echoing the challenge the peer sent, sealed as 1-RTT.
     /// Source: RFC 9000 s8.2.
     pub fn sealPathResponse(self: *Connection, out: []u8) Error!?usize {
@@ -997,16 +1248,11 @@ pub const Connection = struct {
         return self.tracked(.application, pn, n);
     }
 
-    /// Sends the ClientHello again under a fresh packet number. A lost packet is
-    /// never resent as-is: the information goes in a new packet, and repeating a
+    /// Sends our hello again under a fresh packet number. A lost packet is never
+    /// resent as-is: the information goes in a new packet, and repeating a
     /// number would repeat an AEAD nonce and be discarded as a duplicate anyway.
     /// Source: RFC 9000 s13.3, s12.3.
-    pub fn sealInitialRetransmit(self: *Connection, out: []u8, client_hello: []const u8) Error!usize {
-        var payload: [min_initial_datagram]u8 = undefined;
-        var pw = std.Io.Writer.fixed(&payload);
-        writeCryptoFrame(&pw, 0, client_hello) catch return error.BufferTooSmall;
-        const frames_len = pw.buffered().len;
-
+    pub fn sealInitialRetransmit(self: *Connection, out: []u8, hello: []const u8) Error!usize {
         // Until the server's Initial arrives there is no id to address it by,
         // so keep using the one that derived the keys.
         const build: packet.Build = .{
@@ -1020,11 +1266,7 @@ pub const Connection = struct {
             .pn_len = packet.max_pn_len,
         };
 
-        const payload_len = try paddedInitialLen(out, build, frames_len);
-        if (payload_len > payload.len) return error.BufferTooSmall;
-        pw.splatByteAll(0, payload_len - frames_len) catch return error.BufferTooSmall;
-
-        const n = try packet.seal(out, build, pw.buffered(), self.initial_keys.send);
+        const n = try sealInitialCrypto(out, build, self.initial_keys.send, hello);
         return self.tracked(.initial, build.pn, n);
     }
 
@@ -1035,7 +1277,29 @@ pub const Connection = struct {
     /// Source: RFC 9002 s2, s7.
     fn tracked(self: *Connection, space: packet.Space, pn: u64, n: usize) usize {
         self.recovery.onSent(space, pn, n, self.now_ms);
+        return self.counted(n);
+    }
+
+    /// Every sealed packet passes through here, so the amplification budget
+    /// sees all of them and not only the ones loss detection tracks.
+    fn counted(self: *Connection, n: usize) usize {
+        self.sent_bytes +|= n;
         return n;
+    }
+
+    /// What a server may still send to an address it has not validated: three
+    /// times what arrived, less what has gone out. No limit for a client, and
+    /// none once a Handshake packet has proved the peer is there.
+    /// Source: RFC 9000 s8, s8.1.
+    pub fn amplificationRoom(self: *const Connection) u64 {
+        if (self.role == .client or self.address_validated) return std.math.maxInt(u64);
+        return (self.received_bytes *| 3) -| self.sent_bytes;
+    }
+
+    /// Whether a whole datagram still fits in that budget. Measured in whole
+    /// datagrams, since that is what goes out.
+    fn amplificationBlocked(self: *const Connection) bool {
+        return self.amplificationRoom() < min_initial_datagram;
     }
 
     pub fn received(self: *Connection, space: packet.Space) *frame.Received {
@@ -1134,6 +1398,9 @@ pub const Connection = struct {
         const tracker = self.received(space);
         if (!tracker.ack_eliciting) return null;
         if (!self.ackDue(space)) return null;
+        // Silence is better than exceeding the budget: the peer retransmits,
+        // and what it sends raises what we may send back.
+        if (self.amplificationBlocked()) return null;
 
         var payload: [min_initial_datagram]u8 = undefined;
         var pw = std.Io.Writer.fixed(&payload);
@@ -1172,16 +1439,18 @@ pub const Connection = struct {
 
         // A client expands every datagram carrying an Initial to 1200 bytes,
         // with no exception for one holding only an ACK: a server discards a
-        // smaller one before it reads the frames.
+        // smaller one before it reads the frames. A server owes the expansion
+        // only on an ack-eliciting Initial, and would be spending its
+        // amplification budget on padding.
         // Source: RFC 9000 s14.1.
-        if (space == .initial) {
+        if (space == .initial and self.role == .client) {
             const want = try paddedInitialLen(out, build, pw.buffered().len);
             pw.splatByteAll(0, want - pw.buffered().len) catch return error.BufferTooSmall;
         }
         const n = switch (space) {
             .initial => try packet.seal(out, build, pw.buffered(), self.initial_keys.send),
             .handshake => try packet.seal(out, build, pw.buffered(), crypto.keysFromSecret(
-                (self.accepted.handshake orelse return error.KeysUnavailable).client,
+                self.role.ours(self.accepted.handshake orelse return error.KeysUnavailable),
             )),
             .application => try packet.sealShort(out, .{
                 .dcid = self.accepted.scid(),
@@ -1206,9 +1475,10 @@ pub const Connection = struct {
         }
         tracker.cleared();
         // A PING makes the packet ack-eliciting, so it is one loss detection
-        // and the congestion window have to know about.
+        // and the congestion window have to know about. Either way the bytes
+        // are counted once.
         if (ping) return self.tracked(space, pn, n);
-        return n;
+        return self.counted(n);
     }
 
     /// Whether an ACK for `space` is owed yet. The handshake spaces answer
@@ -1287,30 +1557,64 @@ pub const Connection = struct {
         if (self.phase != .wait_client_hello) return error.UnexpectedMessage;
 
         const ch = try handshake.parseClientHello(msg.raw);
-        if (!offers(ch.cipher_suites, cipher_suite)) return error.UnsupportedCipherSuite;
+        try uniqueExtensions(ch.extensions);
+        // Only a version the client offered may be selected, and 1.3 is the
+        // only one there is a ServerHello for here.
+        // Source: RFC 8446 s4.2.1, RFC 9001 s4.2.
+        if (!try offersTls13(ch)) return error.UnsupportedVersion;
+        // Middlebox compatibility mode, which has no use over QUIC and which a
+        // server is told to refuse.
+        // Source: RFC 9001 s8.4.
+        if (ch.session_id.len != 0) return error.ProtocolViolation;
+        if (!try offers(ch.cipher_suites, cipher_suite)) return error.UnsupportedCipherSuite;
 
         const ks = try clientKeyShare(ch) orelse return error.Malformed;
         if (ks.group != .x25519 or ks.key.len != 32) return error.UnsupportedGroup;
 
+        var offered_ours = false;
+        var offered_theirs = false;
         var it = handshake.ExtensionIterator.init(ch.extensions);
         while (try it.next()) |e| switch (e.type) {
-            .client_certificate_type, .server_certificate_type => {
-                // Raw public keys have to be on offer, since a certificate
-                // chain is not something either end here can read.
-                // Source: RFC 7250 s4.1.
-                if (std.mem.indexOfScalar(u8, e.body, raw_public_key) == null) {
-                    return error.UnsupportedCertificateType;
-                }
-                self.negotiated_raw_key = true;
-            },
+            // Raw public keys have to be on offer, since a certificate chain is
+            // not something either end here can read.
+            // Source: RFC 7250 s4.1.
+            .client_certificate_type => offered_theirs = try offersRawPublicKey(e.body),
+            .server_certificate_type => offered_ours = try offersRawPublicKey(e.body),
             .application_layer_protocol_negotiation => try self.selectAlpn(e.body),
             .quic_transport_parameters => try self.transportParams(e.body),
             else => {},
         };
 
+        // Both directions, and only what the client offered may be echoed: a
+        // client that named one of them cannot be authenticated mutually and
+        // has to be turned down rather than sent an extension it never asked
+        // for. Source: RFC 7250 s4.1, RFC 8446 s4.2.
+        if (!offered_ours or !offered_theirs) return error.UnsupportedCertificateType;
+        self.negotiated_raw_key = true;
+        // Nothing in common, so there is no connection to have.
+        // Source: RFC 9001 s8.1.
+        if (self.accepted.alpn_len == 0) return error.NoApplicationProtocol;
+        try self.requiredParams();
+
         self.transcript.update(msg.raw);
         self.keying = .{ .offered = ks.key[0..32].* };
         self.phase = .wait_certificate;
+    }
+
+    /// No extension type may appear twice in one block. A repeat would leave
+    /// what we took from the hello depending on which copy was read last, so it
+    /// is refused rather than resolved.
+    /// Source: RFC 8446 s4.2.
+    fn uniqueExtensions(block: []const u8) Error!void {
+        var outer = handshake.ExtensionIterator.init(block);
+        while (try outer.next()) |a| {
+            var inner = handshake.ExtensionIterator.init(block);
+            var seen: usize = 0;
+            while (try inner.next()) |b| {
+                if (b.type == a.type) seen += 1;
+            }
+            if (seen > 1) return error.ProtocolViolation;
+        }
     }
 
     /// The one key share we can use, out of however many the client offered.
@@ -1328,23 +1632,118 @@ pub const Connection = struct {
         return null;
     }
 
-    fn offers(suites: []const u8, want: u16) bool {
+    /// Whether the ClientHello's supported_versions names TLS 1.3. A client
+    /// sends a u8-length list of versions where a ServerHello selects one.
+    /// Source: RFC 8446 s4.2.1.
+    fn offersTls13(ch: handshake.ParsedClientHello) Error!bool {
+        const body = (try ch.find(.supported_versions)) orelse return false;
+        var r = codec.Reader{ .buf = body };
+        var list = codec.Reader{ .buf = try r.take(try r.readU8()) };
+        while (list.pos < list.buf.len) {
+            if (try list.readU16() == @backingInt(std.crypto.tls.ProtocolVersion.tls_1_3)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// A cipher suite list is whole suites and nothing else, so an odd length
+    /// is a message we misread rather than one with a byte to spare.
+    /// Source: RFC 8446 s4.1.2.
+    fn offers(suites: []const u8, want: u16) Error!bool {
+        if (suites.len % 2 != 0) return error.Malformed;
         var i: usize = 0;
-        while (i + 1 < suites.len) : (i += 2) {
+        while (i < suites.len) : (i += 2) {
             if (std.mem.readInt(u16, suites[i..][0..2], .big) == want) return true;
         }
         return false;
     }
 
-    /// The first protocol the client offered. Enough for radicle's two, which
-    /// a server speaks both of.
+    /// A certificate_type extension's list, which is a u8 length around one
+    /// byte per type. Source: RFC 7250 s4.1.
+    fn offersRawPublicKey(body: []const u8) Error!bool {
+        var r = codec.Reader{ .buf = body };
+        const types = try r.take(try r.readU8());
+        return std.mem.indexOfScalar(u8, types, raw_public_key) != null;
+    }
+
+    /// The protocol both ends name, taking `alpns` as the order of preference.
+    /// Leaves the selection empty when there is no overlap, which the caller
+    /// refuses. Source: RFC 9001 s8.1.
     fn selectAlpn(self: *Connection, body: []const u8) Error!void {
         var r = codec.Reader{ .buf = body };
-        var list = codec.Reader{ .buf = try r.take(try r.readU16()) };
-        const name = try list.take(try list.readU8());
-        if (name.len > self.accepted.alpn_buf.len) return error.BufferTooSmall;
-        @memcpy(self.accepted.alpn_buf[0..name.len], name);
-        self.accepted.alpn_len = name.len;
+        const offered = try r.take(try r.readU16());
+        for (self.alpns) |ours| {
+            var list = codec.Reader{ .buf = offered };
+            while (list.pos < list.buf.len) {
+                const name = try list.take(try list.readU8());
+                if (!std.mem.eql(u8, name, ours)) continue;
+                if (name.len > self.accepted.alpn_buf.len) return error.BufferTooSmall;
+                @memcpy(self.accepted.alpn_buf[0..name.len], name);
+                self.accepted.alpn_len = name.len;
+                return;
+            }
+        }
+    }
+
+    /// The ServerHello answering the ClientHello, sealed as our first Initial.
+    /// Writing it and deriving are one step: the handshake traffic secrets take
+    /// the transcript through it inclusive, so this runs once, and `hello_buf`
+    /// keeps the message for `sealInitialRetransmit` to send again.
+    /// Source: RFC 8446 s4.1.3, RFC 9001 s5.
+    pub fn sealServerHello(
+        self: *Connection,
+        out: []u8,
+        hello_buf: []u8,
+        random: handshake.Random,
+    ) Error!Initial {
+        const offered = switch (self.keying) {
+            .offered => |key| key,
+            else => return error.HandshakeIncomplete,
+        };
+        if (self.amplificationBlocked()) return error.AmplificationLimited;
+        const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(self.secret) catch
+            return error.UnsupportedGroup;
+
+        // The extensions are part of the message, so its length covers them too.
+        var ext: [max_server_hello]u8 = undefined;
+        var ew = std.Io.Writer.fixed(&ext);
+        handshake.writeServerKeyShare(&ew, kp.public_key) catch return error.BufferTooSmall;
+        handshake.writeSelectedVersion(&ew) catch return error.BufferTooSmall;
+
+        const sh = try handshake.writeServerHello(hello_buf, .{
+            .random = random,
+            .cipher_suite = cipher_suite,
+            .extensions = ew.buffered(),
+        });
+
+        const shared = tls.x25519(self.secret, offered) catch return error.UnsupportedGroup;
+
+        // Everything that can fail happens first: the transcript cannot be
+        // unhashed, and a keying left `.derived` with nothing sent has no way
+        // back to answering the ClientHello.
+        const pn = self.nextPacketNumber(.initial).*;
+        const n = try sealInitialCrypto(out, .{
+            .kind = .initial,
+            .dcid = self.accepted.scid(),
+            .scid = self.our_scid[0..self.our_cid_len],
+            .pn = pn,
+            .pn_len = packet.max_pn_len,
+        }, self.initial_keys.send, sh);
+
+        self.transcript.update(sh);
+        const secret = tls.handshakeSecret(tls.earlySecret(), &shared);
+        const hs = tls.handshakeTraffic(secret, self.transcript.hash());
+
+        self.accepted.cipher_suite = cipher_suite;
+        self.accepted.handshake = hs;
+        self.keying = .{ .derived = .{
+            .secret = secret,
+            .keys = crypto.keysFromSecret(self.role.theirs(hs)),
+        } };
+
+        _ = self.takePacketNumber(.initial);
+        return .{ .len = self.tracked(.initial, pn, n), .hello = sh };
     }
 
     fn clientMessage(self: *Connection, msg: handshake.Message) Error!void {
@@ -1419,40 +1818,68 @@ pub const Connection = struct {
                 // possible: the key in the certificate has to have signed the
                 // transcript.
                 if (!self.accepted.peer_verified) return error.BadCertificateVerify;
-                const d = self.keying.get() orelse return error.Malformed;
                 const hs = self.accepted.handshake orelse return error.Malformed;
                 const expect = tls.verifyData(self.role.theirs(hs), self.transcript.hash());
                 if (msg.body.len != expect.len) return error.BadFinished;
                 if (!std.crypto.timing_safe.eql([32]u8, expect, msg.body[0..32].*)) {
                     return error.BadFinished;
                 }
-                // The application traffic secrets take the transcript through
-                // this message, so hash it once it is trusted.
                 self.transcript.update(msg.raw);
-                const app = tls.applicationTraffic(
-                    tls.masterSecret(d.secret),
-                    self.transcript.hash(),
-                );
-                self.accepted.application = app;
-                self.app_keys = .{
-                    .send = crypto.keysFromSecret(self.role.ours(app)),
-                    .recv = crypto.keysFromSecret(self.role.theirs(app)),
-                };
+                // A client is reading the server's Finished, which is where the
+                // 1-RTT secrets come from. A server is reading the client's,
+                // and derived its own back when it wrote the flight.
+                if (self.role == .client) try self.deriveApplication();
                 self.phase = .connected;
+                // A server's handshake is confirmed the moment it completes,
+                // and it owes the client the frame that says so.
+                // Source: RFC 9001 s4.1.2.
+                if (self.role == .server) {
+                    self.confirmed = true;
+                    self.recovery.confirmed = true;
+                    self.handshake_done_owed = true;
+                }
             },
             else => return error.UnexpectedMessage,
         }
     }
 
-    /// Our half of mutual authentication, as one CRYPTO stream: Certificate and
-    /// CertificateVerify when the server asked for them, then Finished. Each
-    /// message is hashed as it is written, since the two that sign the
-    /// transcript cover everything before themselves.
+    /// The 1-RTT secrets, taken from the transcript through the server's
+    /// Finished. Both roles derive at that one point, which a server reaches by
+    /// writing that message and a client by reading it.
+    /// Source: RFC 8446 s7.1.
+    fn deriveApplication(self: *Connection) Error!void {
+        const d = self.keying.get() orelse return error.KeysUnavailable;
+        const app = tls.applicationTraffic(tls.masterSecret(d.secret), self.transcript.hash());
+        self.accepted.application = app;
+        self.app_keys = .{
+            .send = crypto.keysFromSecret(self.role.ours(app)),
+            .recv = crypto.keysFromSecret(self.role.theirs(app)),
+        };
+    }
+
+    /// Hashes the message `writeFlight` just appended, which is everything
+    /// written since `at`, and returns where the next one starts.
+    fn hashFrom(self: *Connection, w: *const std.Io.Writer, at: usize) usize {
+        self.transcript.update(w.buffered()[at..]);
+        return w.buffered().len;
+    }
+
+    /// Our half of the handshake, as one CRYPTO stream. A server leads with
+    /// EncryptedExtensions and a CertificateRequest, then both roles write
+    /// Certificate and CertificateVerify when the peer wants authenticating,
+    /// and Finished last. Each message is hashed as it is written, since the
+    /// two that sign the transcript cover everything before themselves.
     ///
     /// Advances the transcript, so it can only be called once.
-    /// Source: RFC 8446 s4.4.
+    /// Source: RFC 8446 s4.3, s4.4.
     pub fn writeFlight(self: *Connection, out: []u8, key: Ed25519.KeyPair) Error![]const u8 {
-        if (!self.done()) return error.HandshakeIncomplete;
+        switch (self.role) {
+            // A client answers a handshake it has already verified. A server
+            // writes as soon as the ServerHello gave it keys to encrypt under,
+            // which is well before it has heard back.
+            .client => if (!self.done()) return error.HandshakeIncomplete,
+            .server => if (self.keying.get() == null) return error.HandshakeIncomplete,
+        }
         // The transcript advances past the flight, so a second call would sign
         // and MAC over the wrong prefix. Retransmission resends these bytes.
         if (self.flight_sent) return error.FlightAlreadySent;
@@ -1460,37 +1887,65 @@ pub const Connection = struct {
         const hs = self.accepted.handshake orelse return error.HandshakeIncomplete;
 
         var w = std.Io.Writer.fixed(out);
-        if (self.requested) {
-            const cert_at = w.buffered().len;
+        var at: usize = 0;
+        if (self.role == .server) {
+            var ext: [handshake.max_extensions]u8 = undefined;
+            var ew = std.Io.Writer.fixed(&ext);
+            writeServerExtensions(
+                &ew,
+                self.accepted.alpn(),
+                self.our_scid[0..self.our_cid_len],
+                self.original_dcid[0..self.original_dcid_len],
+                self.window,
+            ) catch return error.BufferTooSmall;
+
+            handshake.writeEncryptedExtensions(&w, ew.buffered()) catch return error.BufferTooSmall;
+            at = self.hashFrom(&w, at);
+
+            // radicle authenticates both ends, so the client is asked for a key
+            // too. The context is empty: there is only ever one request here,
+            // so nothing needs matching up.
+            // Source: RFC 8446 s4.3.2.
+            handshake.writeCertificateRequest(
+                &w,
+                &.{},
+                &certificate_request_extensions,
+            ) catch return error.BufferTooSmall;
+            at = self.hashFrom(&w, at);
+        }
+
+        // A server always authenticates; a client only when asked to.
+        if (self.role == .server or self.requested) {
             handshake.writeRawPublicKeyCertificate(
                 &w,
                 self.request_buf[0..self.request_len],
                 key.public_key.toBytes(),
             ) catch return error.BufferTooSmall;
-            self.transcript.update(w.buffered()[cert_at..]);
+            at = self.hashFrom(&w, at);
 
             var content: [handshake.max_verify_content]u8 = undefined;
             const signed = try handshake.verifyContent(
                 &content,
-                handshake.client_verify_context,
+                self.role.ourVerifyContext(),
                 self.transcript.hash(),
             );
             const sig = (key.sign(signed, null) catch return error.BadCertificateVerify).toBytes();
 
-            const cv_at = w.buffered().len;
             handshake.writeCertificateVerify(
                 &w,
                 @backingInt(SignatureScheme.ed25519),
                 &sig,
             ) catch return error.BufferTooSmall;
-            self.transcript.update(w.buffered()[cv_at..]);
+            at = self.hashFrom(&w, at);
         }
 
-        const vd = tls.verifyData(hs.client, self.transcript.hash());
-        const fin_at = w.buffered().len;
+        const vd = tls.verifyData(self.role.ours(hs), self.transcript.hash());
         handshake.writeMessage(&w, .finished, &vd) catch return error.BufferTooSmall;
-        self.transcript.update(w.buffered()[fin_at..]);
+        _ = self.hashFrom(&w, at);
 
+        // This is the server's Finished, so the transcript now stands where
+        // both roles take their 1-RTT secrets from.
+        if (self.role == .server) try self.deriveApplication();
         return w.buffered();
     }
 
@@ -1499,6 +1954,7 @@ pub const Connection = struct {
     /// is calling this again with the same bytes.
     pub fn sealFlight(self: *Connection, out: []u8, flight: []const u8) Error!usize {
         const hs = self.accepted.handshake orelse return error.HandshakeIncomplete;
+        if (self.amplificationBlocked()) return error.AmplificationLimited;
         const pn = self.takePacketNumber(.handshake);
 
         // A CRYPTO frame is a type byte then two varints, around the flight.
@@ -1567,10 +2023,18 @@ pub const Connection = struct {
         // since the alternative is an unauthenticated peer.
         // Source: RFC 7250 s4.2.
         if (!self.negotiated_raw_key) return error.UnsupportedCertificateType;
+        // A server that selected nothing we offered, or no protocol at all.
+        // Source: RFC 9001 s8.1.
+        if (self.accepted.alpn_len == 0) return error.NoApplicationProtocol;
+        try self.requiredParams();
+    }
 
-        // Both are mandatory, and their absence is an error in its own right.
-        // Source: RFC 9000 s7.3.
-        if (!self.saw_initial_scid or !self.saw_original_dcid) {
+    /// The connection ids the peer owed us, once the extension carrying them
+    /// has been read. Only a server sends `original_dcid`.
+    /// Source: RFC 9000 s7.3.
+    fn requiredParams(self: *const Connection) Error!void {
+        if (!self.saw_initial_scid) return error.TransportParameterError;
+        if (self.role == .client and !self.saw_original_dcid) {
             return error.TransportParameterError;
         }
     }
@@ -1583,10 +2047,11 @@ pub const Connection = struct {
         return v;
     }
 
-    /// Checks the connection ids the server claims against the ones actually on
+    /// Checks the connection ids the peer claims against the ones actually on
     /// the packets. Nothing else authenticates them: they travel in cleartext
-    /// headers, so only this comparison ties them to the handshake.
-    /// Source: RFC 9000 s7.3.
+    /// headers, so only this comparison ties them to the handshake. Four are a
+    /// server's to send, and a client sending one is an error.
+    /// Source: RFC 9000 s7.3, s18.2.
     fn transportParams(self: *Connection, body: []const u8) Error!void {
         var it = handshake.TransportParamIterator.init(body);
         while (try it.next()) |p| switch (p.id) {
@@ -1597,19 +2062,21 @@ pub const Connection = struct {
                 self.saw_initial_scid = true;
             },
             .original_destination_connection_id => {
+                if (self.role == .server) return error.TransportParameterError;
                 if (!std.mem.eql(u8, p.value, self.original_dcid[0..self.original_dcid_len])) {
                     return error.TransportParameterError;
                 }
                 self.saw_original_dcid = true;
             },
-            // The limits on what we may send. `bidi_remote` is the one that
-            // covers streams we open ourselves.
-            // Source: RFC 9000 s18.2.
+            .preferred_address, .retry_source_connection_id => {
+                if (self.role == .server) return error.TransportParameterError;
+            },
             .max_idle_timeout => self.peer_idle_ms = try varintParam(p.value),
             // What a lost connection will be proved with, and how long the peer
             // may sit on an acknowledgement before sending it.
             // Source: RFC 9000 s10.3, s13.2.1.
             .stateless_reset_token => {
+                if (self.role == .server) return error.TransportParameterError;
                 if (p.value.len != 16) return error.TransportParameterError;
                 self.peer_reset_token = p.value[0..16].*;
             },
@@ -1622,8 +2089,15 @@ pub const Connection = struct {
                 self.peer_ack_exponent = @intCast(e);
             },
             .initial_max_data => self.send_data.extend(try varintParam(p.value)),
+            // The limit on the one stream, which the client always opens: the
+            // peer's `bidi_local` covers a stream it opened itself, and its
+            // `bidi_remote` one we opened.
+            // Source: RFC 9000 s18.2.
+            .initial_max_stream_data_bidi_local => {
+                if (self.role == .server) self.send_stream.extend(try varintParam(p.value));
+            },
             .initial_max_stream_data_bidi_remote => {
-                self.send_stream.extend(try varintParam(p.value));
+                if (self.role == .client) self.send_stream.extend(try varintParam(p.value));
             },
             else => {},
         };
@@ -1714,7 +2188,7 @@ test "walks a coalesced flight and reads a raw public key certificate" {
 
     // The keys the server would use, derived the same way the Connection will.
     var t: handshake.Transcript = .{};
-    t.update(initial.client_hello);
+    t.update(initial.hello);
     t.update(&sh);
     const share = (try (try handshake.parseServerHello(&sh)).keyShare()).?.key;
     const shared = try tls.x25519(secret, share[0..32].*);
@@ -1724,14 +2198,14 @@ test "walks a coalesced flight and reads a raw public key certificate" {
     // Certificate holding one ed25519 SubjectPublicKeyInfo, then Finished.
     // A real key from a fixed seed, so CertificateVerify can sign against it
     // once that lands.
-    const server_key = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(7));
+    const server_key = try Ed25519.KeyPair.generateDeterministic(hex(testdata.fixed_peer_identity_seed));
     const peer_key = server_key.public_key.toBytes();
     // Hashed one message at a time: CertificateVerify and Finished each cover
     // the transcript up to but not including themselves.
     var server_flight: [1024]u8 = undefined;
     var stw = std.Io.Writer.fixed(&server_flight);
     var st: handshake.Transcript = .{};
-    st.update(initial.client_hello);
+    st.update(initial.hello);
     st.update(&sh);
 
     {
@@ -1834,7 +2308,7 @@ test "walks a coalesced flight and reads a raw public key certificate" {
     var h = Connection.init(.{
         .original_dcid = &dcid,
         .our_scid = &dcid,
-        .client_hello = initial.client_hello,
+        .client_hello = initial.hello,
         .secret = secret,
         .initial_buf = &initial_crypto,
         .handshake_buf = &handshake_crypto,
@@ -1855,13 +2329,13 @@ test "walks a coalesced flight and reads a raw public key certificate" {
     // Our half of mutual authentication, checked the way the server would:
     // Certificate echoing the request context, CertificateVerify over the
     // transcript through it, then Finished under the client secret.
-    const our_key = try Ed25519.KeyPair.generateDeterministic(@splat(9));
+    const our_key = try Ed25519.KeyPair.generateDeterministic(hex(testdata.fixed_identity_seed));
     var messages_buf: [1024]u8 = undefined;
     var flight: [1024]u8 = undefined;
     const sent = try h.sealFlight(&flight, try h.writeFlight(&messages_buf, our_key));
 
     var mirror: handshake.Transcript = .{};
-    mirror.update(initial.client_hello);
+    mirror.update(initial.hello);
     mirror.update(&sh);
     mirror.update(messages);
 
@@ -1931,26 +2405,35 @@ test "walks a coalesced flight and reads a raw public key certificate" {
     try testing.expectEqual(@as(?usize, null), try h.sealPathResponse(&response));
 }
 
-/// A server that has read the Initial header, which is where the client's
-/// source connection id comes from, and is waiting on the ClientHello.
-fn serverConnection(dcid: []const u8, bufs: *TestBufs) Connection {
-    var h = Connection.init(.{
+/// A server waiting on a ClientHello. `scid` is the id it gives for itself,
+/// which is its own to choose and so is not the one the client addressed. The
+/// client's id arrives on the first Initial, so a test that pushes no datagram
+/// hands the hello over with `tellsHello` instead.
+fn serverConnection(dcid: []const u8, scid: []const u8, bufs: *TestBufs) Connection {
+    return Connection.init(.{
         .role = .server,
         .original_dcid = dcid,
-        .our_scid = dcid,
+        .our_scid = scid,
         .client_hello = "",
-        .secret = hex(testdata.fixed_x25519_secret),
+        .alpns = &.{ "radicle/gossip/1", "radicle/git/1" },
+        .secret = hex(testdata.fixed_server_x25519_secret),
         .initial_buf = &bufs.initial,
         .handshake_buf = &bufs.handshake,
     });
-    h.phase = .wait_client_hello;
-    h.accepted.scid_len = dcid.len;
-    @memcpy(h.accepted.scid_buf[0..dcid.len], dcid);
-    return h;
+}
+
+/// A ClientHello as a datagram would deliver it: the client's source
+/// connection id off the Initial header, then the message. The transport
+/// parameters are checked against that id, so it has to be there first.
+fn tellsHello(h: *Connection, scid: []const u8, raw: []const u8) Error!void {
+    h.accepted.scid_len = scid.len;
+    @memcpy(h.accepted.scid_buf[0..scid.len], scid);
+    return h.message(firstMessage(raw));
 }
 
 test "a server reads what a ClientHello offered, and refuses one without raw public keys" {
     const dcid = hex(testdata.other_dcid);
+    const server_scid = hex("aabbccdd");
     const kp = try std.crypto.dh.X25519.KeyPair.generateDeterministic(hex(testdata.fixed_x25519_secret));
 
     var out: [1500]u8 = undefined;
@@ -1965,9 +2448,8 @@ test "a server reads what a ClientHello offered, and refuses one without raw pub
     });
 
     var bufs: TestBufs = .{};
-    var h = serverConnection(&dcid, &bufs);
-    var it = handshake.MessageIterator.init(initial.client_hello);
-    try h.message(it.next().?);
+    var h = serverConnection(&dcid, &server_scid, &bufs);
+    try tellsHello(&h, &dcid, initial.hello);
 
     try testing.expectEqualStrings("radicle/git/1", h.accepted.alpn());
     try testing.expect(h.negotiated_raw_key);
@@ -1976,28 +2458,441 @@ test "a server reads what a ClientHello offered, and refuses one without raw pub
     try testing.expectEqual(@as(u64, 4096), h.send_stream.limit);
     try testing.expectEqual(Connection.Phase.wait_certificate, h.phase);
 
-    // The same hello with an X.509 chain in place of a raw key: neither end
-    // here can read a certificate chain, so there is nothing to fall back to.
+    // An X.509 chain in place of a raw key: neither end here can read a
+    // certificate chain, so there is nothing to fall back to.
+    var chain: [max_client_hello]u8 = undefined;
+    var cw = std.Io.Writer.fixed(&chain);
+    try handshake.writeSupportedVersions(&cw);
+    try handshake.writeKeyShare(&cw, kp.public_key);
+    try handshake.writeExtension(&cw, @backingInt(ExtensionType.server_certificate_type), &.{ 1, 0 });
+    try refuses(&dcid, &server_scid, .{
+        .random = hex(testdata.fixed_hello_random),
+        .cipher_suites = &.{cipher_suite},
+        .extensions = cw.buffered(),
+    }, error.UnsupportedCertificateType);
+
+    // The extensions a good hello carries, so the two below differ from a
+    // workable one by exactly the thing being refused.
     var ext: [512]u8 = undefined;
     var ew = std.Io.Writer.fixed(&ext);
+    try handshake.writeSupportedVersions(&ew);
     try handshake.writeKeyShare(&ew, kp.public_key);
+    try handshake.writeExtension(&ew, @backingInt(ExtensionType.server_certificate_type), &certificate_types);
+
+    // Middlebox compatibility mode, which is what a non-empty session id means
+    // and which has no use over QUIC.
+    // Source: RFC 9001 s8.4.
+    try refuses(&dcid, &server_scid, .{
+        .random = hex(testdata.fixed_hello_random),
+        .session_id = &@as([32]u8, @splat(0)),
+        .cipher_suites = &.{cipher_suite},
+        .extensions = ew.buffered(),
+    }, error.ProtocolViolation);
+
+    // Only a version the client offered may be selected, and a hello with no
+    // supported_versions has offered 1.2 at best.
+    // Source: RFC 8446 s4.2.1.
+    var old: [max_client_hello]u8 = undefined;
+    var ow = std.Io.Writer.fixed(&old);
+    try handshake.writeKeyShare(&ow, kp.public_key);
+    try handshake.writeExtension(&ow, @backingInt(ExtensionType.server_certificate_type), &certificate_types);
+    try refuses(&dcid, &server_scid, .{
+        .random = hex(testdata.fixed_hello_random),
+        .cipher_suites = &.{cipher_suite},
+        .extensions = ow.buffered(),
+    }, error.UnsupportedVersion);
+}
+
+test "a server's stream credit is the limit for the stream the client opened" {
+    const dcid = hex(testdata.other_dcid);
+    const server_scid = hex("aabbccdd");
+    const kp = try std.crypto.dh.X25519.KeyPair.generateDeterministic(hex(testdata.fixed_x25519_secret));
+
+    // Asymmetric on purpose: `bidi_remote` is the limit on a stream the server
+    // opens, and there is never one.
+    // Source: RFC 9000 s18.2.
+    var params: [max_transport_params]u8 = undefined;
+    var pw = std.Io.Writer.fixed(&params);
+    try handshake.writeIntTransportParam(&pw, .initial_max_data, 8192);
+    try handshake.writeIntTransportParam(&pw, .initial_max_stream_data_bidi_local, 4096);
+    try handshake.writeIntTransportParam(&pw, .initial_max_stream_data_bidi_remote, 0);
+    try handshake.writeTransportParam(&pw, .initial_source_connection_id, &dcid);
+
+    var buf: [max_client_hello]u8 = undefined;
+    const raw = try testHello(&buf, .{ .key = kp.public_key, .params = pw.buffered() });
+
+    var bufs: TestBufs = .{};
+    var h = serverConnection(&dcid, &server_scid, &bufs);
+    try tellsHello(&h, &dcid, raw);
+    try testing.expectEqual(@as(u64, 4096), h.send_stream.limit);
+    try testing.expectEqual(@as(u64, 8192), h.send_data.limit);
+}
+
+test "the streams a hello allows are the ones the peer opens" {
+    // radish handles one stream and the client is always the end that opens it,
+    // so a server allows one and a client none.
+    // Source: RFC 9000 s18.2.
+    const scid = hex(testdata.other_dcid);
+
+    var server: [max_client_extensions]u8 = undefined;
+    var sw = std.Io.Writer.fixed(&server);
+    try writeServerExtensions(&sw, "radicle/git/1", &scid, &scid, default_window);
+    try testing.expectEqual(@as(u64, 1), try streamsBidi(sw.buffered()));
+
+    var client: [max_client_extensions]u8 = undefined;
+    var cw = std.Io.Writer.fixed(&client);
+    try writeExtensions(&cw, .{
+        .dcid = &scid,
+        .scid = &scid,
+        .random = @splat(0),
+        .public_key = @splat(0),
+        .alpn = "radicle/git/1",
+    });
+    try testing.expectEqual(@as(u64, 0), try streamsBidi(cw.buffered()));
+}
+
+/// The initial_max_streams_bidi in an extension block's transport parameters.
+fn streamsBidi(extensions: []const u8) !u64 {
+    var it = handshake.ExtensionIterator.init(extensions);
+    while (try it.next()) |e| {
+        if (e.type != .quic_transport_parameters) continue;
+        var pit = handshake.TransportParamIterator.init(e.body);
+        while (try pit.next()) |p| {
+            if (p.id == .initial_max_streams_bidi) return Connection.varintParam(p.value);
+        }
+    }
+    return error.Malformed;
+}
+
+test "a server refuses a ClientHello it has nothing in common with" {
+    const dcid = hex(testdata.other_dcid);
+    const server_scid = hex("aabbccdd");
+    const kp = try std.crypto.dh.X25519.KeyPair.generateDeterministic(hex(testdata.fixed_x25519_secret));
+    var buf: [max_client_hello]u8 = undefined;
+    var params: [max_transport_params]u8 = undefined;
+
+    // A protocol we do not speak: echoing the client's first would agree to
+    // something nothing here can answer.
+    // Source: RFC 9001 s8.1.
+    try refusesHello(&dcid, &server_scid, try testHello(&buf, .{
+        .key = kp.public_key,
+        .alpn = "h3",
+        .params = try testParams(&params, &dcid),
+    }), error.NoApplicationProtocol);
+
+    // Nothing said about what the client will present, so what it presents is
+    // an X.509 chain by default and there is nothing to authenticate it by.
+    // Source: RFC 7250 s4.1.
+    try refusesHello(&dcid, &server_scid, try testHello(&buf, .{
+        .key = kp.public_key,
+        .client_certificate_type = false,
+        .params = try testParams(&params, &dcid),
+    }), error.UnsupportedCertificateType);
+
+    // The id on the packets, unclaimed in the parameters: nothing else ties the
+    // cleartext headers to the handshake.
+    // Source: RFC 9000 s7.3.
+    try refusesHello(&dcid, &server_scid, try testHello(&buf, .{
+        .key = kp.public_key,
+        .params = try testParams(&params, null),
+    }), error.TransportParameterError);
+
+    // A server's parameter, and one a client must not send even when its value
+    // is the id it did choose.
+    // Source: RFC 9000 s18.2.
+    var pw = std.Io.Writer.fixed(&params);
+    try handshake.writeTransportParam(&pw, .initial_source_connection_id, &dcid);
+    try handshake.writeTransportParam(&pw, .original_destination_connection_id, &dcid);
+    try refusesHello(&dcid, &server_scid, try testHello(&buf, .{
+        .key = kp.public_key,
+        .params = pw.buffered(),
+    }), error.TransportParameterError);
+
+    // One extension twice, naming a protocol we speak and one we do not. Which
+    // one wins would be whichever copy was read last, so neither does.
+    // Source: RFC 8446 s4.2.
+    var ext: [max_client_extensions]u8 = undefined;
+    var ew = std.Io.Writer.fixed(&ext);
+    try handshake.writeSupportedVersions(&ew);
+    try handshake.writeKeyShare(&ew, kp.public_key);
+    try writeAlpn(&ew, "radicle/git/1");
+    try writeAlpn(&ew, "h3");
+    try refuses(&dcid, &server_scid, .{
+        .random = hex(testdata.fixed_hello_random),
+        .cipher_suites = &.{cipher_suite},
+        .extensions = ew.buffered(),
+    }, error.ProtocolViolation);
+}
+
+test "a cipher suite list that is not whole suites is refused" {
+    // A trailing byte means the length prefix and the list disagree, so the
+    // pairs read out of it are not the ones the client wrote.
+    // Source: RFC 8446 s4.1.2.
+    try testing.expectError(
+        error.Malformed,
+        Connection.offers(&.{ 0x13, 0x01, 0x13 }, cipher_suite),
+    );
+    try testing.expect(try Connection.offers(&.{ 0x13, 0x01 }, cipher_suite));
+    try testing.expect(!try Connection.offers(&.{}, cipher_suite));
+}
+
+test "a server refuses a HANDSHAKE_DONE, which is its own to send" {
+    // Source: RFC 9000 s19.20.
+    const dcid = hex(testdata.other_dcid);
+    const server_scid = hex("aabbccdd");
+    var bufs: TestBufs = .{};
+    var h = serverConnection(&dcid, &server_scid, &bufs);
+
+    const done = [_]u8{@backingInt(frame.Type.handshake_done)};
+    try testing.expectError(error.ProtocolViolation, h.appFrames(&done));
+    try testing.expect(!h.confirmed);
+}
+
+/// A ClientHello carrying what a server needs, so a test can leave out or
+/// change exactly one part of it.
+const TestHello = struct {
+    key: tls.PublicKey,
+    alpn: []const u8 = "radicle/git/1",
+    /// What the client offers to present, which a server needs to ask it for a
+    /// raw public key.
+    client_certificate_type: bool = true,
+    params: []const u8,
+};
+
+fn testHello(buf: []u8, h: TestHello) ![]const u8 {
+    var ext: [max_client_extensions]u8 = undefined;
+    var ew = std.Io.Writer.fixed(&ext);
+    try handshake.writeSupportedVersions(&ew);
+    try handshake.writeKeyShare(&ew, h.key);
+    if (h.client_certificate_type) {
+        try handshake.writeExtension(
+            &ew,
+            @backingInt(ExtensionType.client_certificate_type),
+            &certificate_types,
+        );
+    }
     try handshake.writeExtension(
         &ew,
         @backingInt(ExtensionType.server_certificate_type),
-        &.{ 1, 0 },
+        &certificate_types,
     );
-
-    var chain_hello: [max_client_hello]u8 = undefined;
-    const ch = try handshake.writeClientHello(&chain_hello, .{
+    try writeAlpn(&ew, h.alpn);
+    try handshake.writeExtension(
+        &ew,
+        @backingInt(ExtensionType.quic_transport_parameters),
+        h.params,
+    );
+    return handshake.writeClientHello(buf, .{
         .random = hex(testdata.fixed_hello_random),
         .cipher_suites = &.{cipher_suite},
         .extensions = ew.buffered(),
     });
+}
 
-    var bad_bufs: TestBufs = .{};
-    var bad = serverConnection(&dcid, &bad_bufs);
-    var bad_it = handshake.MessageIterator.init(ch);
-    try testing.expectError(error.UnsupportedCertificateType, bad.message(bad_it.next().?));
+/// The transport parameters a client owes, or all but the one it left out.
+fn testParams(buf: []u8, scid: ?[]const u8) ![]const u8 {
+    var pw = std.Io.Writer.fixed(buf);
+    try handshake.writeIntTransportParam(&pw, .initial_max_data, default_window);
+    try handshake.writeIntTransportParam(&pw, .initial_max_stream_data_bidi_local, default_window);
+    if (scid) |id| try handshake.writeTransportParam(&pw, .initial_source_connection_id, id);
+    return pw.buffered();
+}
+
+test "a server sends no more than three times what has arrived" {
+    const dcid = hex(testdata.other_dcid);
+    const server_scid = hex("aabbccdd");
+    const kp = try std.crypto.dh.X25519.KeyPair.generateDeterministic(hex(testdata.fixed_x25519_secret));
+    const server_key = try Ed25519.KeyPair.generateDeterministic(hex(testdata.fixed_peer_identity_seed));
+
+    var out: [max_initial_datagram]u8 = undefined;
+    var hello_buf: [max_client_hello]u8 = undefined;
+    const initial = try initialDatagram(&out, &hello_buf, .{
+        .dcid = &dcid,
+        .scid = &dcid,
+        .random = hex(testdata.fixed_hello_random),
+        .public_key = kp.public_key,
+        .alpn = "radicle/git/1",
+    });
+
+    var scratch: [max_initial_datagram]u8 = undefined;
+    var bufs: TestBufs = .{};
+    var server = serverConnection(&dcid, &server_scid, &bufs);
+    // Opened in place, so each arrival gets its own copy and `out` stays as it
+    // went out.
+    var wire: [max_initial_datagram]u8 = undefined;
+    @memcpy(wire[0..initial.len], out[0..initial.len]);
+    try server.push(&scratch, wire[0..initial.len]);
+
+    var reply: [max_initial_datagram]u8 = undefined;
+    var server_hello: [max_server_hello]u8 = undefined;
+    _ = try server.sealServerHello(&reply, &server_hello, hex(testdata.fixed_server_hello_random));
+    var messages: [max_flight]u8 = undefined;
+    const flight = try server.writeFlight(&messages, server_key);
+
+    // Probing the flight over and over, which is what a peer that answers
+    // nothing would have a server do, runs out of budget rather than
+    // amplifying a spoofed address.
+    // Source: RFC 9000 s8.1.
+    while (true) {
+        _ = server.sealFlight(&reply, flight) catch |e| {
+            try testing.expectEqual(error.AmplificationLimited, e);
+            break;
+        };
+    }
+    try testing.expect(!server.address_validated);
+    try testing.expect(server.sent_bytes <= 3 * server.received_bytes);
+
+    // What the peer sends raises what may go back, so nothing deadlocks.
+    try server.push(&scratch, out[0..initial.len]);
+    _ = try server.sealFlight(&reply, flight);
+}
+
+/// Feeds one ClientHello to a fresh server and expects it to be turned down.
+fn refuses(
+    dcid: []const u8,
+    scid: []const u8,
+    ch: handshake.ClientHello,
+    want: anyerror,
+) !void {
+    var buf: [max_client_hello]u8 = undefined;
+    try refusesHello(dcid, scid, try handshake.writeClientHello(&buf, ch), want);
+}
+
+/// The same, for a hello a test has built itself.
+fn refusesHello(dcid: []const u8, scid: []const u8, raw: []const u8, want: anyerror) !void {
+    var bufs: TestBufs = .{};
+    var h = serverConnection(dcid, scid, &bufs);
+    try testing.expectError(want, tellsHello(&h, dcid, raw));
+}
+
+test "a client and our own server walk the handshake to 1-RTT" {
+    const dcid = hex(testdata.other_dcid);
+    const server_scid = hex("aabbccdd");
+    const secret = hex(testdata.fixed_x25519_secret);
+    const kp = try std.crypto.dh.X25519.KeyPair.generateDeterministic(secret);
+    const client_key = try Ed25519.KeyPair.generateDeterministic(hex(testdata.fixed_identity_seed));
+    const server_key = try Ed25519.KeyPair.generateDeterministic(hex(testdata.fixed_peer_identity_seed));
+    const window = 4096;
+
+    var out: [max_initial_datagram]u8 = undefined;
+    var hello_buf: [max_client_hello]u8 = undefined;
+    const initial = try initialDatagram(&out, &hello_buf, .{
+        .dcid = &dcid,
+        .scid = &dcid,
+        .random = hex(testdata.fixed_hello_random),
+        .public_key = kp.public_key,
+        .alpn = "radicle/git/1",
+        .window = window,
+    });
+
+    var scratch: [max_initial_datagram]u8 = undefined;
+    var server_bufs: TestBufs = .{};
+    var server = serverConnection(&dcid, &server_scid, &server_bufs);
+    server.window = window;
+    // The datagram as it would arrive, so the server reads the ClientHello off
+    // the wire and the amplification budget sees what came in.
+    try server.push(&scratch, out[0..initial.len]);
+    try testing.expectEqual(@as(u64, initial.len), server.received_bytes);
+    try testing.expectEqual(@as(u64, 3 * initial.len), server.amplificationRoom());
+
+    var reply: [max_initial_datagram]u8 = undefined;
+    var server_hello: [max_server_hello]u8 = undefined;
+    const hello = try server.sealServerHello(
+        &reply,
+        &server_hello,
+        hex(testdata.fixed_server_hello_random),
+    );
+    // Numbered from 0, and expanded like any datagram carrying an Initial.
+    try testing.expectEqual(@as(u64, 1), server.next_initial_pn);
+    try testing.expect(hello.len >= min_initial_datagram);
+    // Kept for a retransmission, which is the only way it can go again.
+    try testing.expectEqual(
+        std.crypto.tls.HandshakeType.server_hello,
+        firstMessage(hello.hello).type,
+    );
+
+    var client_bufs: TestBufs = .{};
+    var client = Connection.init(.{
+        .original_dcid = &dcid,
+        .our_scid = &dcid,
+        .client_hello = initial.hello,
+        .secret = secret,
+        .initial_buf = &client_bufs.initial,
+        .handshake_buf = &client_bufs.handshake,
+        .window = window,
+    });
+
+    try client.push(&scratch, reply[0..hello.len]);
+
+    try testing.expectEqual(Connection.Phase.wait_encrypted_extensions, client.phase);
+    try testing.expectEqualSlices(
+        u8,
+        &server.accepted.handshake.?.server,
+        &client.accepted.handshake.?.server,
+    );
+    // Deriving is what leaves `.offered`, so there is no second one to build.
+    try testing.expectError(
+        error.HandshakeIncomplete,
+        server.sealServerHello(&reply, &server_hello, @splat(0)),
+    );
+
+    // The rest of the server's half, under the keys the ServerHello just made.
+    var messages: [max_flight]u8 = undefined;
+    const flight = try server.writeFlight(&messages, server_key);
+    const flight_len = try server.sealFlight(&reply, flight);
+    try client.push(&scratch, reply[0..flight_len]);
+
+    try testing.expect(client.done());
+    try testing.expect(client.accepted.peer_verified);
+    try testing.expectEqualSlices(u8, &server_key.public_key.toBytes(), &client.accepted.peer_key.?);
+    try testing.expectEqualStrings("radicle/git/1", client.accepted.alpn());
+    // The CertificateRequest landed, so the client knows to authenticate back.
+    try testing.expect(client.requested);
+    // Both connection ids echoed back and matched what is on the packets, and
+    // the limits arrived with them.
+    try testing.expect(client.saw_initial_scid and client.saw_original_dcid);
+    try testing.expectEqual(@as(u64, window), client.send_stream.limit);
+    try testing.expectEqual(idle_timeout_ms, client.peer_idle_ms);
+
+    // The client's own half closes the loop.
+    var client_messages: [max_flight]u8 = undefined;
+    const answer = try client.writeFlight(&client_messages, client_key);
+    var sealed: [max_initial_datagram]u8 = undefined;
+    const answer_len = try client.sealFlight(&sealed, answer);
+    try server.push(&scratch, sealed[0..answer_len]);
+
+    try testing.expect(server.done());
+    try testing.expect(server.accepted.peer_verified);
+    try testing.expectEqualSlices(u8, &client_key.public_key.toBytes(), &server.accepted.peer_key.?);
+    // A Handshake packet only opens for a peer that read our Initial, so the
+    // address is proved and the budget stops applying.
+    // Source: RFC 9000 s8.1.
+    try testing.expect(server.address_validated);
+    try testing.expectEqual(std.math.maxInt(u64), server.amplificationRoom());
+
+    // The server's handshake is confirmed the moment it completes; the client's
+    // waits on being told. Owed once, and not again until one is lost.
+    // Source: RFC 9001 s4.1.2, RFC 9000 s13.3.
+    try testing.expect(server.confirmed);
+    try testing.expect(!client.confirmed);
+    const done_len = (try server.sealHandshakeDone(&sealed)).?;
+    try client.push(&scratch, sealed[0..done_len]);
+    try testing.expect(client.confirmed);
+    try testing.expectEqual(@as(?usize, null), try server.sealHandshakeDone(&sealed));
+
+    // Same transcript on both sides, so neither hashed anything the other did
+    // not, and the 1-RTT keys that come off it agree.
+    try testing.expectEqualSlices(u8, &server.transcript.hash(), &client.transcript.hash());
+    try testing.expectEqualSlices(
+        u8,
+        &server.accepted.application.?.client,
+        &client.accepted.application.?.client,
+    );
+    try testing.expectEqualSlices(
+        u8,
+        &server.accepted.application.?.server,
+        &client.accepted.application.?.server,
+    );
 }
 
 test "builds an Initial datagram we can open again" {
@@ -2030,7 +2925,7 @@ test "builds an Initial datagram we can open again" {
     // The CRYPTO frame in the sealed packet must be the ClientHello returned.
     var it = frame.Iterator.init(opened.payload);
     const sent = (try it.next()).?.crypto.data;
-    try testing.expectEqualSlices(u8, initial.client_hello, sent);
+    try testing.expectEqualSlices(u8, initial.hello, sent);
 
     const ch = try handshake.parseClientHello(sent);
 
@@ -2303,6 +3198,65 @@ test "acknowledges an Initial the server can open" {
 
     // The debt is settled, so a second call owes nothing.
     try testing.expectEqual(@as(?usize, null), try h.sealAck(&out, .initial));
+}
+
+test "only a client expands a datagram holding nothing but an Initial ACK" {
+    // A client owes the expansion on every datagram carrying an Initial; a
+    // server owes it on an ack-eliciting one, which an ACK is not, and would be
+    // spending its amplification budget on padding.
+    // Source: RFC 9000 s14.1.
+    const dcid = hex(testdata.other_dcid);
+    const server_scid = hex("aabbccdd");
+    const kp = try std.crypto.dh.X25519.KeyPair.generateDeterministic(hex(testdata.fixed_x25519_secret));
+
+    var hello: [max_initial_datagram]u8 = undefined;
+    var hello_buf: [max_client_hello]u8 = undefined;
+    const initial = try initialDatagram(&hello, &hello_buf, .{
+        .dcid = &dcid,
+        .scid = &dcid,
+        .random = hex(testdata.fixed_hello_random),
+        .public_key = kp.public_key,
+        .alpn = "radicle/git/1",
+    });
+
+    var scratch: [max_initial_datagram]u8 = undefined;
+    var bufs: TestBufs = .{};
+    var server = serverConnection(&dcid, &server_scid, &bufs);
+    try server.push(&scratch, hello[0..initial.len]);
+
+    var out: [max_initial_datagram]u8 = undefined;
+    const from_server = (try server.sealAck(&out, .initial)).?;
+    try testing.expect(from_server < min_initial_datagram);
+
+    // The client's, for the same ACK in the same space.
+    var client_bufs: TestBufs = .{};
+    var client = testConnection(&dcid, &client_bufs);
+    client.initial_received.record(0);
+    client.initial_received.elicited();
+    const from_client = (try client.sealAck(&out, .initial)).?;
+    try testing.expect(from_client >= min_initial_datagram);
+}
+
+test "an ACK carrying a PING counts its bytes once" {
+    const dcid = hex(testdata.other_dcid);
+    var bufs: TestBufs = .{};
+    var stream_buf: [4096]u8 = undefined;
+    var h = appConnection(&dcid, &bufs, &stream_buf);
+
+    // A round trip since the last one, so this ACK carries the PING that has
+    // the peer acknowledge it.
+    // Source: RFC 9000 s13.2.4.
+    h.now_ms = 10 * h.recovery.rtt.smoothed_ms;
+    h.app_received.record(0);
+    h.app_received.elicited();
+    h.app_received.record(1);
+    h.app_received.elicited();
+
+    var out: [max_initial_datagram]u8 = undefined;
+    const n = (try h.sealAck(&out, .application)).?;
+    // Remembered, so the PING went out with it.
+    try testing.expect(h.sent_ack != null);
+    try testing.expectEqual(@as(u64, n), h.sent_bytes);
 }
 
 test "a bulk transfer is acknowledged every second packet, not every packet" {

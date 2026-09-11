@@ -225,7 +225,9 @@ pub const Dialed = struct {
             .secret = testdata.hex(testdata.fixed_x25519_secret),
             .random = testdata.hex(testdata.fixed_hello_random),
             .dcid = &fixture_dcid,
-            .identity = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(7)),
+            .identity = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(
+                testdata.hex(testdata.fixed_identity_seed),
+            ),
             .timeout_ms = fixture_timeout_ms,
         }, idle_ms);
         return self;

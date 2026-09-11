@@ -30,10 +30,25 @@ pub const fixed_x25519_secret = "49af42ba7f7994852d713ef2784bcbcaa7911de26adc564
 /// Paired with `fixed_x25519_secret`, so the ClientHello never varies.
 pub const fixed_hello_random = "0303030303030303030303030303030303030303030303030303030303030303";
 
+/// The server's x25519 private key from the same exchange, whose public half is
+/// the key share in `rfc8448_server_hello_hex`. Distinct from the client's, so
+/// a test where both ends meet notices a derivation that took the wrong half.
+/// Source: RFC 8448 s3.
+pub const fixed_server_x25519_secret = "b1580eeadf6dd589b8ef4f2d5652578cc810e9980191ec8d058308cea216a21e";
+
+/// Ours, not the RFC's, like `fixed_hello_random`: only fixed so the
+/// ServerHello never varies.
+pub const fixed_server_hello_random = "0505050505050505050505050505050505050505050505050505050505050505";
+
 /// The ed25519 seed a probe authenticates with, fixed so the peer sees the same
 /// node id every run and can be told about it in advance. Published, so tests
-/// and probes only.
+/// and probes only. This is our end: whoever dials.
 pub const fixed_identity_seed = "0404040404040404040404040404040404040404040404040404040404040404";
+
+/// The ed25519 seed the other end authenticates with, in tests where both are
+/// ours. Distinct from `fixed_identity_seed`, so a key attributed to the wrong
+/// side is a test failure rather than a coincidence.
+pub const fixed_peer_identity_seed = "0606060606060606060606060606060606060606060606060606060606060606";
 
 /// The connection id a probe opens with. RFC 9000 s7.2 wants an unpredictable
 /// value, since it seeds the Initial keys; this is the opposite, so that a
