@@ -136,9 +136,10 @@ is the same ls-refs, packfile, index and verify as 1.x over a different session.
 A 12 MB packfile clones and verifies against a local node.
 
 The server side answers now: a ClientHello is checked and negotiated, and the
-ServerHello and the flight behind it go back, so both roles walk to 1-RTT and
-HANDSHAKE_DONE against each other in tests. Nothing listens yet, though: no
-accept loop, no connection id demux, no Retry, and no stateless reset.
+ServerHello and the flight behind it go back. An endpoint binds a port and
+accepts one connection, so a client and a server of ours handshake to
+HANDSHAKE_DONE over a socket. One at a time, though: finding a connection by
+id is not built, nor Retry, nor stateless reset.
 
 ## Build
 

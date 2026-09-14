@@ -14,6 +14,7 @@ const sigrefs = @import("../identity/sigrefs.zig");
 const node_id = @import("../identity/node_id.zig");
 const signature = @import("../crypto/signature.zig");
 const git = @import("git.zig");
+const odb = @import("odb.zig");
 
 const DOC_PATH = "embeds/radicle.json";
 const ID_REF = "refs/rad/id";
@@ -23,19 +24,12 @@ const MAX_DOC = 1 << 20;
 const MAX_SIGREFS = 1 << 22;
 const DID_KEY_PREFIX = "did:key:";
 
-// v2 pack index: magic, u32 version, then a 256-entry u32 fan-out table,
-// then the sorted oid table. (gitformat-pack)
-const IDX_MAGIC = "\xFFtOc";
-const IDX_FANOUT_OFF = 8;
-const IDX_OIDS_OFF = IDX_FANOUT_OFF + 256 * 4;
-
 pub const Error = error{
     IdRefMissing,
     DocMissing,
     PackMissing,
     SigrefsMissing,
     SigrefsMalformed,
-    BadPackIndex,
     MissingObject,
     UnsignedRef,
     MismatchedRef,
@@ -156,6 +150,8 @@ pub const Repository = struct {
     pack_reader: std.Io.File.Reader,
     idx_reader: std.Io.File.Reader,
     repo: gitpack.Repository,
+    /// Reads objects out of the same pack, which gitpack will not do for us.
+    odb: odb.Odb,
     pbuf: []u8,
     ibuf: []u8,
     allocator: std.mem.Allocator,
@@ -185,6 +181,11 @@ pub const Repository = struct {
         errdefer allocator.free(self.ibuf);
         self.pack_reader = self.pack_file.reader(io, self.pbuf);
         self.idx_reader = self.idx_file.reader(io, self.ibuf);
+        self.odb = .{
+            .format = .sha1,
+            .pack = &self.pack_reader,
+            .idx = &self.idx_reader,
+        };
 
         try self.repo.init(allocator, .sha1, &self.pack_reader, &self.idx_reader);
         return self;
@@ -563,41 +564,10 @@ pub const Repository = struct {
         return list.toOwnedSlice(gpa);
     }
 
-    /// Whether `oid` is present in the pack, by binary-searching the v2 index
-    /// (`\xFFtOc`, 256-entry fan-out, then sorted oids). Reading the index
-    /// directly avoids decoding any pack data; gitpack's own object database
-    /// is private, so it cannot answer this.
-    /// Source: gitformat-pack, "Version 2 pack-*.idx files".
+    /// Whether `oid` is in the pack, which the index answers without decoding
+    /// any pack data.
     pub fn hasObject(self: *Repository, oid: gitpack.Oid) !bool {
-        const r = &self.idx_reader;
-        try r.seekTo(0);
-        const magic = try r.interface.take(4);
-        if (!std.mem.eql(u8, magic, IDX_MAGIC)) return error.BadPackIndex;
-        if (try r.interface.takeInt(u32, .big) != 2) return error.BadPackIndex;
-
-        // fan_out[b] is the number of oids whose first byte is <= b, so the
-        // candidates for this oid sit in [fan_out[b-1], fan_out[b]).
-        const key = oid.slice()[0];
-        var lo: u32 = 0;
-        if (key > 0) {
-            try r.seekTo(IDX_FANOUT_OFF + (@as(u64, key) - 1) * 4);
-            lo = try r.interface.takeInt(u32, .big);
-        }
-        try r.seekTo(IDX_FANOUT_OFF + @as(u64, key) * 4);
-        var hi = try r.interface.takeInt(u32, .big);
-
-        const oid_len = oid.slice().len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            try r.seekTo(IDX_OIDS_OFF + @as(u64, mid) * oid_len);
-            const candidate = try r.interface.take(oid_len);
-            switch (std.mem.order(u8, candidate, oid.slice())) {
-                .lt => lo = mid + 1,
-                .gt => hi = mid,
-                .eq => return true,
-            }
-        }
-        return false;
+        return (try self.odb.offsetOf(oid)) != null;
     }
 
     /// Checks `commit` out to a temp dir and returns the bytes of `path`

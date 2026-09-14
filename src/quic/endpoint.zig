@@ -20,6 +20,9 @@ pub const Error = error{
     DatagramTooLarge,
     SendStalled,
     HandshakeUnconfirmed,
+    /// A server's first datagram was something other than a client opening a
+    /// connection.
+    NotInitial,
 } || connection.Error;
 
 /// Where the connection reads time. A test supplies its own so a timer can be
@@ -44,14 +47,82 @@ pub const Clock = union(enum) {
     }
 };
 
+/// The buffers one connection holds, owned by the caller so it picks the
+/// sizes. `stream` dominates and is the window we advertise, which a server
+/// keeping many connections sets far below what a fetch wants.
+pub const Buffers = struct {
+    /// The peer's CRYPTO stream in each space. A ServerHello is small; a
+    /// handshake flight carries a certificate.
+    initial_crypto: []u8,
+    handshake_crypto: []u8,
+    /// What the peer may send us, and so the window we advertise.
+    stream: []u8,
+    /// What we have outstanding until it is acknowledged.
+    send: []u8,
+    /// Our hello and our flight, kept for retransmitting them.
+    hello: []u8,
+    messages: []u8,
+    /// A datagram as it arrived, the copy decryption works on, and where the
+    /// plaintext lands.
+    datagram: []u8,
+    work: []u8,
+    plain: []u8,
+};
+
+const send_len = stream.Sender.max_chunks * connection.max_stream_chunk;
+
+/// Inline storage for one connection, sized by the window it offers.
+pub fn Storage(comptime window: usize) type {
+    return struct {
+        initial_crypto: [4 * 1024]u8 = undefined,
+        handshake_crypto: [16 * 1024]u8 = undefined,
+        stream: [window]u8 = undefined,
+        send: [send_len]u8 = undefined,
+        hello: [connection.max_client_hello]u8 = undefined,
+        messages: [connection.max_flight]u8 = undefined,
+        datagram: [connection.max_receive_datagram]u8 = undefined,
+        work: [connection.max_receive_datagram]u8 = undefined,
+        plain: [connection.max_receive_datagram]u8 = undefined,
+
+        pub fn buffers(self: *@This()) Buffers {
+            return .{
+                .initial_crypto = &self.initial_crypto,
+                .handshake_crypto = &self.handshake_crypto,
+                .stream = &self.stream,
+                .send = &self.send,
+                .hello = &self.hello,
+                .messages = &self.messages,
+                .datagram = &self.datagram,
+                .work = &self.work,
+                .plain = &self.plain,
+            };
+        }
+    };
+}
+
+/// What a client fetching at full speed wants.
+pub const DefaultStorage = Storage(connection.default_window);
+
 pub const Options = struct {
+    /// Where to dial, or where to bind when serving.
     host: []const u8,
     port: u16,
-    alpn: []const u8,
+    /// The one protocol a client offers. A server names what it will take in
+    /// `alpns` instead.
+    alpn: []const u8 = "",
+    /// What a server accepts from a ClientHello's list, preferred first.
+    alpns: []const []const u8 = &.{},
+    /// Where the connection keeps everything, which sizes its window.
+    bufs: Buffers,
     /// The x25519 secret behind our key share.
     secret: tls.SecretKey,
+    /// The random in whichever hello we write.
     random: [32]u8,
-    dcid: []const u8,
+    /// The connection id a client opens with, which pins both ends' Initial
+    /// keys. A server takes that id off the packet and gives `scid` for
+    /// itself.
+    dcid: []const u8 = &.{},
+    scid: []const u8 = &.{},
     /// Signs our half of mutual authentication, and is the node id the peer
     /// sees us as.
     identity: Ed25519.KeyPair,
@@ -112,20 +183,8 @@ pub const Endpoint = struct {
     /// Counters for the connection, filled whether or not anyone reads them.
     profile: profile.Profile = .{},
 
-    /// The peer's CRYPTO stream in each space. A ServerHello is small; the
-    /// handshake flight carries a certificate, so it gets room to spare.
-    initial_crypto: [4 * 1024]u8 = undefined,
-    handshake_crypto: [16 * 1024]u8 = undefined,
-    stream_buf: [connection.default_window]u8 = undefined,
-    /// Everything the sender can have outstanding at once.
-    send_buf: [stream.Sender.max_chunks * connection.max_stream_chunk]u8 = undefined,
-    hello_buf: [connection.max_client_hello]u8 = undefined,
-    messages: [connection.max_flight]u8 = undefined,
-    /// Received datagrams, and the copy decryption works on so `last` keeps the
-    /// bytes as they arrived.
-    datagram: [connection.max_receive_datagram]u8 = undefined,
-    work: [connection.max_receive_datagram]u8 = undefined,
-    plain: [connection.max_receive_datagram]u8 = undefined,
+    /// Where the connection holds everything, which the caller owns and sized.
+    bufs: Buffers,
 
     /// Binds a socket and sends the first flight. `self` must already be where
     /// it will live, and may hold anything: every field is set here, since a
@@ -134,6 +193,7 @@ pub const Endpoint = struct {
         self.* = .{
             .io = io,
             .opts = opts,
+            .bufs = opts.bufs,
             .sock = undefined,
             .addr = undefined,
             .conn = undefined,
@@ -141,14 +201,14 @@ pub const Endpoint = struct {
         const kp = try std.crypto.dh.X25519.KeyPair.generateDeterministic(opts.secret);
 
         var datagram: [connection.max_initial_datagram]u8 = undefined;
-        const initial = try connection.initialDatagram(&datagram, &self.hello_buf, .{
+        const initial = try connection.initialDatagram(&datagram, self.bufs.hello, .{
             .dcid = opts.dcid,
             .scid = opts.dcid,
             .random = opts.random,
             .public_key = kp.public_key,
             .alpn = opts.alpn,
             .server_name = opts.server_name,
-            .window = self.stream_buf.len,
+            .window = self.bufs.stream.len,
         });
 
         self.addr = try dial.resolve(io, opts.host, opts.port);
@@ -171,10 +231,11 @@ pub const Endpoint = struct {
             .our_scid = opts.dcid,
             .client_hello = initial.hello,
             .secret = opts.secret,
-            .initial_buf = &self.initial_crypto,
-            .handshake_buf = &self.handshake_crypto,
-            .stream_buf = &self.stream_buf,
-            .send_buf = &self.send_buf,
+            .initial_buf = self.bufs.initial_crypto,
+            .handshake_buf = self.bufs.handshake_crypto,
+            .stream_buf = self.bufs.stream,
+            .send_buf = self.bufs.send,
+            .window = self.bufs.stream.len,
         });
         // Both fields hold something from here on, whatever the send does.
         self.ready = true;
@@ -186,6 +247,99 @@ pub const Endpoint = struct {
         self.conn.recovery.onSent(.initial, 0, initial.len, self.now_ms);
 
         try self.sendDatagram(datagram[0..initial.len]);
+    }
+
+    /// Binds and answers one client, leaving `service` to drive the rest as it
+    /// does for a client. Whoever arrives first has the socket: serving more at
+    /// once needs a lookup by connection id, which is not built.
+    pub fn serve(self: *Endpoint, io: std.Io, opts: Options) !void {
+        try self.bind(io, opts);
+        try self.accept();
+    }
+
+    /// Takes the port, so a caller can be reachable before it accepts. Leaves
+    /// the connection undefined until `accept` builds one, which `ready` says.
+    pub fn bind(self: *Endpoint, io: std.Io, opts: Options) !void {
+        self.* = .{
+            .io = io,
+            .opts = opts,
+            .bufs = opts.bufs,
+            .sock = undefined,
+            .addr = undefined,
+            .conn = undefined,
+        };
+        var local = try std.Io.net.IpAddress.resolve(io, opts.host, opts.port);
+        self.sock = try local.bind(io, .{ .mode = .dgram });
+        self.sock_open = true;
+    }
+
+    pub fn boundPort(self: *const Endpoint) u16 {
+        return self.sock.address.getPort();
+    }
+
+    /// Waits for a client's Initial and answers it.
+    pub fn accept(self: *Endpoint) !void {
+        const io = self.io;
+        const opts = self.opts;
+        const got = try self.sock.receiveTimeout(io, self.bufs.datagram, .{ .duration = .{
+            .raw = .fromNanoseconds(@intCast(opts.timeout_ms * std.time.ns_per_ms)),
+            .clock = .awake,
+        } });
+        // Whoever wrote to us is who we answer. A later datagram from
+        // elsewhere is migration, which takes a challenge first.
+        // Source: RFC 9000 s9.
+        self.addr = got.from;
+        self.datagrams = 1;
+        self.received = got.data.len;
+        self.profile.datagrams_in += 1;
+        self.profile.bytes_in += got.data.len;
+
+        // The id the client addressed, which both ends' Initial keys come
+        // from. Source: RFC 9001 s5.2.
+        const hdr = try packet.parseLongHeader(got.data);
+        if (hdr.kind != .initial) return error.NotInitial;
+
+        self.now_ms = opts.clock.nowMs(io);
+        self.last_arrival_ms = self.now_ms;
+        self.last_stream_ms = self.now_ms;
+        self.opened_ms = self.now_ms;
+        self.conn = connection.Connection.init(.{
+            .role = .server,
+            .original_dcid = hdr.dcid,
+            .our_scid = opts.scid,
+            // The transcript opens with the hello we are about to read.
+            .client_hello = "",
+            .alpns = opts.alpns,
+            .secret = opts.secret,
+            .initial_buf = self.bufs.initial_crypto,
+            .handshake_buf = self.bufs.handshake_crypto,
+            .stream_buf = self.bufs.stream,
+            .send_buf = self.bufs.send,
+            .window = self.bufs.stream.len,
+        });
+        self.ready = true;
+        self.conn.now_ms = self.now_ms;
+        self.conn.profile = &self.profile;
+
+        // Decrypted on the copy, so `last` keeps it as it arrived.
+        self.last = got.data;
+        if (got.data.len > self.bufs.work.len) return error.DatagramTooLarge;
+        @memcpy(self.bufs.work[0..got.data.len], got.data);
+        try self.conn.push(self.bufs.plain, self.bufs.work[0..got.data.len]);
+
+        var out: [connection.max_initial_datagram]u8 = undefined;
+        const hello = try self.conn.sealServerHello(&out, self.bufs.hello, opts.random);
+        self.hello = hello.hello;
+        self.sent = hello.len;
+        try self.sendDatagram(out[0..hello.len]);
+
+        // The rest of our half, under the keys the ServerHello just made.
+        // Written once: resending is `repair` sealing these bytes again.
+        self.flight = try self.conn.writeFlight(self.bufs.messages, opts.identity);
+        const n = try self.conn.sealFlight(&out, self.flight.?);
+        self.sent += n;
+        try self.sendDatagram(out[0..n]);
+        self.flight_out = true;
     }
 
     /// Says goodbye before dropping the socket, so the peer releases the state
@@ -201,7 +355,11 @@ pub const Endpoint = struct {
         // A peer that reset us holds nothing to release, and would answer a
         // goodbye with another reset.
         // Source: RFC 9000 s10.3.
-        if (self.conn.app_keys != null and self.conn.closed == null and !self.conn.stateless_reset) {
+        // `bind` leaves the connection undefined, so a socket can outlive a
+        // failed accept with nothing to say goodbye with.
+        if (self.ready and self.conn.app_keys != null and self.conn.closed == null and
+            !self.conn.stateless_reset)
+        {
             var out: [connection.max_initial_datagram]u8 = undefined;
             if (self.conn.sealClose(&out, "done") catch null) |n| {
                 self.sendDatagram(out[0..n]) catch {};
@@ -268,11 +426,11 @@ pub const Endpoint = struct {
         // The furthest byte the peer has sent, not what the reader has taken:
         // this is about the transfer moving, not about who is draining it.
         const before = self.conn.stream.highest;
-        if (arrived.len > self.work.len) {
+        if (arrived.len > self.bufs.work.len) {
             self.last_err = error.DatagramTooLarge;
         } else {
-            @memcpy(self.work[0..arrived.len], arrived);
-            if (self.conn.push(&self.plain, self.work[0..arrived.len])) {
+            @memcpy(self.bufs.work[0..arrived.len], arrived);
+            if (self.conn.push(self.bufs.plain, self.bufs.work[0..arrived.len])) {
                 // Only a datagram that opened counts as the peer still being
                 // there. Anything can be sent at us, and garbage that reset the
                 // idle timeout would hold the connection open forever.
@@ -308,6 +466,11 @@ pub const Endpoint = struct {
             if (try self.conn.sealMaxData(&out)) |n| {
                 self.sendDatagram(out[0..n]) catch {};
             }
+            // A server's to send, once its handshake completes and again if
+            // the frame is lost. Source: RFC 9001 s4.1.2.
+            if (try self.conn.sealHandshakeDone(&out)) |n| {
+                self.sendDatagram(out[0..n]) catch {};
+            }
         }
 
         // The peer's Finished checks out, so our own flight can go: it waits
@@ -315,7 +478,7 @@ pub const Endpoint = struct {
         // the transcript, so there is one attempt at it and no more, whatever
         // happens to the packet.
         if (self.conn.done() and !self.conn.flight_sent) send: {
-            self.flight = self.conn.writeFlight(&self.messages, self.opts.identity) catch |e| {
+            self.flight = self.conn.writeFlight(self.bufs.messages, self.opts.identity) catch |e| {
                 self.last_err = e;
                 break :send;
             };
@@ -346,7 +509,7 @@ pub const Endpoint = struct {
             const wait_ms = self.waitMs();
             if (wait_ms > 0) {
                 const asked = std.Io.Timestamp.now(self.io, .awake);
-                if (self.sock.receiveTimeout(self.io, &self.datagram, .{ .duration = .{
+                if (self.sock.receiveTimeout(self.io, self.bufs.datagram, .{ .duration = .{
                     .raw = .fromNanoseconds(@intCast(wait_ms * std.time.ns_per_ms)),
                     .clock = .awake,
                 } })) |got| {
@@ -613,6 +776,8 @@ const testdata = @import("testdata.zig");
 test "opening sets every field, whatever the memory held" {
     const c = try testing.allocator.create(Endpoint);
     defer testing.allocator.destroy(c);
+    const s = try testing.allocator.create(DefaultStorage);
+    defer testing.allocator.destroy(s);
     // What an allocator hands back is not zeroed, and field defaults do not run
     // for it, so `open` has to write everything itself.
     @memset(std.mem.asBytes(c), 0xaa);
@@ -623,6 +788,7 @@ test "opening sets every field, whatever the memory held" {
         // needs. `handshake` is what would wait for a reply.
         .port = 9,
         .alpn = "radicle/gossip/1",
+        .bufs = s.buffers(),
         .secret = testdata.hex(testdata.fixed_x25519_secret),
         .random = testdata.hex(testdata.fixed_hello_random),
         .dcid = &.{ 0xc0, 0xff, 0xee, 0x01 },
@@ -642,6 +808,8 @@ test "opening sets every field, whatever the memory held" {
 test "closing is safe however far opening got, and sends one goodbye at most" {
     const unopened = try testing.allocator.create(Endpoint);
     defer testing.allocator.destroy(unopened);
+    const s = try testing.allocator.create(DefaultStorage);
+    defer testing.allocator.destroy(s);
     @memset(std.mem.asBytes(unopened), 0xaa);
 
     // Rejected before the socket or the connection exist, so both still hold
@@ -650,6 +818,7 @@ test "closing is safe however far opening got, and sends one goodbye at most" {
         .host = "not a host",
         .port = 8776,
         .alpn = "radicle/gossip/1",
+        .bufs = s.buffers(),
         .secret = testdata.hex(testdata.fixed_x25519_secret),
         .random = testdata.hex(testdata.fixed_hello_random),
         .dcid = &.{ 0xc0, 0xff, 0xee, 0x03 },
@@ -661,12 +830,16 @@ test "closing is safe however far opening got, and sends one goodbye at most" {
 
     const c = try testing.allocator.create(Endpoint);
     defer testing.allocator.destroy(c);
+    // Its own, since two connections sharing buffers would tread on each other.
+    const cs = try testing.allocator.create(DefaultStorage);
+    defer testing.allocator.destroy(cs);
     @memset(std.mem.asBytes(c), 0xaa);
 
     try c.open(testing.io, .{
         .host = "127.0.0.1",
         .port = 9,
         .alpn = "radicle/gossip/1",
+        .bufs = cs.buffers(),
         .secret = testdata.hex(testdata.fixed_x25519_secret),
         .random = testdata.hex(testdata.fixed_hello_random),
         .dcid = &.{ 0xc0, 0xff, 0xee, 0x04 },
@@ -687,7 +860,7 @@ test "closing is safe however far opening got, and sends one goodbye at most" {
 /// A connection on a clock the test moves, with the state a finished handshake
 /// would have left: keys, confirmation, and nothing outstanding, since what the
 /// handshake sent stops being tracked once it completes.
-fn clocked(c: *Endpoint, dcid: []const u8, at: *const u64) !void {
+fn clocked(c: *Endpoint, s: *DefaultStorage, dcid: []const u8, at: *const u64) !void {
     @memset(std.mem.asBytes(c), 0xaa);
     try c.open(testing.io, .{
         .host = "127.0.0.1",
@@ -695,6 +868,7 @@ fn clocked(c: *Endpoint, dcid: []const u8, at: *const u64) !void {
         // the connection do about it.
         .port = 9,
         .alpn = "radicle/git/1",
+        .bufs = s.buffers(),
         .secret = testdata.hex(testdata.fixed_x25519_secret),
         .random = testdata.hex(testdata.fixed_hello_random),
         .dcid = dcid,
@@ -712,9 +886,11 @@ test "a quiet connection is held open by halves, then given up at the idle timeo
     const dcid = [_]u8{ 0xc0, 0xff, 0xee, 0x02 };
     const c = try testing.allocator.create(Endpoint);
     defer testing.allocator.destroy(c);
+    const s = try testing.allocator.create(DefaultStorage);
+    defer testing.allocator.destroy(s);
 
     var at: u64 = 1_000_000;
-    try clocked(c, &dcid, &at);
+    try clocked(c, s, &dcid, &at);
     defer c.close();
 
     const idle = c.conn.idleTimeoutMs();
@@ -744,9 +920,11 @@ test "a peer that stops answering is written off after a run of probes" {
     const dcid = [_]u8{ 0xc0, 0xff, 0xee, 0x05 };
     const c = try testing.allocator.create(Endpoint);
     defer testing.allocator.destroy(c);
+    const s = try testing.allocator.create(DefaultStorage);
+    defer testing.allocator.destroy(s);
 
     var at: u64 = 1_000_000;
-    try clocked(c, &dcid, &at);
+    try clocked(c, s, &dcid, &at);
     defer c.close();
 
     // One ack-eliciting packet outstanding, which is what a probe is about.
@@ -766,4 +944,82 @@ test "a peer that stops answering is written off after a run of probes" {
     try testing.expectEqual(c.opts.max_retries, probes);
     try testing.expect(!c.stalled());
     try testing.expect(at - 1_000_000 < c.conn.idleTimeoutMs());
+}
+
+/// A server slot, which offers far less than a client fetching a packfile.
+const ServerStorage = Storage(64 * 1024);
+
+/// Services one side until nothing is waiting for it.
+fn drain(e: *Endpoint) !void {
+    while (try e.service() == .arrived) {}
+}
+
+test "a client and our own server handshake over a socket" {
+    const io = testing.io;
+    const client = try testing.allocator.create(Endpoint);
+    defer testing.allocator.destroy(client);
+    const server = try testing.allocator.create(Endpoint);
+    defer testing.allocator.destroy(server);
+    const client_bufs = try testing.allocator.create(DefaultStorage);
+    defer testing.allocator.destroy(client_bufs);
+    const server_bufs = try testing.allocator.create(ServerStorage);
+    defer testing.allocator.destroy(server_bufs);
+
+    const client_key = try Ed25519.KeyPair.generateDeterministic(
+        testdata.hex(testdata.fixed_identity_seed),
+    );
+    const server_key = try Ed25519.KeyPair.generateDeterministic(
+        testdata.hex(testdata.fixed_peer_identity_seed),
+    );
+
+    // Bound before anything dials it, so the port is known and the client's
+    // Initial is waiting by the time `accept` looks.
+    try server.bind(io, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .alpns = &.{ "radicle/gossip/1", "radicle/git/1" },
+        .bufs = server_bufs.buffers(),
+        .secret = testdata.hex(testdata.fixed_server_x25519_secret),
+        .random = testdata.hex(testdata.fixed_server_hello_random),
+        .scid = &.{ 0xaa, 0xbb, 0xcc, 0xdd, 0x00, 0x00, 0x00, 0x01 },
+        .identity = server_key,
+        .timeout_ms = 100,
+    });
+    defer server.close();
+
+    try client.open(io, .{
+        .host = "127.0.0.1",
+        .port = server.boundPort(),
+        .alpn = "radicle/git/1",
+        .bufs = client_bufs.buffers(),
+        .secret = testdata.hex(testdata.fixed_x25519_secret),
+        .random = testdata.hex(testdata.fixed_hello_random),
+        .dcid = &.{ 0xc0, 0xff, 0xee, 0x06, 0x00, 0x00, 0x00, 0x01 },
+        .identity = client_key,
+        .timeout_ms = 100,
+    });
+    defer client.close();
+
+    try server.accept();
+    // One turn each until both are finished: the client reads the server's
+    // half and answers, the server confirms and says so.
+    try drain(client);
+    try drain(server);
+    try drain(client);
+
+    try testing.expect(client.conn.confirmed);
+    try testing.expect(server.conn.confirmed);
+    try testing.expectEqualSlices(
+        u8,
+        &server_key.public_key.toBytes(),
+        &client.conn.accepted.peer_key.?,
+    );
+    try testing.expectEqualSlices(
+        u8,
+        &client_key.public_key.toBytes(),
+        &server.conn.accepted.peer_key.?,
+    );
+    try testing.expectEqualStrings("radicle/git/1", client.conn.accepted.alpn());
+    // The window is the server's buffer, not the default a client offers.
+    try testing.expectEqual(@as(u64, server_bufs.stream.len), client.conn.send_stream.limit);
 }

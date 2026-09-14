@@ -79,8 +79,8 @@ pub const FakePeer = struct {
         c.conn.peer_reset_token = reset_token;
         c.conn.peer_idle_ms = idle_ms;
         // What our transport parameters would have opened.
-        c.conn.send_data.extend(c.stream_buf.len);
-        c.conn.send_stream.extend(c.stream_buf.len);
+        c.conn.send_data.extend(c.bufs.stream.len);
+        c.conn.send_stream.extend(c.bufs.stream.len);
     }
 
     /// Opens a connection pointed at us, faked through to confirmation.
@@ -208,6 +208,7 @@ const fixture_timeout_ms = 20;
 pub const Dialed = struct {
     peer: FakePeer,
     endpoint: *endpoint.Endpoint,
+    storage: *endpoint.DefaultStorage,
 
     /// `idle_ms` is the timeout the peer would have advertised.
     pub fn init(io: std.Io, idle_ms: u64) !*Dialed {
@@ -216,12 +217,14 @@ pub const Dialed = struct {
         self.* = .{
             .peer = try FakePeer.bind(io, &fixture_dcid),
             .endpoint = try std.testing.allocator.create(endpoint.Endpoint),
+            .storage = try std.testing.allocator.create(endpoint.DefaultStorage),
         };
         try self.peer.dial(self.endpoint, .{
             // Host and port come from `dial`.
             .host = "",
             .port = 0,
             .alpn = "radicle/gossip/1",
+            .bufs = self.storage.buffers(),
             .secret = testdata.hex(testdata.fixed_x25519_secret),
             .random = testdata.hex(testdata.fixed_hello_random),
             .dcid = &fixture_dcid,
@@ -237,6 +240,7 @@ pub const Dialed = struct {
         self.endpoint.close();
         self.peer.deinit();
         std.testing.allocator.destroy(self.endpoint);
+        std.testing.allocator.destroy(self.storage);
         std.testing.allocator.destroy(self);
     }
 };

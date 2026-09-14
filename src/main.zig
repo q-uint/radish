@@ -486,10 +486,13 @@ fn quicDial(init: std.process.Init, host: []const u8, port: u16) !radish.quic.en
     const dcid = try arena.alloc(u8, 8);
     try init.io.randomSecure(dcid);
 
+    // Allocated for the same reason, and large: a full receive window.
+    const bufs = try arena.create(radish.quic.endpoint.DefaultStorage);
     var opts: radish.quic.endpoint.Options = .{
         .host = host,
         .port = port,
         .alpn = radish.net.gossip.alpn_gossip,
+        .bufs = bufs.buffers(),
         .secret = undefined,
         .random = undefined,
         .dcid = dcid,
