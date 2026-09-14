@@ -3,6 +3,7 @@
 //! toolchain's own git implementation (see build.zig `gitpack`).
 pub const objects = @import("git.zig");
 pub const odb = @import("odb.zig");
+pub const walk = @import("walk.zig");
 pub const storage = @import("storage.zig");
 pub const pktline = @import("pktline.zig");
 pub const protocol = @import("protocol.zig");
@@ -10,9 +11,11 @@ pub const protocol = @import("protocol.zig");
 test {
     _ = objects;
     _ = odb;
+    _ = walk;
     _ = storage;
     _ = pktline;
     _ = protocol;
     _ = @import("storage_test.zig");
     _ = @import("odb_test.zig");
+    _ = @import("walk_test.zig");
 }

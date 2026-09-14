@@ -34,6 +34,83 @@ fn hex(comptime s: *const [128:0]u8) [64]u8 {
 /// A valid key that did not sign anything in these fixtures.
 const OTHER_NID = "z6MkkfM3tPXNPrPevKr3uSiQtHPuwnNhu2yUVjgd2jXVsVz5";
 
+/// Makes `name` look to `Storage` like a repository, with whichever halves of
+/// a pack `exts` names. The contents do not matter here, only that inventory
+/// counts what `Repository.open` would be able to open.
+fn fakeRepo(dir: std.Io.Dir, name: []const u8, exts: []const []const u8) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    try dir.createDirPath(testing.io, try std.fmt.bufPrint(&buf, "{s}/objects/pack", .{name}));
+    for (exts) |ext| {
+        const f = try dir.createFile(
+            testing.io,
+            try std.fmt.bufPrint(&buf, "{s}/objects/pack/pack-fixture.{s}", .{ name, ext }),
+            .{},
+        );
+        f.close(testing.io);
+    }
+}
+
+// An inventory announcement is a promise to serve what it names, so it must
+// count repositories we can actually read objects out of, not directories that
+// happen to sit in the storage root.
+test "inventory counts repositories we could serve, and nothing else" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+
+    const held = "z42hL2jL4XNk6K8oHQaSWfMgCL7ji";
+    try fakeRepo(tmp.dir, held, &.{ "pack", "idx" });
+    // Named for a RID, but with nothing to serve out of.
+    try fakeRepo(tmp.dir, "z4VSyUhaBGUJQrFdS7nWULf1dJdos", &.{});
+    // A pack with no index, which is what an interrupted clone leaves: the
+    // objects are there but nothing can find one.
+    try fakeRepo(tmp.dir, "z3gqcJUoA1n9HaHKufZs5FCSGazv5", &.{"pack"});
+    // Both halves, but its name is not a RID, so it is not ours to announce.
+    try fakeRepo(tmp.dir, "notarid", &.{ "pack", "idx" });
+
+    var store = try storage.Storage.open(testing.io, alloc, root);
+    defer store.deinit();
+
+    const ids = try store.inventory(alloc);
+    defer alloc.free(ids);
+    try testing.expectEqual(@as(usize, 1), ids.len);
+
+    const name = try ids[0].encodeBare(alloc);
+    defer alloc.free(name);
+    try testing.expectEqualStrings(held, name);
+}
+
+test "a repository opens by RID out of the storage root" {
+    var s = try fixture.scratch(alloc);
+    defer fixture.destroy(alloc, s);
+    const doc_bytes = "{\"payload\":{\"xyz.radicle.project\":{\"defaultBranch\":\"main\",\"description\":\"d\",\"name\":\"n\"}},\"delegates\":[\"did:key:" ++ REAL_SIGREFS_NID ++ "\"],\"threshold\":1}";
+    const id = try s.repo.commit("main", "embeds/radicle.json", doc_bytes);
+    try s.repo.radId(id);
+    const bare = try s.repo.finish();
+
+    // Storage names a repository by its RID, so move the fixture under one.
+    const want = try rid.RepoId.fromDoc(doc_bytes);
+    const name = try want.encodeBare(alloc);
+    defer alloc.free(name);
+    try moveInto(bare, name);
+
+    var store = try storage.Storage.open(testing.io, alloc, std.fs.path.dirname(bare).?);
+    defer store.deinit();
+
+    var repo = try store.repository(alloc, want);
+    defer repo.deinit();
+    try testing.expect(try repo.hasObject(try storage.parseOid(id)));
+}
+
+/// Renames the fixture's `bare` directory to `name` beside itself.
+fn moveInto(bare: []const u8, name: []const u8) !void {
+    const parent = std.fs.path.dirname(bare).?;
+    var dir = try std.Io.Dir.cwd().openDir(testing.io, parent, .{});
+    defer dir.close(testing.io);
+    try dir.rename(std.fs.path.basename(bare), dir, name, testing.io);
+}
+
 test "reads a namespace's sigrefs, and the namespaces on disk" {
     var s = try fixture.scratch(alloc);
     defer fixture.destroy(alloc, s);

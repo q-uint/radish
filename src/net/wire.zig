@@ -53,7 +53,7 @@ pub fn sendAnnouncement(
     const now_ms: u64 = @intCast(@divTrunc(std.Io.Clock.now(.real, io).nanoseconds, std.time.ns_per_ms));
     var msg_buf: std.ArrayList(u8) = .empty;
     defer msg_buf.deinit(allocator);
-    const signed = try announce.sign(allocator, .{
+    const signed = try announce.sign(allocator, announce.NodeAnnouncement{
         .timestamp = now_ms,
         .alias = alias,
     }, key, &msg_buf);

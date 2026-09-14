@@ -65,6 +65,31 @@ pub const Odb = struct {
         return self.readAt(gpa, at, 0);
     }
 
+    /// What `oid` is, without inflating a byte of it. A delta never changes
+    /// the type, so this follows the chain to a base, but only through entry
+    /// headers: a caller that will not walk a blob's content need not pay to
+    /// find out it is one.
+    pub fn typeOf(self: *Odb, oid: gitpack.Oid) !Type {
+        const at = (try self.offsetOf(oid)) orelse return error.ObjectMissing;
+        return self.typeAt(at, 0);
+    }
+
+    fn typeAt(self: *Odb, offset: u64, depth: usize) anyerror!Type {
+        if (depth > max_depth) return error.DeltaTooDeep;
+        try self.pack.seekTo(offset);
+        switch (try self.entry()) {
+            .base => |b| return b.type,
+            .ofs => |d| {
+                if (d.back > offset) return error.BadPack;
+                return self.typeAt(offset - d.back, depth + 1);
+            },
+            .ref => |d| {
+                const at = (try self.offsetOf(d.base)) orelse return error.ObjectMissing;
+                return self.typeAt(at, depth + 1);
+            },
+        }
+    }
+
     /// Where `oid`'s entry starts, or null when the pack does not hold it.
     pub fn offsetOf(self: *Odb, oid: gitpack.Oid) !?u64 {
         const n = try self.count();

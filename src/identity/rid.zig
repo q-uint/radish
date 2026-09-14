@@ -56,13 +56,25 @@ pub const RepoId = struct {
 
     /// Renders the RID as `rad:z...`. Caller owns the result.
     pub fn encode(self: RepoId, allocator: std.mem.Allocator) base58.Error![]u8 {
+        const bare = try self.encodeBare(allocator);
+        defer allocator.free(bare);
+
+        var out = try allocator.alloc(u8, RAD_PREFIX.len + bare.len);
+        @memcpy(out[0..RAD_PREFIX.len], RAD_PREFIX);
+        @memcpy(out[RAD_PREFIX.len..], bare);
+        return out;
+    }
+
+    /// Renders the RID without the `rad:` prefix, which is how storage names a
+    /// repository's directory. Caller owns the result.
+    /// Source: RIP-0003 Layout (`<storage>/<rid>`); rad 1.9.1 storage on disk.
+    pub fn encodeBare(self: RepoId, allocator: std.mem.Allocator) base58.Error![]u8 {
         const b58 = try base58.encode(allocator, &self.oid);
         defer allocator.free(b58);
 
-        var out = try allocator.alloc(u8, RAD_PREFIX.len + 1 + b58.len);
-        @memcpy(out[0..RAD_PREFIX.len], RAD_PREFIX);
-        out[RAD_PREFIX.len] = MULTIBASE_BTC;
-        @memcpy(out[RAD_PREFIX.len + 1 ..], b58);
+        var out = try allocator.alloc(u8, 1 + b58.len);
+        out[0] = MULTIBASE_BTC;
+        @memcpy(out[1..], b58);
         return out;
     }
 };
@@ -81,6 +93,13 @@ test "round trip" {
 
     const back = try RepoId.parse(s);
     try testing.expectEqualSlices(u8, &oid, &back.oid);
+}
+
+test "the bare form is what a storage directory is named" {
+    const id = try RepoId.parse("rad:z42hL2jL4XNk6K8oHQaSWfMgCL7ji");
+    const bare = try id.encodeBare(testing.allocator);
+    defer testing.allocator.free(bare);
+    try testing.expectEqualStrings("z42hL2jL4XNk6K8oHQaSWfMgCL7ji", bare);
 }
 
 test "heartwood vector re-encodes to itself, with or without the rad prefix" {

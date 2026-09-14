@@ -50,6 +50,25 @@ pub const Repo = struct {
         return oid;
     }
 
+    /// Merges `other` into `branch` and returns the merge commit's oid (owned
+    /// by the Repo). `--no-ff` so it has two parents even when the merge would
+    /// fast-forward, which is the case a walk has to get right.
+    pub fn merge(self: *Repo, branch: []const u8, other: []const u8) ![]const u8 {
+        const out = try run(self.alloc, try std.fmt.allocPrint(self.alloc,
+            \\set -e
+            \\cd {s}/src
+            \\git checkout -q {s}
+            \\git merge -q --no-ff -m merge {s}
+            \\git rev-parse HEAD
+        , .{ self.root, branch, other }));
+        defer self.alloc.free(out);
+
+        const oid = try self.alloc.dupe(u8, std.mem.trim(u8, out, " \t\r\n"));
+        errdefer self.alloc.free(oid);
+        try self.packed_oids.append(self.alloc, oid);
+        return oid;
+    }
+
     /// Writes a sigrefs commit for `nid`: a tree of {refs, signature} where
     /// `message` is the canonical ref lines and `sig` signs exactly those
     /// bytes. The sigrefs commit is always packed (otherwise it could not be

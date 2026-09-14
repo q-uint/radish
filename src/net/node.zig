@@ -2,15 +2,69 @@
 //!
 //! `wire.zig` dials out; this accepts. A session greets the way heartwood's
 //! `initial()` does (node announcement, inventory announcement, subscribe),
-//! then answers what arrives. It does not yet store gossip, route, or serve
-//! fetches, so a Subscribe gets the greeting and nothing to replay.
+//! then answers what arrives. It does not yet store gossip or route, so a
+//! Subscribe gets the greeting and nothing to replay.
 //! Source: radicle-protocol service.rs initial / handle Ping.
 
 const std = @import("std");
 const noise = @import("../crypto/noise.zig");
 const signature = @import("../crypto/signature.zig");
+const storage = @import("../git/storage.zig");
 const protocol = @import("protocol.zig");
 const announce = @import("announce.zig");
+
+/// What a node needs to answer a peer.
+pub const Config = struct {
+    /// The node's secret seed; its public half is the node id peers know us by.
+    seed: [32]u8,
+    alias: []const u8,
+    /// Where our repositories live, to serve objects out of.
+    store: ?*storage.Storage = null,
+    /// The signed inventory frame to greet with, from `inventoryFrame`. Empty
+    /// announces nothing, which is what a node holding nothing should say.
+    inventory: []const u8 = &.{},
+    /// Frames one session will answer before it is dropped.
+    max_frames: usize = 1000,
+};
+
+/// How long a signed inventory is reused before it is rebuilt with a fresh
+/// timestamp. Well inside the day a peer waits before evicting us.
+/// Source: RIP-0001 Pruning.
+pub const INVENTORY_REFRESH_MS: u64 = 60 * 60 * 1000;
+
+/// A signed inventory announcement and how many repositories it names.
+pub const Inventory = struct {
+    /// The gossip frame, caller-owned.
+    frame: []u8,
+    count: usize,
+};
+
+/// Signs the inventory announcement a node greets peers with; caller owns the
+/// frame. An empty inventory signs to a frame like any other, since the
+/// message states a node's whole inventory and so retracts an earlier one.
+/// Rebuild on `INVENTORY_REFRESH_MS`, not per session.
+/// Source: RIP-0001 Inventory Announcements, Pruning.
+pub fn inventoryFrame(
+    allocator: std.mem.Allocator,
+    store: *storage.Storage,
+    seed: [32]u8,
+    now_ms: u64,
+) !Inventory {
+    const ids = try store.inventory(allocator);
+    defer allocator.free(ids);
+
+    const oids = try allocator.alloc([20]u8, ids.len);
+    defer allocator.free(oids);
+    for (ids, oids) |id, *oid| oid.* = id.oid;
+
+    var msg_buf: std.ArrayList(u8) = .empty;
+    defer msg_buf.deinit(allocator);
+    const signed = try announce.sign(allocator, announce.InventoryAnnouncement{
+        .inventory = oids,
+        .timestamp = now_ms,
+    }, try signature.SecretKey.fromSeed(seed), &msg_buf);
+    return .{ .frame = try signed.encodeFrame(allocator), .count = ids.len };
+}
 
 /// What a session did, for the caller to report. Counting rather than logging
 /// keeps this testable without capturing output.
@@ -28,18 +82,16 @@ pub fn serveOver(
     allocator: std.mem.Allocator,
     r: *std.Io.Reader,
     w: *std.Io.Writer,
-    key: signature.SecretKey,
-    alias: []const u8,
+    cfg: Config,
     now_ms: u64,
-    max_frames: usize,
 ) !SessionStats {
-    try greet(allocator, w, key, alias, now_ms);
+    try greet(allocator, w, cfg, now_ms);
 
     var stats: SessionStats = .{};
     var scratch: [protocol.MAX_FRAME_PAYLOAD]u8 = undefined;
     var oids: [protocol.INVENTORY_LIMIT][20]u8 = undefined;
 
-    while (stats.frames < max_frames) : (stats.frames += 1) {
+    while (stats.frames < cfg.max_frames) : (stats.frames += 1) {
         const msg = protocol.decodeFrameStreaming(r, &scratch, &oids) catch |e| switch (e) {
             error.EndOfStream => break,
             // A peer that sends us garbage is not worth staying connected to,
@@ -62,20 +114,27 @@ pub fn serveOver(
 }
 
 /// Binds `port` and serves inbound connections one at a time, until
-/// `max_sessions` have been handled. `key` is the node's identity.
+/// `max_sessions` have been handled. Owns the inventory frame that every
+/// greeting sends, rebuilding it when it goes stale rather than per session.
 pub fn listen(
     io: std.Io,
     allocator: std.mem.Allocator,
     port: u16,
-    seed: [32]u8,
-    alias: []const u8,
+    config: Config,
     max_sessions: usize,
     handler: anytype,
 ) !usize {
-    const key = try signature.SecretKey.fromSeed(seed);
     const addr = try std.Io.net.IpAddress.resolve(io, "0.0.0.0", port);
     var server = try addr.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
+
+    var cfg = config;
+    // Ours to free; `config.inventory` is the caller's and is only read.
+    var owned: ?[]u8 = null;
+    defer if (owned) |frame| allocator.free(frame);
+    // Silent until we hold something; after that, empty retracts.
+    var announced = cfg.inventory.len > 0;
+    var signed_at_ms: u64 = 0;
 
     var served: usize = 0;
     while (served < max_sessions) : (served += 1) {
@@ -85,7 +144,27 @@ pub fn listen(
         };
         defer stream.close(io);
 
-        const stats = accept(io, allocator, &stream, seed, key, alias) catch |e| {
+        if (cfg.store) |store| refresh: {
+            const now_ms: u64 = @intCast(@divTrunc(std.Io.Clock.now(.real, io).nanoseconds, std.time.ns_per_ms));
+            if (now_ms -| signed_at_ms < INVENTORY_REFRESH_MS) break :refresh;
+
+            // The frame we already hold is still true, so a failed rescan is
+            // not a reason to drop the peer we just accepted.
+            const inv = inventoryFrame(allocator, store, cfg.seed, now_ms) catch |e| {
+                handler.onRefreshFailed(e);
+                break :refresh;
+            };
+            // Advanced whatever came back, so an empty root is not rescanned
+            // on every connection.
+            signed_at_ms = now_ms;
+
+            if (owned) |frame| allocator.free(frame);
+            owned = inv.frame;
+            announced = announced or inv.count > 0;
+            cfg.inventory = if (announced) inv.frame else &.{};
+        }
+
+        const stats = accept(io, allocator, &stream, cfg) catch |e| {
             handler.onSessionFailed(e);
             continue;
         };
@@ -99,16 +178,15 @@ fn accept(
     io: std.Io,
     allocator: std.mem.Allocator,
     stream: *std.Io.net.Stream,
-    seed: [32]u8,
-    key: signature.SecretKey,
-    alias: []const u8,
+    cfg: Config,
 ) !SessionStats {
+    const key = try signature.SecretKey.fromSeed(cfg.seed);
     var eph_seed: [32]u8 = undefined;
     try io.randomSecure(&eph_seed);
     const ephemeral = try noise.KeyPair.generateDeterministic(eph_seed);
     // noise.KeyPair carries the seed as its secret, matching how the initiator
     // builds one; the node id is the Ed25519 public key over that seed.
-    const static: noise.KeyPair = .{ .secret_key = seed, .public_key = key.nodeId().key };
+    const static: noise.KeyPair = .{ .secret_key = cfg.seed, .public_key = key.nodeId().key };
     var res = noise.Responder.init(static, ephemeral);
 
     var wbuf: [4096]u8 = undefined;
@@ -135,29 +213,31 @@ fn accept(
     _ = res.split();
 
     const now_ms: u64 = @intCast(@divTrunc(std.Io.Clock.now(.real, io).nanoseconds, std.time.ns_per_ms));
-    return serveOver(allocator, r, w, key, alias, now_ms, 1000);
+    return serveOver(allocator, r, w, cfg, now_ms);
 }
 
 /// The three messages heartwood sends on every new connection.
 fn greet(
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
-    key: signature.SecretKey,
-    alias: []const u8,
+    cfg: Config,
     now_ms: u64,
 ) !void {
+    const key = try signature.SecretKey.fromSeed(cfg.seed);
+
     var msg_buf: std.ArrayList(u8) = .empty;
     defer msg_buf.deinit(allocator);
-    const signed = try announce.sign(allocator, .{
+    const signed = try announce.sign(allocator, announce.NodeAnnouncement{
         .timestamp = now_ms,
-        .alias = alias,
+        .alias = cfg.alias,
     }, key, &msg_buf);
     const ann = try signed.encodeFrame(allocator);
     defer allocator.free(ann);
     try w.writeAll(ann);
 
-    // No inventory announcement yet: we hold nothing to announce, and an empty
-    // one would claim we serve nothing rather than say nothing.
+    // The same bytes for every peer, so our inventory does not churn through
+    // the network under a new timestamp per connection.
+    if (cfg.inventory.len > 0) try w.writeAll(cfg.inventory);
 
     const sub = &protocol.subscribe_all_frame;
     try w.writeAll(sub);
@@ -177,9 +257,8 @@ fn pong(allocator: std.mem.Allocator, w: *std.Io.Writer, ponglen: u16) !void {
 
 const testing = std.testing;
 
-fn testKey() !signature.SecretKey {
-    const seed: [32]u8 = @splat(7);
-    return signature.SecretKey.fromSeed(seed);
+fn testConfig() Config {
+    return .{ .seed = @splat(7), .alias = "radish", .max_frames = 10 };
 }
 
 test "greets with a signed announcement and a subscribe" {
@@ -187,7 +266,7 @@ test "greets with a signed announcement and a subscribe" {
     var w = std.Io.Writer.fixed(&out);
     var r = std.Io.Reader.fixed(&.{});
 
-    const stats = try serveOver(testing.allocator, &r, &w, try testKey(), "radish", 1, 10);
+    const stats = try serveOver(testing.allocator, &r, &w, testConfig(), 1);
     try testing.expectEqual(@as(usize, 0), stats.frames);
 
     // Both frames are on the gossip stream and decode cleanly.
@@ -216,7 +295,7 @@ test "answers a ping with a matching pong, but ignores one asking for too many z
         defer testing.allocator.free(ping);
         var r = std.Io.Reader.fixed(ping);
 
-        const stats = try serveOver(testing.allocator, &r, &w, try testKey(), "radish", 1, 10);
+        const stats = try serveOver(testing.allocator, &r, &w, testConfig(), 1);
         try testing.expectEqual(@as(usize, 1), stats.pings);
 
         // Skip the greeting, then look for a reply behind it.
@@ -242,7 +321,86 @@ test "counts a peer's subscribe" {
     try input.appendSlice(testing.allocator, sub);
 
     var r = std.Io.Reader.fixed(input.items);
-    const stats = try serveOver(testing.allocator, &r, &w, try testKey(), "radish", 1, 10);
+    const stats = try serveOver(testing.allocator, &r, &w, testConfig(), 1);
     try testing.expectEqual(@as(usize, 1), stats.subscribes);
     try testing.expectEqual(@as(usize, 1), stats.frames);
+}
+
+/// A directory `Storage` will count: named for a RID, holding both halves of
+/// a pack.
+fn fakeRepo(dir: std.Io.Dir, name: []const u8) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    try dir.createDirPath(testing.io, try std.fmt.bufPrint(&buf, "{s}/objects/pack", .{name}));
+    for ([_][]const u8{ "pack", "idx" }) |ext| {
+        const path = try std.fmt.bufPrint(&buf, "{s}/objects/pack/pack-fixture.{s}", .{ name, ext });
+        (try dir.createFile(testing.io, path, .{})).close(testing.io);
+    }
+}
+
+// The greeting claims what we hold, and a peer can check the claim: the frame
+// verifies under our own key.
+test "the greeting carries a signed inventory of what storage holds" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
+
+    var store = try storage.Storage.open(testing.io, gpa, root);
+    defer store.deinit();
+
+    // An empty root still signs to a frame; `listen` is what decides that one
+    // naming nothing is silence rather than a retraction.
+    const empty = try inventoryFrame(gpa, &store, testConfig().seed, 1);
+    defer gpa.free(empty.frame);
+    try testing.expectEqual(@as(usize, 0), empty.count);
+
+    try fakeRepo(tmp.dir, "z42hL2jL4XNk6K8oHQaSWfMgCL7ji");
+    const inv = try inventoryFrame(gpa, &store, testConfig().seed, 1);
+    defer gpa.free(inv.frame);
+    try testing.expectEqual(@as(usize, 1), inv.count);
+
+    var cfg = testConfig();
+    cfg.store = &store;
+    cfg.inventory = inv.frame;
+
+    var out: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&out);
+    var r = std.Io.Reader.fixed(&.{});
+    _ = try serveOver(gpa, &r, &w, cfg, 1);
+
+    var sent = std.Io.Reader.fixed(w.buffered());
+    var scratch: [protocol.MAX_FRAME_PAYLOAD]u8 = undefined;
+    var oids: [8][20]u8 = undefined;
+    _ = try protocol.decodeFrameStreaming(&sent, &scratch, &oids); // node announcement
+    const second = try protocol.decodeFrameStreaming(&sent, &scratch, &oids);
+    try testing.expectEqual(@as(usize, 1), second.inventory_announced.inventory.len);
+    try testing.expect(second.inventory_announced.verified());
+}
+
+// Peers keep the newest announcement and relay it, so an unchanged inventory
+// must sign to the identical frame, or every connection puts a new message on
+// the network for no change. Moving the clock is the refresh that keeps us
+// from expiring out of their tables, and that must produce different bytes.
+test "an unchanged inventory re-signs identically until its timestamp moves" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
+
+    try fakeRepo(tmp.dir, "z42hL2jL4XNk6K8oHQaSWfMgCL7ji");
+
+    var store = try storage.Storage.open(testing.io, gpa, root);
+    defer store.deinit();
+
+    const a = (try inventoryFrame(gpa, &store, testConfig().seed, 1000)).frame;
+    defer gpa.free(a);
+    const b = (try inventoryFrame(gpa, &store, testConfig().seed, 1000)).frame;
+    defer gpa.free(b);
+    const later = (try inventoryFrame(gpa, &store, testConfig().seed, 2000)).frame;
+    defer gpa.free(later);
+
+    try testing.expectEqualSlices(u8, a, b);
+    try testing.expect(!std.mem.eql(u8, a, later));
 }

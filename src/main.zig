@@ -51,7 +51,9 @@ pub fn main(init: std.process.Init) !void {
             std.fmt.parseInt(usize, args[3], 10) catch return usage()
         else
             std.math.maxInt(usize);
-        return serve(init, port, sessions);
+        // Without a storage root we announce no inventory, which is the honest
+        // thing for a node with nothing to serve.
+        return serve(init, port, sessions, if (args.len >= 5) args[4] else null);
     }
 
     // Radicle 2.x, which shares nothing with the commands above but storage.
@@ -147,7 +149,8 @@ fn usage() void {
         \\  radish fetch-deps  <manifest> [dir]                     resolve `.rad` deps (default .rad-deps)
         \\    --from <host>:<port>:<node-id>                        fetch from this node instead of
         \\                                                          locating a seed over gossip
-        \\  radish serve       <port> [sessions]                    answer inbound connections
+        \\  radish serve       <port> [sessions] [storage]          answer inbound connections
+        \\                                                          <storage> is a root of <rid> repos to announce
         \\
         \\radicle 2.x, over QUIC:
         \\  radish quic ping   <host> <port>                        handshake, then a gossip ping/pong
@@ -471,6 +474,10 @@ const ServePrinter = struct {
     pub fn onSessionFailed(_: *ServePrinter, err: anyerror) void {
         std.debug.print("session failed: {s}\n", .{@errorName(err)});
     }
+
+    pub fn onRefreshFailed(_: *ServePrinter, err: anyerror) void {
+        std.debug.print("inventory refresh failed: {s}\n", .{@errorName(err)});
+    }
 };
 
 /// Connection settings for a live 2.x exchange: a fresh key share and
@@ -761,7 +768,7 @@ fn quicProbe(init: std.process.Init, host: []const u8, port: u16, alpn: []const 
 /// Answers inbound connections. The identity is generated per run, so peers
 /// cannot find this node again across restarts; a stored key is the next piece
 /// of work.
-fn serve(init: std.process.Init, port: u16, sessions: usize) !void {
+fn serve(init: std.process.Init, port: u16, sessions: usize, root: ?[]const u8) !void {
     const arena = init.arena.allocator();
 
     // randomSecure everywhere a key is derived: `random` degrades to a weaker
@@ -771,9 +778,25 @@ fn serve(init: std.process.Init, port: u16, sessions: usize) !void {
     const key = try radish.SecretKey.fromSeed(seed);
     const nid = try key.nodeId().encode(arena);
 
+    var store: ?radish.git.storage.Storage = null;
+    defer if (store) |*s| s.deinit();
+    if (root) |path| {
+        store = radish.git.storage.Storage.open(init.io, arena, path) catch |e| {
+            std.debug.print("cannot read storage at {s}: {s}\n", .{ path, @errorName(e) });
+            return e;
+        };
+        const ids = try store.?.inventory(arena);
+        std.debug.print("serving {d} repositories from {s}\n", .{ ids.len, path });
+    }
+
     var printer = ServePrinter{};
     std.debug.print("listening on 0.0.0.0:{d} as {s}\n", .{ port, nid });
-    const served = radish.net.node.listen(init.io, arena, port, seed, "radish", sessions, &printer) catch |e| {
+    const cfg: radish.net.node.Config = .{
+        .seed = seed,
+        .alias = "radish",
+        .store = if (store) |*s| s else null,
+    };
+    const served = radish.net.node.listen(init.io, arena, port, cfg, sessions, &printer) catch |e| {
         std.debug.print("serve failed: {s}\n", .{@errorName(e)});
         return e;
     };

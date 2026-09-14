@@ -18,7 +18,12 @@ pub const ADDRESS_LIMIT = 16;
 /// Radicle's user-agent convention is `/<name>:<version>/`.
 pub const USER_AGENT = "/radish:0.0.0/";
 
-pub const Error = error{ AliasTooLong, AgentTooLong, TooManyAddresses } || std.mem.Allocator.Error;
+pub const Error = error{
+    AliasTooLong,
+    AgentTooLong,
+    TooManyAddresses,
+    TooManyRepos,
+} || std.mem.Allocator.Error;
 
 pub const Address = struct {
     pub const Kind = enum(u8) { ipv4 = 1, ipv6 = 2, dns = 3 };
@@ -26,6 +31,8 @@ pub const Address = struct {
 };
 
 pub const NodeAnnouncement = struct {
+    pub const message_type = protocol.MessageType.node_announcement;
+
     version: u8 = 1,
     features: u64 = 1,
     timestamp: u64, // unix millis
@@ -51,20 +58,48 @@ pub const NodeAnnouncement = struct {
     }
 };
 
+/// A node announcing which repositories it holds, and so what it will serve.
+/// Unlike a NodeAnnouncement the body carries no version or features: the
+/// inventory and the timestamp are the whole of it.
+/// Source: radicle-protocol service/message.rs InventoryAnnouncement.
+pub const InventoryAnnouncement = struct {
+    pub const message_type = protocol.MessageType.inventory_announcement;
+
+    /// Raw 20-byte oids, which is what a RID is underneath.
+    inventory: []const [20]u8,
+    timestamp: u64, // unix millis
+
+    pub fn encodeMessage(self: InventoryAnnouncement, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) Error!void {
+        if (self.inventory.len > protocol.INVENTORY_LIMIT) return error.TooManyRepos;
+        const w = codec.Writer{ .out = out, .allocator = allocator };
+        try w.writeU16(@intCast(self.inventory.len));
+        // Each RepoId is a length-prefixed oid rather than a bare 20 bytes, so
+        // the list is not contiguous on the wire.
+        for (self.inventory) |oid| {
+            try w.writeU16(oid.len);
+            try w.bytes(&oid);
+        }
+        try writeU64(w, self.timestamp);
+    }
+};
+
 /// A signed announcement, ready to wrap in a gossip frame.
 pub const Announcement = struct {
+    /// Which announcement `message` holds, since the wrapper is identical for
+    /// all of them and only the type id says which.
+    type: protocol.MessageType,
     node: node_id.NodeId,
     sig: signature.Signature,
-    message: []const u8, // the encoded NodeAnnouncement body
+    message: []const u8, // the encoded announcement body
 
     /// Encodes a full gossip frame: version ++ stream ++ len ++
-    ///   type(NodeAnnouncement) ++ node ++ signature ++ message.
+    ///   type ++ node ++ signature ++ message.
     /// Caller owns the result.
     pub fn encodeFrame(self: Announcement, allocator: std.mem.Allocator) ![]u8 {
         var payload: std.ArrayList(u8) = .empty;
         defer payload.deinit(allocator);
         const pw = codec.Writer{ .out = &payload, .allocator = allocator };
-        try pw.writeU16(@backingInt(protocol.MessageType.node_announcement));
+        try pw.writeU16(@backingInt(self.type));
         try pw.bytes(&self.node.key);
         try pw.bytes(&self.sig.bytes);
         try pw.bytes(self.message);
@@ -80,18 +115,23 @@ pub const Announcement = struct {
     }
 };
 
-/// Signs a NodeAnnouncement with `key` and returns the wrapped Announcement.
-/// The signature is over the encoded message body. `message` is owned by the
-/// returned Announcement's caller via `allocator` (kept in `msg_buf`).
+/// Signs any announcement with `key` and returns the wrapped Announcement.
+/// The signature is over the encoded message body alone: not the type id, not
+/// the wrapper. `message` is owned by the caller via `msg_buf`.
 pub fn sign(
     allocator: std.mem.Allocator,
-    ann: NodeAnnouncement,
+    ann: anytype,
     key: signature.SecretKey,
     msg_buf: *std.ArrayList(u8),
 ) !Announcement {
     try ann.encodeMessage(allocator, msg_buf);
     const sig = try key.sign(msg_buf.items);
-    return .{ .node = key.nodeId(), .sig = sig, .message = msg_buf.items };
+    return .{
+        .type = @TypeOf(ann).message_type,
+        .node = key.nodeId(),
+        .sig = sig,
+        .message = msg_buf.items,
+    };
 }
 
 fn writeU64(w: codec.Writer, v: u64) !void {

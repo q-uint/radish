@@ -142,6 +142,78 @@ fn findPack(io: std.Io, dir: std.Io.Dir, buf: []u8) ![]const u8 {
     return error.PackMissing;
 }
 
+/// Every repository we hold, one bare git repo per RID directly under a root
+/// directory, named by the RID's bare multibase form.
+/// Source: RIP-0003 Layout; confirmed against rad 1.9.1 storage on disk.
+pub const Storage = struct {
+    io: std.Io,
+    dir: std.Io.Dir,
+    root: []const u8,
+    allocator: std.mem.Allocator,
+
+    pub fn open(io: std.Io, allocator: std.mem.Allocator, root: []const u8) !Storage {
+        var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+        errdefer dir.close(io);
+        return .{
+            .io = io,
+            .dir = dir,
+            .root = try allocator.dupe(u8, root),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Storage) void {
+        self.dir.close(self.io);
+        self.allocator.free(self.root);
+    }
+
+    /// The RIDs on disk, which is what a node announces as its inventory. Only
+    /// repositories `repository` would open are counted: announcing one we
+    /// cannot read objects out of promises a fetch we would then fail.
+    /// Caller owns the result.
+    pub fn inventory(self: *Storage, gpa: std.mem.Allocator) ![]rid.RepoId {
+        var list: std.ArrayList(rid.RepoId) = .empty;
+        errdefer list.deinit(gpa);
+
+        var it = self.dir.iterate();
+        while (try it.next(self.io)) |entry| {
+            if (entry.kind != .directory) continue;
+            // A directory that is not named for a RID is not ours to announce,
+            // whatever else it might be.
+            const id = rid.RepoId.parse(entry.name) catch continue;
+            if (!self.readable(entry.name)) continue;
+            try list.append(gpa, id);
+        }
+        return list.toOwnedSlice(gpa);
+    }
+
+    /// Whether `name` holds both halves of a pack, which is what
+    /// `Repository.open` needs. An index is written after its pack, so a pack
+    /// alone is what an interrupted clone leaves behind.
+    fn readable(self: *Storage, name: []const u8) bool {
+        var dir = self.dir.openDir(self.io, name, .{}) catch return false;
+        defer dir.close(self.io);
+
+        var base_buf: [std.fs.max_name_bytes]u8 = undefined;
+        const base = findPack(self.io, dir, &base_buf) catch return false;
+
+        var name_buf: [std.fs.max_name_bytes]u8 = undefined;
+        const idx = std.fmt.bufPrint(&name_buf, "objects/pack/{s}.idx", .{base}) catch return false;
+        dir.access(self.io, idx, .{}) catch return false;
+        return true;
+    }
+
+    /// Opens one repository by RID. Caller owns it; call `deinit`.
+    pub fn repository(self: *Storage, gpa: std.mem.Allocator, id: rid.RepoId) !*Repository {
+        const name = try id.encodeBare(gpa);
+        defer gpa.free(name);
+
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ self.root, name });
+        return Repository.open(self.io, gpa, path);
+    }
+};
+
 pub const Repository = struct {
     io: std.Io,
     dir: std.Io.Dir,
