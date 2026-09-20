@@ -82,7 +82,7 @@ fn PktReader(comptime S: type) type {
 /// small (commands, oids, ref-prefixes); the local buffer bounds them.
 fn writePkt(session: anytype, payload: []const u8) !void {
     var buf: [512]u8 = undefined;
-    const line = try pktline.writeData(&buf, payload);
+    const line = try pktline.bufWrite(&buf, payload);
     try session.writeGit(line);
 }
 

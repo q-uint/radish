@@ -21,6 +21,7 @@ const ID_REF = "refs/rad/id";
 // Namespace-relative, as sigrefs names it.
 const ROOT_REF = "refs/rad/root";
 const MAX_DOC = 1 << 20;
+const MAX_PACKED_REFS = 1 << 24;
 const MAX_SIGREFS = 1 << 22;
 const DID_KEY_PREFIX = "did:key:";
 
@@ -140,6 +141,27 @@ fn findPack(io: std.Io, dir: std.Io.Dir, buf: []u8) ![]const u8 {
         return buf[0..base.len];
     }
     return error.PackMissing;
+}
+
+/// A ref and what it points at, as ls-refs advertises the pair.
+pub const Ref = struct {
+    /// The full name, `refs/...`. Caller-owned.
+    name: []u8,
+    oid: gitpack.Oid,
+};
+
+fn lessByName(_: void, a: Ref, b: Ref) bool {
+    return std.mem.order(u8, a.name, b.name) == .lt;
+}
+
+/// Whether `name` is under any of `prefixes`. No prefixes means everything,
+/// which is what a peer asking for no ref-prefix wants.
+fn matches(name: []const u8, prefixes: []const []const u8) bool {
+    if (prefixes.len == 0) return true;
+    for (prefixes) |p| {
+        if (std.mem.startsWith(u8, name, p)) return true;
+    }
+    return false;
 }
 
 /// Every repository we hold, one bare git repo per RID directly under a root
@@ -658,6 +680,102 @@ pub const Repository = struct {
         defer diags.deinit();
         try self.repo.checkout(self.io, tmp.dir, commit, &diags);
         return tmp.dir.readFileAlloc(self.io, path, gpa, .limited(max));
+    }
+
+    /// Every ref whose full name starts with one of `prefixes`, or all of them
+    /// when `prefixes` is empty, sorted by name. This is what ls-refs
+    /// advertises. Caller owns the names.
+    ///
+    /// Both halves of where git keeps refs: loose files under `refs/`, and
+    /// `packed-refs`, which is where `git gc` moves them.
+    ///
+    /// `HEAD` is deliberately not among them. A peer never asks for it: the
+    /// fetcher's only ref-prefixes are `refs/namespaces/<nid>/refs/rad/id`,
+    /// the same remote's `refs/rad/sigrefs`, and `refs/namespaces`. HEAD is
+    /// derived from the identity document instead of being fetched.
+    /// Source: heartwood radicle-fetch/src/stage.rs (RefPrefix),
+    /// radicle/src/storage/git.rs (head, canonical_head).
+    pub fn listRefs(
+        self: *Repository,
+        gpa: std.mem.Allocator,
+        prefixes: []const []const u8,
+    ) ![]Ref {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+
+        // Packed first, so a loose file of the same name replaces it: git
+        // writes the loose one to move a ref that was packed.
+        var by_name: std.StringHashMapUnmanaged(gitpack.Oid) = .empty;
+        try self.readPackedRefs(arena.allocator(), prefixes, &by_name);
+        try self.readLooseRefs(arena.allocator(), prefixes, &by_name);
+
+        var found: std.ArrayList(Ref) = .empty;
+        errdefer {
+            for (found.items) |r| gpa.free(r.name);
+            found.deinit(gpa);
+        }
+        try found.ensureTotalCapacity(gpa, by_name.count());
+
+        var it = by_name.iterator();
+        while (it.next()) |entry| {
+            found.appendAssumeCapacity(.{
+                .name = try gpa.dupe(u8, entry.key_ptr.*),
+                .oid = entry.value_ptr.*,
+            });
+        }
+
+        std.mem.sort(Ref, found.items, {}, lessByName);
+        return found.toOwnedSlice(gpa);
+    }
+
+    fn readLooseRefs(
+        self: *Repository,
+        arena: std.mem.Allocator,
+        prefixes: []const []const u8,
+        out: *std.StringHashMapUnmanaged(gitpack.Oid),
+    ) !void {
+        var root = self.dir.openDir(self.io, "refs", .{ .iterate = true }) catch return;
+        defer root.close(self.io);
+
+        var walker = try root.walk(arena);
+        defer walker.deinit();
+        while (try walker.next(self.io)) |entry| {
+            if (entry.kind != .file) continue;
+
+            // A name too long to spell is one we cannot advertise, and no
+            // reason to stop advertising the rest.
+            var buf: [std.fs.max_path_bytes + "refs/".len]u8 = undefined;
+            const name = std.fmt.bufPrint(&buf, "refs/{s}", .{entry.path}) catch continue;
+            if (!matches(name, prefixes)) continue;
+            // A ref file we cannot parse is not one we can advertise.
+            const oid = self.readRef(name, error.IdRefMissing) catch continue;
+
+            try out.put(arena, try arena.dupe(u8, name), oid);
+        }
+    }
+
+    /// `packed-refs` is "<oid> <name>" a line, with `#` for its header and `^`
+    /// for a tag's peeled target, which is not itself a ref.
+    /// Source: gitrepository-layout, "packed-refs".
+    fn readPackedRefs(
+        self: *Repository,
+        arena: std.mem.Allocator,
+        prefixes: []const []const u8,
+        out: *std.StringHashMapUnmanaged(gitpack.Oid),
+    ) !void {
+        const raw = self.dir.readFileAlloc(self.io, "packed-refs", arena, .limited(MAX_PACKED_REFS)) catch
+            return;
+
+        var lines = std.mem.tokenizeAny(u8, raw, "\r\n");
+        while (lines.next()) |line| {
+            if (line.len == 0 or line[0] == '#' or line[0] == '^') continue;
+            const sp = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+            const name = std.mem.trim(u8, line[sp + 1 ..], " \t");
+            if (!matches(name, prefixes)) continue;
+            const oid = gitpack.Oid.parse(.sha1, line[0..sp]) catch continue;
+
+            try out.put(arena, name, oid);
+        }
     }
 
     fn readRef(self: *Repository, name: []const u8, missing: anyerror) !gitpack.Oid {

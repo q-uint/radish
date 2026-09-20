@@ -166,6 +166,20 @@ pub const Repo = struct {
         self.alloc.free(out);
     }
 
+    /// Moves the bare repo's loose refs into `packed-refs`, which is what
+    /// `git gc` does to a repository that has been sitting around.
+    pub fn packRefs(self: *Repo) !void {
+        const out = try run(self.alloc, try std.fmt.allocPrint(self.alloc,
+            \\set -e
+            \\# The fixture builds `bare` by hand, so give git the HEAD and
+            \\# config it needs before asking it to do repository work. Safe on
+            \\# a directory that already holds objects and refs.
+            \\git init -q --bare {s}/bare
+            \\git -C {s}/bare pack-refs --all --prune
+        , .{ self.root, self.root }));
+        self.alloc.free(out);
+    }
+
     /// Packs everything accumulated so far into the bare repo. Call once, last.
     pub fn finish(self: *Repo) ![]const u8 {
         var oids: std.ArrayList(u8) = .empty;
@@ -267,6 +281,23 @@ pub fn packOids(alloc: std.mem.Allocator, bare: []const u8) ![]gitpack.Oid {
         try list.append(alloc, try gitpack.Oid.parse(.sha1, hex));
     }
     return list.toOwnedSlice(alloc);
+}
+
+/// Has `git index-pack` read a pack we wrote, which fails outright if it is
+/// malformed, and returns how many objects git found in it. `pack` is a path
+/// ending in `.pack`; git writes the index beside it.
+pub fn indexPack(alloc: std.mem.Allocator, pack: []const u8) !usize {
+    const out = try run(alloc, try std.fmt.allocPrint(alloc,
+        \\set -e
+        \\p="{s}"
+        \\git index-pack "$p" >/dev/null
+        \\listing=$(git verify-pack -v "${{p%.pack}}.idx")
+        \\# Only grep's no-match exit is tolerated, which an empty pack is. A
+        \\# verify-pack that failed has already stopped the script above.
+        \\printf '%s\n' "$listing" | grep -cE '^[0-9a-f]{{40}} ' || true
+    , .{pack}));
+    defer alloc.free(out);
+    return std.fmt.parseInt(usize, std.mem.trim(u8, out, " \t\r\n"), 10);
 }
 
 /// Runs `script` under bash and returns stdout. Takes ownership of `script`.

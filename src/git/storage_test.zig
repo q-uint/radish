@@ -103,6 +103,44 @@ test "a repository opens by RID out of the storage root" {
     try testing.expect(try repo.hasObject(try storage.parseOid(id)));
 }
 
+// `git gc` runs pack-refs, so a repository that has been sitting around keeps
+// its refs somewhere a directory walk cannot see. Advertising none of them
+// would be a silent wrong answer rather than a failure.
+test "listRefs reads packed refs, and a loose ref wins over its packed value" {
+    var s = try fixture.scratch(alloc);
+    defer fixture.destroy(alloc, s);
+
+    const first = try s.repo.commit("main", "a.txt", "one\n");
+    const second = try s.repo.commit("main", "b.txt", "two\n");
+    try s.repo.radId(first);
+    try s.repo.namespaceRef(REAL_SIGREFS_NID, "refs/heads/main", first);
+    const bare = try s.repo.finish();
+    try s.repo.packRefs();
+
+    // Moved since it was packed, which is what a loose file records.
+    try s.repo.radId(second);
+
+    var repo = try storage.Repository.open(testing.io, alloc, bare);
+    defer repo.deinit();
+
+    const refs = try repo.listRefs(alloc, &.{});
+    defer {
+        for (refs) |r| alloc.free(r.name);
+        alloc.free(refs);
+    }
+
+    try testing.expectEqual(@as(usize, 2), refs.len);
+    try testing.expectEqualStrings(
+        "refs/namespaces/" ++ REAL_SIGREFS_NID ++ "/refs/heads/main",
+        refs[0].name,
+    );
+    try testing.expectEqualStrings("refs/rad/id", refs[1].name);
+
+    var moved: [40]u8 = undefined;
+    _ = try std.fmt.bufPrint(&moved, "{x}", .{refs[1].oid.slice()});
+    try testing.expectEqualStrings(second, &moved);
+}
+
 /// Renames the fixture's `bare` directory to `name` beside itself.
 fn moveInto(bare: []const u8, name: []const u8) !void {
     const parent = std.fs.path.dirname(bare).?;
