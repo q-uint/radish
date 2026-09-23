@@ -67,12 +67,19 @@ test "a want we do not hold is refused, but a have we do not hold only prunes no
         walk.missing(alloc, &repo.odb, &.{absent}, &.{}),
     );
 
-    // A have out of a history we never stored costs us only a larger pack.
+    // A `have` out of a history we never stored costs us only a larger pack.
     const all = try walk.missing(alloc, &repo.odb, &.{head}, &.{});
     defer alloc.free(all);
     const with_have = try walk.missing(alloc, &repo.odb, &.{head}, &.{absent});
     defer alloc.free(with_have);
     try testing.expectEqual(all.len, with_have.len);
+
+    // Naming the same unheld oid as both is still a `want` we cannot answer:
+    // marking the `have` must not make the `want` look already sent.
+    try testing.expectError(
+        error.ObjectMissing,
+        walk.missing(alloc, &repo.odb, &.{absent}, &.{absent}),
+    );
 }
 
 // A merge reaches both sides, and a walk that followed only the first parent

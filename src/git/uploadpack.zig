@@ -26,7 +26,7 @@ const band_pack = 1;
 
 /// Arguments a peer may name. Bounded by both count and bytes, since one line
 /// may be 64K on its own. Past a bound the request is refused rather than
-/// trimmed: prefixes are a union and wants are a set, so dropping one of
+/// trimmed: prefixes are a union and `want`s are a set, so dropping one of
 /// either would answer a narrower question than the peer asked.
 const max_prefixes = 1024;
 const max_prefix_bytes = 1 << 16;
@@ -58,7 +58,7 @@ pub fn serve(
             error.LineTooLong,
             => {
                 // Only while the peer is still reading pkt-lines: past the
-                // packfile line an ERR would be pack bytes to it.
+                // `packfile` line an ERR would be pack bytes to it.
                 if (wrote) return e;
                 try fail(w, @errorName(e));
                 return;
@@ -131,8 +131,8 @@ fn nextCommand(r: *std.Io.Reader, buf: []u8) !?Command {
 }
 
 /// Advertises the refs the peer asked for, or all of them when it named no
-/// prefix. `symrefs` and `peel` are accepted and not acted on: we publish no
-/// symbolic refs, and nothing here is an annotated tag.
+/// prefix. `peel` is accepted and not acted on: nothing here is an annotated
+/// tag.
 fn lsRefs(
     gpa: std.mem.Allocator,
     r: *std.Io.Reader,
@@ -147,12 +147,14 @@ fn lsRefs(
         prefixes.deinit(gpa);
     }
     var prefix_bytes: usize = 0;
+    var symrefs = false;
 
     while (true) {
         switch (try pktline.read(r, buf)) {
             .marker => |m| if (m == .flush) break else continue,
             .data => |d| {
                 const arg = std.mem.trimEnd(u8, d, "\n");
+                if (std.mem.eql(u8, arg, "symrefs")) symrefs = true;
                 if (!std.mem.startsWith(u8, arg, "ref-prefix ")) continue;
                 const prefix = arg["ref-prefix ".len..];
                 prefix_bytes += prefix.len;
@@ -171,11 +173,43 @@ fn lsRefs(
 
     // The request is read by now, so its buffer is free to spell the answer.
     wrote.* = true;
+    if (wantsHead(prefixes.items)) try advertiseHead(gpa, w, repo, buf, symrefs);
     for (refs) |ref| {
         const text = try std.fmt.bufPrint(buf, "{x} {s}\n", .{ ref.oid.slice(), ref.name });
         try pktline.write(w, text);
     }
     try w.writeAll(pktline.Marker.flush.wire());
+}
+
+/// Only when the peer named it: a radicle fetcher's prefixes never do, and a
+/// git client's always do.
+fn wantsHead(prefixes: []const []const u8) bool {
+    for (prefixes) |p| {
+        if (std.mem.startsWith(u8, "HEAD", p)) return true;
+    }
+    return false;
+}
+
+/// `HEAD` goes out first, the way git's own upload-pack advertises it, and
+/// carries what it points at when the peer asked for `symrefs`. A repository
+/// whose HEAD names no ref we hold advertises none.
+fn advertiseHead(
+    gpa: std.mem.Allocator,
+    w: *std.Io.Writer,
+    repo: *storage.Repository,
+    buf: []u8,
+    symrefs: bool,
+) !void {
+    const head = (try repo.headRef(gpa)) orelse return;
+    defer head.deinit(gpa);
+
+    const text = if (head.target) |target| blk: {
+        break :blk if (symrefs)
+            try std.fmt.bufPrint(buf, "{x} HEAD symref-target:{s}\n", .{ head.oid.slice(), target })
+        else
+            try std.fmt.bufPrint(buf, "{x} HEAD\n", .{head.oid.slice()});
+    } else try std.fmt.bufPrint(buf, "{x} HEAD\n", .{head.oid.slice()});
+    try pktline.write(w, text);
 }
 
 const Request = struct {
@@ -189,7 +223,7 @@ const Request = struct {
     }
 };
 
-/// Sends the objects behind the peer's wants that its haves do not already
+/// Sends the objects behind the peer's `want`s that its `have`s do not already
 /// cover. Without `done` the peer is still negotiating, so it gets
 /// acknowledgements and another round instead of a pack.
 fn fetch(
@@ -260,7 +294,7 @@ const Sideband = struct {
 
     /// One band line per chunk, since a pkt-line cannot carry more. Nothing is
     /// written for no bytes: an empty pkt-line is a flush, which would end the
-    /// packfile section early.
+    /// `packfile` section early.
     fn emit(self: *Sideband, bytes: []const u8) !void {
         var rest = bytes;
         while (rest.len > 0) {
@@ -286,7 +320,7 @@ fn readFetch(gpa: std.mem.Allocator, r: *std.Io.Reader, buf: []u8) !Request {
                     if (req.wants.items.len == max_oids) return error.MalformedRequest;
                     try req.wants.append(gpa, try parseOid(arg["want ".len..]));
                 } else if (std.mem.startsWith(u8, arg, "have ")) {
-                    // A have we drop only makes the pack bigger, so the cap
+                    // A `have` we drop only makes the pack bigger, so the cap
                     // trims here rather than refusing.
                     if (req.haves.items.len == max_oids) continue;
                     try req.haves.append(gpa, try parseOid(arg["have ".len..]));
@@ -297,7 +331,7 @@ fn readFetch(gpa: std.mem.Allocator, r: *std.Io.Reader, buf: []u8) !Request {
     return req;
 }
 
-/// Tells the peer which of its haves we hold, so the next round can narrow
+/// Tells the peer which of its `have`s we hold, so the next round can narrow
 /// what it asks for.
 ///
 /// Deliberately never `ready`: that word commits us to continuing the same
@@ -321,4 +355,3 @@ fn acknowledge(w: *std.Io.Writer, repo: *storage.Repository, req: Request) !void
 fn parseOid(hex: []const u8) !gitpack.Oid {
     return gitpack.Oid.parse(.sha1, hex) catch error.MalformedRequest;
 }
-

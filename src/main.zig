@@ -56,6 +56,10 @@ pub fn main(init: std.process.Init) !void {
         return serve(init, port, sessions, if (args.len >= 5) args[4] else null);
     }
 
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "upload-pack")) {
+        return uploadPack(init, args[2]);
+    }
+
     // Radicle 2.x, which shares nothing with the commands above but storage.
     if (args.len >= 5 and std.mem.eql(u8, args[1], "quic")) {
         const port = std.fmt.parseInt(u16, args[4], 10) catch return usage();
@@ -151,6 +155,8 @@ fn usage() void {
         \\                                                          locating a seed over gossip
         \\  radish serve       <port> [sessions] [storage]          answer inbound connections
         \\                                                          <storage> is a root of <rid> repos to announce
+        \\  radish upload-pack <repo>                               serve one git v2 fetch on stdin/stdout,
+        \\                                                          for `git clone --upload-pack`
         \\
         \\radicle 2.x, over QUIC:
         \\  radish quic ping   <host> <port>                        handshake, then a gossip ping/pong
@@ -466,9 +472,13 @@ const ServePrinter = struct {
 
     pub fn onSession(self: *ServePrinter, stats: radish.net.node.SessionStats) void {
         self.sessions += 1;
-        std.debug.print("session: {d} frames, {d} pings, {d} subscribes, {d} announcements\n", .{
-            stats.frames, stats.pings, stats.subscribes, stats.announcements,
-        });
+        std.debug.print(
+            "session: {d} frames, {d} pings, {d} subscribes, {d} announcements, {d} fetches, {d} refused\n",
+            .{
+                stats.frames,        stats.pings,   stats.subscribes,
+                stats.announcements, stats.fetches, stats.refused,
+            },
+        );
     }
 
     pub fn onSessionFailed(_: *ServePrinter, err: anyerror) void {
@@ -801,6 +811,29 @@ fn serve(init: std.process.Init, port: u16, sessions: usize, root: ?[]const u8) 
         return e;
     };
     std.debug.print("\nserved {d} sessions\n", .{served});
+}
+
+/// Serves one git protocol v2 fetch over stdin/stdout, which is how real `git`
+/// runs an upload-pack: `git -c protocol.version=2 clone --upload-pack 'radish
+/// upload-pack' <repo> <dir>`. No transport intro line is read here, since the
+/// repository arrives on the command line the way `git upload-pack` takes it.
+fn uploadPack(init: std.process.Init, path: []const u8) !void {
+    const gpa = init.gpa;
+    var repo = radish.git.storage.Repository.open(init.io, gpa, path) catch |e| {
+        std.debug.print("cannot open {s}: {s}\n", .{ path, @errorName(e) });
+        return e;
+    };
+    defer repo.deinit();
+
+    // Streaming: stdio is a pipe here, which has no position to seek to. The
+    // write side holds one pkt-line, so a sideband line never splits a syscall.
+    var in_buf: [4096]u8 = undefined;
+    var out_buf: [radish.git.pktline.MAX_LINE]u8 = undefined;
+    var in = std.Io.File.stdin().readerStreaming(init.io, &in_buf);
+    var out = std.Io.File.stdout().writerStreaming(init.io, &out_buf);
+
+    try radish.git.uploadpack.serve(gpa, &in.interface, &out.interface, repo);
+    try out.interface.flush();
 }
 
 /// The dependency's pinned `.node`, or null when it names none or names one

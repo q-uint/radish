@@ -2,6 +2,7 @@
 //! testfixture.zig).
 const std = @import("std");
 const gitpack = @import("gitpack");
+const odb = @import("odb.zig");
 const storage = @import("storage.zig");
 const fixture = @import("testfixture.zig");
 
@@ -78,7 +79,64 @@ test "every object in a pack reads back as itself" {
     try testing.expect(found);
 }
 
-test "an oid the pack does not hold is missing rather than wrong" {
+// `rad init` writes every object loose and packs none of them: `git gc` is
+// heartwood's only packing, and it does nothing until thousands have piled up.
+// A repository like that is most of what a node is asked to serve.
+test "a repository with nothing packed reads its objects loose" {
+    const s = try fixture.scratch(alloc);
+    defer fixture.destroy(alloc, s);
+
+    const first = try s.repo.commit("main", "a.txt", "one\n");
+    const tip = try s.repo.commit("main", "b.txt", "two\n");
+    const bare = try s.repo.looseOnly(tip);
+
+    var repo = try storage.Repository.open(testing.io, alloc, bare);
+    defer repo.deinit();
+    try testing.expectEqual(@as(usize, 0), repo.packs.len);
+
+    for ([_][]const u8{ first, tip }) |hex| {
+        const oid = try storage.parseOid(hex);
+        try testing.expect(try repo.odb.has(oid));
+        try testing.expectEqual(@as(odb.Type, .commit), try repo.odb.typeOf(oid));
+
+        const obj = try repo.odb.read(alloc, oid);
+        defer obj.deinit(alloc);
+        try testing.expectEqualSlices(u8, oid.slice(), oidOf(obj).slice());
+    }
+}
+
+// What a repository looks like once it has been fetched into and collected at
+// least once: some of it packed, whatever arrived since still loose.
+test "objects are read across every pack and the loose ones" {
+    const s = try fixture.scratch(alloc);
+    defer fixture.destroy(alloc, s);
+
+    const first = try s.repo.commit("main", "a.txt", "one\n");
+    const second = try s.repo.commit("main", "b.txt", "two\n");
+    const third = try s.repo.commit("main", "c.txt", "three\n");
+    const since_first = try std.fmt.allocPrint(alloc, "{s} ^{s}", .{ second, first });
+    defer alloc.free(since_first);
+    const since_second = try std.fmt.allocPrint(alloc, "{s} ^{s}", .{ third, second });
+    defer alloc.free(since_second);
+
+    _ = try s.repo.packOnly(first);
+    _ = try s.repo.packOnly(since_first);
+    const bare = try s.repo.looseOnly(since_second);
+
+    var repo = try storage.Repository.open(testing.io, alloc, bare);
+    defer repo.deinit();
+    try testing.expectEqual(@as(usize, 2), repo.packs.len);
+
+    // One from each pack and one that was never packed.
+    for ([_][]const u8{ first, second, third }) |hex| {
+        const oid = try storage.parseOid(hex);
+        const obj = try repo.odb.read(alloc, oid);
+        defer obj.deinit(alloc);
+        try testing.expectEqualSlices(u8, oid.slice(), oidOf(obj).slice());
+    }
+}
+
+test "an oid the repository does not hold is missing rather than wrong" {
     var s = try fixture.scratch(alloc);
     defer fixture.destroy(alloc, s);
     _ = try s.repo.commit("main", "f", "hi");
@@ -88,6 +146,6 @@ test "an oid the pack does not hold is missing rather than wrong" {
     defer repo.deinit();
 
     const absent = try gitpack.Oid.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
-    try testing.expectEqual(@as(?u64, null), try repo.odb.offsetOf(absent));
+    try testing.expect(!try repo.odb.has(absent));
     try testing.expectError(error.ObjectMissing, repo.odb.read(alloc, absent));
 }

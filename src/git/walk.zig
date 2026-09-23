@@ -60,31 +60,73 @@ pub const Links = struct {
         };
     }
 
-    /// A tree entry is "<mode> <name>\x00<oid>", with the oid raw rather than
-    /// hex, and nothing delimiting entries but their own lengths.
     fn nextEntry(self: *Links) Error!?gitpack.Oid {
-        const width = self.format.byteLength();
-        while (self.pos < self.data.len) {
-            const rest = self.data[self.pos..];
-            const nul = std.mem.indexOfScalar(u8, rest, 0) orelse return error.MalformedObject;
-            if (rest.len < nul + 1 + width) return error.MalformedObject;
-            const sp = std.mem.indexOfScalar(u8, rest[0..nul], ' ') orelse
-                return error.MalformedObject;
-            const mode = rest[0..sp];
-            const oid = rest[nul + 1 ..][0..width];
-            self.pos += nul + 1 + width;
+        var entries: Tree = .{ .format = self.format, .data = self.data, .pos = self.pos };
+        defer self.pos = entries.pos;
 
+        while (try entries.next()) |entry| {
             // A gitlink's commit lives in the submodule's own repository, so
             // it is not ours to send. git packs them the same way.
-            if (std.mem.eql(u8, mode, gitlink_mode)) continue;
-            return gitpack.Oid.fromBytes(self.format, oid);
+            if (entry.kind == .gitlink) continue;
+            return entry.oid;
         }
         return null;
     }
 };
 
-/// The tree entry mode of a submodule.
-const gitlink_mode = "160000";
+/// What a tree entry points at, which is the high bits of its mode. These four
+/// are all git writes, and `git fsck` refuses the rest.
+///
+/// Trivia: the field is POSIX `st_mode`'s file type, whose other values (fifo,
+/// device, socket) cannot appear in a tree, and 0o16 is git's own, for a value
+/// POSIX left unused.
+pub const EntryKind = enum(u4) {
+    directory = 0o4,
+    file = 0o10,
+    symlink = 0o12,
+    /// A submodule's commit, which this repository does not hold.
+    gitlink = 0o16,
+};
+
+pub const TreeEntry = struct {
+    kind: EntryKind,
+    /// Only a file may carry it; git writes 0o755 or 0o644 and nothing else.
+    executable: bool,
+    name: []const u8,
+    oid: gitpack.Oid,
+};
+
+/// The entries of a tree: "<mode> <name>\x00<oid>" each, with the oid raw
+/// rather than hex, and nothing delimiting them but their own lengths.
+/// Source: gitformat-tree.
+pub const Tree = struct {
+    format: gitpack.Oid.Format,
+    data: []const u8,
+    pos: usize = 0,
+
+    pub fn next(self: *Tree) Error!?TreeEntry {
+        if (self.pos >= self.data.len) return null;
+        const width = self.format.byteLength();
+        const rest = self.data[self.pos..];
+
+        const nul = std.mem.indexOfScalar(u8, rest, 0) orelse return error.MalformedObject;
+        if (rest.len < nul + 1 + width) return error.MalformedObject;
+        const sp = std.mem.indexOfScalar(u8, rest[0..nul], ' ') orelse
+            return error.MalformedObject;
+        self.pos += nul + 1 + width;
+
+        const mode = std.fmt.parseUnsigned(u16, rest[0..sp], 8) catch
+            return error.MalformedObject;
+        const kind = std.enums.fromInt(EntryKind, mode >> 12) orelse
+            return error.MalformedObject;
+        return .{
+            .kind = kind,
+            .executable = kind == .file and mode & 0o111 != 0,
+            .name = rest[sp + 1 .. nul],
+            .oid = gitpack.Oid.fromBytes(self.format, rest[nul + 1 ..][0..width]),
+        };
+    }
+};
 
 const Set = std.AutoHashMapUnmanaged(gitpack.Oid, void);
 
@@ -128,7 +170,7 @@ pub fn missing(
 }
 
 /// Marks everything behind `tips` as the peer's already. An oid we do not hold
-/// is skipped rather than fatal: a peer may name a have from a history we
+/// is skipped rather than fatal: a peer may name a `have` from a history we
 /// never stored, and all that costs us is a larger pack.
 fn mark(gpa: std.mem.Allocator, o: *odb.Odb, tips: []const gitpack.Oid, seen: *Set) !void {
     var queue: std.ArrayList(gitpack.Oid) = .empty;
@@ -136,11 +178,15 @@ fn mark(gpa: std.mem.Allocator, o: *odb.Odb, tips: []const gitpack.Oid, seen: *S
     try queue.appendSlice(gpa, tips);
 
     while (queue.pop()) |oid| {
-        if ((try seen.getOrPut(gpa, oid)).found_existing) continue;
+        if (seen.contains(oid)) continue;
         const kind = o.typeOf(oid) catch |e| switch (e) {
+            // Marked only once it is ours to mark: a `have` we never stored
+            // would otherwise also hide a `want` naming the same oid, and the
+            // pack would go out short of it and look complete.
             error.ObjectMissing => continue,
             else => return e,
         };
+        try seen.put(gpa, oid, {});
         if (kind == .blob) continue;
 
         const obj = try o.read(gpa, oid);

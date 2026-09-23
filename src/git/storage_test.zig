@@ -50,23 +50,25 @@ fn fakeRepo(dir: std.Io.Dir, name: []const u8, exts: []const []const u8) !void {
     }
 }
 
-// An inventory announcement is a promise to serve what it names, so it must
-// count repositories we can actually read objects out of, not directories that
-// happen to sit in the storage root.
+// An inventory announcement is a promise to serve what it names, so it counts
+// directories we could read objects out of. Whether those objects are packed
+// is git's business and changes under us: `rad init` writes them all loose,
+// and `git gc` packs them later.
 test "inventory counts repositories we could serve, and nothing else" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = buf[0..try tmp.dir.realPath(testing.io, &buf)];
 
-    const held = "z42hL2jL4XNk6K8oHQaSWfMgCL7ji";
-    try fakeRepo(tmp.dir, held, &.{ "pack", "idx" });
-    // Named for a RID, but with nothing to serve out of.
+    try fakeRepo(tmp.dir, "z42hL2jL4XNk6K8oHQaSWfMgCL7ji", &.{ "pack", "idx" });
+    // Nothing packed, which is every repository `rad init` has just written.
     try fakeRepo(tmp.dir, "z4VSyUhaBGUJQrFdS7nWULf1dJdos", &.{});
-    // A pack with no index, which is what an interrupted clone leaves: the
-    // objects are there but nothing can find one.
+    // A pack with no index, which is what an interrupted fetch leaves: that
+    // pack is unreadable, but whatever else the repository holds is not.
     try fakeRepo(tmp.dir, "z3gqcJUoA1n9HaHKufZs5FCSGazv5", &.{"pack"});
-    // Both halves, but its name is not a RID, so it is not ours to announce.
+    // Named for a RID, but holding no objects at all.
+    try tmp.dir.createDirPath(testing.io, "z2VgCqRhCQAeSgqnbgXo5UqQQUVEu");
+    // A repository, but its name is not a RID, so it is not ours to announce.
     try fakeRepo(tmp.dir, "notarid", &.{ "pack", "idx" });
 
     var store = try storage.Storage.open(testing.io, alloc, root);
@@ -74,11 +76,7 @@ test "inventory counts repositories we could serve, and nothing else" {
 
     const ids = try store.inventory(alloc);
     defer alloc.free(ids);
-    try testing.expectEqual(@as(usize, 1), ids.len);
-
-    const name = try ids[0].encodeBare(alloc);
-    defer alloc.free(name);
-    try testing.expectEqualStrings(held, name);
+    try testing.expectEqual(@as(usize, 3), ids.len);
 }
 
 test "a repository opens by RID out of the storage root" {
@@ -551,6 +549,42 @@ test "canonicalHead reads defaultBranch, and the doc, from a delegate namespace"
     const doc = try repo.readDocBytes(alloc, alloc);
     defer alloc.free(doc);
     try testing.expectEqualStrings(doc_bytes, doc);
+}
+
+// Nothing on the wire carries HEAD, so a clone has none until this derives
+// one, and plain git cannot check out a repository without it.
+test "writeHead leaves the branch and HEAD that git needs" {
+    var s = try fixture.scratch(alloc);
+    defer fixture.destroy(alloc, s);
+
+    const signer = try nidForSeed(SEED_SORTS_SECOND);
+    defer alloc.free(signer);
+    const doc_bytes = try docDelegating(&.{signer});
+    defer alloc.free(doc_bytes);
+    const root = try s.repo.commit("main", "embeds/radicle.json", doc_bytes);
+    const head = try s.repo.commit("main", "f", "hi");
+
+    alloc.free(try s.repo.signedRefs(SEED_SORTS_SECOND, &.{
+        .{ .oid = root, .name = "refs/rad/root" },
+        .{ .oid = head, .name = "refs/heads/main" },
+    }));
+    try s.repo.radRoot(signer, root);
+    try s.repo.radId(root);
+    try s.repo.namespaceRef(signer, "refs/heads/main", head);
+    const bare = try s.repo.finish();
+
+    var repo = try storage.Repository.open(testing.io, alloc, bare);
+    defer repo.deinit();
+    try repo.writeHead(alloc);
+
+    // What `headRef` will now answer an asking git client with.
+    const got = (try repo.headRef(alloc)).?;
+    defer got.deinit(alloc);
+    try testing.expectEqualStrings("refs/heads/main", got.target.?);
+
+    var hex_oid: [40]u8 = undefined;
+    _ = try std.fmt.bufPrint(&hex_oid, "{x}", .{got.oid.slice()});
+    try testing.expectEqualStrings(head, &hex_oid);
 }
 
 test "canonicalHead rejects delegates that disagree" {

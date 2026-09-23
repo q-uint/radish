@@ -130,8 +130,8 @@ pub const Session = struct {
         while (true) {
             const f = try protocol.readRawFrame(self.reader, self.frame_buf);
             switch (f) {
-                .git => |data| {
-                    self.leftover = data;
+                .git => |g| {
+                    self.leftover = g.payload;
                     return;
                 },
                 .control => |ctl| if (ctl.ctrl == .close or ctl.ctrl == .eof) return error.EndOfStream,

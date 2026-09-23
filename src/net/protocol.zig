@@ -160,6 +160,56 @@ pub fn gitUploadPackLine(allocator: std.mem.Allocator, rid: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{x:0>4}{s}", .{ total, payload });
 }
 
+/// What a peer asked us to serve, out of the line `gitUploadPackLine` builds.
+/// `rid` borrows the line, bare: no `rad:` and no `.git`.
+pub const GitRequest = struct {
+    rid: []const u8,
+    /// Only version 2 is served, and heartwood refuses everything else too,
+    /// so an absent `version` is as good as a wrong one.
+    version_2: bool,
+};
+
+/// Parses the first git frame's payload: a pkt-line holding
+/// `git-upload-pack /<rid>\0` and NUL-terminated extras, of which only
+/// `version` is ours to care about. The host, which git's own transport puts
+/// between the two, is read past rather than used: whoever dialed us reached
+/// the one node we are.
+/// Source: radicle-node worker/upload_pack.rs, GitRequest::parse.
+pub fn parseGitUploadPackLine(payload: []const u8) !GitRequest {
+    const parsed = try pktline.parse(payload);
+    const line = switch (parsed.line) {
+        .data => |d| d,
+        .marker => return error.MalformedRequest,
+    };
+
+    const prefix = "git-upload-pack ";
+    if (!std.mem.startsWith(u8, line, prefix)) return error.MalformedRequest;
+
+    var parts = std.mem.splitScalar(u8, line[prefix.len..], 0);
+    const path = parts.first();
+    if (path.len < 2 or path[0] != '/') return error.MalformedRequest;
+    // A suffix, not a character set: base58 spells `git` and `t` too.
+    const named = path[1..];
+    const bare = if (std.mem.endsWith(u8, named, ".git"))
+        named[0 .. named.len - ".git".len]
+    else
+        named;
+
+    var version_2 = false;
+    while (parts.next()) |part| {
+        if (std.mem.eql(u8, part, "version=2")) version_2 = true;
+    }
+    return .{ .rid = bare, .version_2 = version_2 };
+}
+
+/// Writes a git frame's header straight to `w`, for a sender that already
+/// holds the payload and has no reason to copy it to prefix four bytes.
+pub fn writeGitFrameHeader(w: *std.Io.Writer, stream: StreamId, len: usize) !void {
+    try w.writeAll(&VERSION_STRING);
+    try codec.writeVarint(w, stream.value);
+    try codec.writeVarint(w, len);
+}
+
 /// Encodes a `Ping` message, with no transport framing around it. 1.x wraps
 /// this in a gossip frame; 2.x length-prefixes it on a QUIC stream. Caller owns
 /// the result.
@@ -360,7 +410,9 @@ pub fn decodeFrameStreaming(r: *std.Io.Reader, scratch: []u8, oid_buf: [][20]u8)
 pub const RawFrame = union(enum) {
     control: struct { ctrl: ControlType, target: u64 },
     gossip: []const u8,
-    git: []const u8,
+    /// The stream comes with it: answering a fetch means framing the reply on
+    /// the id the peer opened, which only the frame it arrived in names.
+    git: struct { stream: StreamId, payload: []const u8 },
     unknown: struct { stream: u64, payload: []const u8 },
 };
 
@@ -390,7 +442,7 @@ pub fn readRawFrame(r: *std.Io.Reader, scratch: []u8) !RawFrame {
         @backingInt(StreamType.gossip), @backingInt(StreamType.git) => {
             const payload = try readPayload(r, scratch);
             return if (kind == @backingInt(StreamType.git))
-                .{ .git = payload }
+                .{ .git = .{ .stream = .{ .value = stream }, .payload = payload } }
             else
                 .{ .gossip = payload };
         },

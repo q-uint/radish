@@ -14,6 +14,7 @@ const sigrefs = @import("../identity/sigrefs.zig");
 const node_id = @import("../identity/node_id.zig");
 const signature = @import("../crypto/signature.zig");
 const git = @import("git.zig");
+const checkout = @import("checkout.zig");
 const odb = @import("odb.zig");
 
 const DOC_PATH = "embeds/radicle.json";
@@ -22,6 +23,9 @@ const ID_REF = "refs/rad/id";
 const ROOT_REF = "refs/rad/root";
 const MAX_DOC = 1 << 20;
 const MAX_PACKED_REFS = 1 << 24;
+/// What each of a pack's two readers buffers. Paid per pack, and a repository
+/// git has not collected holds dozens.
+const PACK_BUF = 4096;
 const MAX_SIGREFS = 1 << 22;
 const DID_KEY_PREFIX = "did:key:";
 
@@ -123,25 +127,15 @@ const TmpDir = struct {
     }
 };
 
-/// Finds the single packfile under objects/pack and returns its basename
-/// (no extension), copied into `buf`. Packs are named for their content, so
-/// the name is not known ahead of time.
-fn findPack(io: std.Io, dir: std.Io.Dir, buf: []u8) ![]const u8 {
-    var pack_dir = dir.openDir(io, "objects/pack", .{ .iterate = true }) catch
-        return error.PackMissing;
-    defer pack_dir.close(io);
+/// Where `HEAD` points. `target` is null on a detached HEAD; caller owns it.
+pub const Head = struct {
+    target: ?[]u8,
+    oid: gitpack.Oid,
 
-    var it = pack_dir.iterate();
-    while (try it.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".pack")) continue;
-        const base = entry.name[0 .. entry.name.len - ".pack".len];
-        if (base.len > buf.len) return error.PackMissing;
-        @memcpy(buf[0..base.len], base);
-        return buf[0..base.len];
+    pub fn deinit(self: Head, gpa: std.mem.Allocator) void {
+        if (self.target) |t| gpa.free(t);
     }
-    return error.PackMissing;
-}
+};
 
 /// A ref and what it points at, as ls-refs advertises the pair.
 pub const Ref = struct {
@@ -155,7 +149,7 @@ fn lessByName(_: void, a: Ref, b: Ref) bool {
 }
 
 /// Whether `name` is under any of `prefixes`. No prefixes means everything,
-/// which is what a peer asking for no ref-prefix wants.
+/// which is what a peer asking for no `ref-prefix` wants.
 fn matches(name: []const u8, prefixes: []const []const u8) bool {
     if (prefixes.len == 0) return true;
     for (prefixes) |p| {
@@ -209,19 +203,13 @@ pub const Storage = struct {
         return list.toOwnedSlice(gpa);
     }
 
-    /// Whether `name` holds both halves of a pack, which is what
-    /// `Repository.open` needs. An index is written after its pack, so a pack
-    /// alone is what an interrupted clone leaves behind.
+    /// Whether `name` holds objects we could serve. A repository is its
+    /// `objects` directory: packed or loose is git's business, and a
+    /// repository that has only just been written has nothing packed at all.
     fn readable(self: *Storage, name: []const u8) bool {
         var dir = self.dir.openDir(self.io, name, .{}) catch return false;
         defer dir.close(self.io);
-
-        var base_buf: [std.fs.max_name_bytes]u8 = undefined;
-        const base = findPack(self.io, dir, &base_buf) catch return false;
-
-        var name_buf: [std.fs.max_name_bytes]u8 = undefined;
-        const idx = std.fmt.bufPrint(&name_buf, "objects/pack/{s}.idx", .{base}) catch return false;
-        dir.access(self.io, idx, .{}) catch return false;
+        dir.access(self.io, "objects", .{}) catch return false;
         return true;
     }
 
@@ -236,22 +224,72 @@ pub const Storage = struct {
     }
 };
 
-pub const Repository = struct {
-    io: std.Io,
-    dir: std.Io.Dir,
+/// One pack's open files and the buffers its readers borrow. An `odb.Pack` is
+/// only two borrowed readers, so what they read from lives here.
+const OpenPack = struct {
     pack_file: std.Io.File,
     idx_file: std.Io.File,
     pack_reader: std.Io.File.Reader,
     idx_reader: std.Io.File.Reader,
-    repo: gitpack.Repository,
-    /// Reads objects out of the same pack, which gitpack will not do for us.
-    odb: odb.Odb,
     pbuf: []u8,
     ibuf: []u8,
+
+    fn open(
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        dir: std.Io.Dir,
+        base: []const u8,
+    ) !OpenPack {
+        var name: [std.fs.max_name_bytes]u8 = undefined;
+        var self: OpenPack = undefined;
+
+        self.pack_file = try dir.openFile(
+            io,
+            try std.fmt.bufPrint(&name, "objects/pack/{s}.pack", .{base}),
+            .{},
+        );
+        errdefer self.pack_file.close(io);
+        self.idx_file = try dir.openFile(
+            io,
+            try std.fmt.bufPrint(&name, "objects/pack/{s}.idx", .{base}),
+            .{},
+        );
+        errdefer self.idx_file.close(io);
+
+        self.pbuf = try gpa.alloc(u8, PACK_BUF);
+        errdefer gpa.free(self.pbuf);
+        self.ibuf = try gpa.alloc(u8, PACK_BUF);
+        errdefer gpa.free(self.ibuf);
+
+        self.pack_reader = self.pack_file.reader(io, self.pbuf);
+        self.idx_reader = self.idx_file.reader(io, self.ibuf);
+        return self;
+    }
+
+    fn close(self: *OpenPack, io: std.Io, gpa: std.mem.Allocator) void {
+        gpa.free(self.pbuf);
+        gpa.free(self.ibuf);
+        self.idx_file.close(io);
+        self.pack_file.close(io);
+    }
+};
+
+pub const Repository = struct {
+    io: std.Io,
+    dir: std.Io.Dir,
+    /// Every pack the repository has. None is a repository whose objects are
+    /// all still loose, which is what `rad init` leaves behind.
+    packs: []OpenPack,
+    /// What `odb` reads through, pointing into `packs`.
+    views: []odb.Pack,
+    /// The decompressor history a loose read borrows.
+    window: []u8,
+    /// Reads objects wherever they are, which gitpack will not do for us.
+    odb: odb.Odb,
     allocator: std.mem.Allocator,
 
-    /// Opens a radish-cloned bare repo at `path` (dir containing objects/pack
-    /// and refs/). Caller owns it; call `deinit`.
+    /// Opens a bare repo at `path` (a dir holding `objects/` and `refs/`).
+    /// Caller owns it; call `deinit`.
     pub fn open(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !*Repository {
         const self = try allocator.create(Repository);
         errdefer allocator.destroy(self);
@@ -260,37 +298,71 @@ pub const Repository = struct {
         self.dir = try std.Io.Dir.cwd().openDir(io, path, .{});
         errdefer self.dir.close(io);
 
-        var base_buf: [std.fs.max_name_bytes]u8 = undefined;
-        const base = try findPack(io, self.dir, &base_buf);
-        var name_buf: [std.fs.max_name_bytes]u8 = undefined;
+        try self.openPacks();
+        errdefer self.closePacks();
 
-        self.pack_file = try self.dir.openFile(io, try std.fmt.bufPrint(&name_buf, "objects/pack/{s}.pack", .{base}), .{});
-        errdefer self.pack_file.close(io);
-        self.idx_file = try self.dir.openFile(io, try std.fmt.bufPrint(&name_buf, "objects/pack/{s}.idx", .{base}), .{});
-        errdefer self.idx_file.close(io);
+        self.window = try allocator.alloc(u8, std.compress.flate.max_window_len);
+        errdefer allocator.free(self.window);
 
-        self.pbuf = try allocator.alloc(u8, 4096);
-        errdefer allocator.free(self.pbuf);
-        self.ibuf = try allocator.alloc(u8, 4096);
-        errdefer allocator.free(self.ibuf);
-        self.pack_reader = self.pack_file.reader(io, self.pbuf);
-        self.idx_reader = self.idx_file.reader(io, self.ibuf);
         self.odb = .{
             .format = .sha1,
-            .pack = &self.pack_reader,
-            .idx = &self.idx_reader,
+            .packs = self.views,
+            .loose = .{ .io = io, .dir = self.dir, .window = self.window },
         };
 
-        try self.repo.init(allocator, .sha1, &self.pack_reader, &self.idx_reader);
         return self;
     }
 
+    /// Opens every pack under `objects/pack`, which is as many as git left
+    /// there: one per fetch until `git gc --auto` folds them together.
+    fn openPacks(self: *Repository) !void {
+        const gpa = self.allocator;
+        var opened: std.ArrayList(OpenPack) = .empty;
+        errdefer {
+            for (opened.items) |*p| p.close(self.io, gpa);
+            opened.deinit(gpa);
+        }
+
+        // No pack directory at all is a repository with nothing packed, not a
+        // broken one.
+        if (self.dir.openDir(self.io, "objects/pack", .{ .iterate = true })) |*found| {
+            var dir = found.*;
+            defer dir.close(self.io);
+
+            var it = dir.iterate();
+            while (try it.next(self.io)) |entry| {
+                if (entry.kind != .file) continue;
+                if (!std.mem.endsWith(u8, entry.name, ".pack")) continue;
+                const base = entry.name[0 .. entry.name.len - ".pack".len];
+
+                // A pack whose index we cannot open is one we cannot look
+                // anything up in: git writes the index second, so this is a
+                // fetch still in flight rather than a repository to refuse.
+                const p = OpenPack.open(self.io, gpa, self.dir, base) catch continue;
+                try opened.append(gpa, p);
+            }
+        } else |_| {}
+
+        self.packs = try opened.toOwnedSlice(gpa);
+        errdefer {
+            for (self.packs) |*p| p.close(self.io, gpa);
+            gpa.free(self.packs);
+        }
+        self.views = try gpa.alloc(odb.Pack, self.packs.len);
+        for (self.packs, self.views) |*p, *v| {
+            v.* = .{ .pack = &p.pack_reader, .idx = &p.idx_reader };
+        }
+    }
+
+    fn closePacks(self: *Repository) void {
+        for (self.packs) |*p| p.close(self.io, self.allocator);
+        self.allocator.free(self.packs);
+        self.allocator.free(self.views);
+    }
+
     pub fn deinit(self: *Repository) void {
-        self.repo.deinit();
-        self.allocator.free(self.pbuf);
-        self.allocator.free(self.ibuf);
-        self.idx_file.close(self.io);
-        self.pack_file.close(self.io);
+        self.allocator.free(self.window);
+        self.closePacks();
         self.dir.close(self.io);
         self.allocator.destroy(self);
     }
@@ -334,9 +406,7 @@ pub const Repository = struct {
         // blobs are small, so a checkout costs two tiny files.
         var tmp = try TmpDir.create(self.io);
         defer tmp.deinit(self.io);
-        var diags: gitpack.Diagnostics = .{ .allocator = scratch };
-        defer diags.deinit();
-        self.repo.checkout(self.io, tmp.dir, oid, &diags) catch return error.SigrefsMissing;
+        self.checkoutTo(scratch, tmp.dir, oid) catch return error.SigrefsMissing;
 
         const message = tmp.dir.readFileAlloc(self.io, "refs", gpa, .limited(MAX_SIGREFS)) catch
             return error.SigrefsMissing;
@@ -537,9 +607,7 @@ pub const Repository = struct {
         dest: std.Io.Dir,
         commit: gitpack.Oid,
     ) !void {
-        var diags: gitpack.Diagnostics = .{ .allocator = scratch };
-        defer diags.deinit();
-        try self.repo.checkout(self.io, dest, commit, &diags);
+        return checkout.commit(scratch, self.io, &self.odb, dest, commit);
     }
 
     /// Verifies one remote: its sigrefs signature must check out against `nid`,
@@ -658,10 +726,9 @@ pub const Repository = struct {
         return list.toOwnedSlice(gpa);
     }
 
-    /// Whether `oid` is in the pack, which the index answers without decoding
-    /// any pack data.
+    /// Whether the repository holds `oid`, packed or loose.
     pub fn hasObject(self: *Repository, oid: gitpack.Oid) !bool {
-        return (try self.odb.offsetOf(oid)) != null;
+        return self.odb.has(oid);
     }
 
     /// Checks `commit` out to a temp dir and returns the bytes of `path`
@@ -676,10 +743,68 @@ pub const Repository = struct {
     ) ![]u8 {
         var tmp = try TmpDir.create(self.io);
         defer tmp.deinit(self.io);
-        var diags: gitpack.Diagnostics = .{ .allocator = scratch };
-        defer diags.deinit();
-        try self.repo.checkout(self.io, tmp.dir, commit, &diags);
+        try self.checkoutTo(scratch, tmp.dir, commit);
         return tmp.dir.readFileAlloc(self.io, path, gpa, .limited(max));
+    }
+
+    /// Writes the canonical branch and points `HEAD` at it, the pair `rad`
+    /// leaves in its own storage. Neither half is carried on the wire: the
+    /// name is the identity document's, the oid is the delegates' agreement.
+    ///
+    /// Both can move, so call this after every fetch, not only after a clone.
+    /// Source: rad 1.9.1 storage on disk (`HEAD`, `refs/heads/<default>`).
+    pub fn writeHead(self: *Repository, scratch: std.mem.Allocator) !void {
+        var parsed = try self.identityDoc(scratch);
+        defer parsed.deinit();
+        const branch = parsed.doc.project.default_branch;
+        const oid = try self.canonicalHead(scratch);
+
+        var name: [std.fs.max_path_bytes]u8 = undefined;
+        const ref = try std.fmt.bufPrint(&name, "refs/heads/{s}", .{branch});
+        if (std.fs.path.dirnamePosix(ref)) |parent| {
+            try self.dir.createDirPath(self.io, parent);
+        }
+
+        var line: [64]u8 = undefined;
+        try self.dir.writeFile(self.io, .{
+            .sub_path = ref,
+            .data = try std.fmt.bufPrint(&line, "{x}\n", .{oid.slice()}),
+        });
+
+        var head: [std.fs.max_path_bytes]u8 = undefined;
+        try self.dir.writeFile(self.io, .{
+            .sub_path = "HEAD",
+            .data = try std.fmt.bufPrint(&head, "ref: {s}\n", .{ref}),
+        });
+    }
+
+    /// What `HEAD` points at: the ref and its oid, or just the oid when it is
+    /// detached. Null when it names a ref we do not hold.
+    ///
+    /// Kept out of `listRefs` because a radicle peer never asks for it, but a
+    /// git client asks on every clone and cannot check out without it.
+    pub fn headRef(self: *Repository, gpa: std.mem.Allocator) !?Head {
+        const raw = self.dir.readFileAlloc(self.io, "HEAD", gpa, .limited(1024)) catch return null;
+        defer gpa.free(raw);
+        const line = std.mem.trim(u8, raw, " \t\r\n");
+
+        const prefix = "ref: ";
+        if (!std.mem.startsWith(u8, line, prefix)) {
+            const oid = parseOid(line) catch return null;
+            return .{ .target = null, .oid = oid };
+        }
+        const target = line[prefix.len..];
+
+        const refs = try self.listRefs(gpa, &.{target});
+        defer {
+            for (refs) |r| gpa.free(r.name);
+            gpa.free(refs);
+        }
+        for (refs) |r| {
+            if (!std.mem.eql(u8, r.name, target)) continue;
+            return .{ .target = try gpa.dupe(u8, target), .oid = r.oid };
+        }
+        return null;
     }
 
     /// Every ref whose full name starts with one of `prefixes`, or all of them

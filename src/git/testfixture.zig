@@ -50,6 +50,44 @@ pub const Repo = struct {
         return oid;
     }
 
+    /// Commits whatever `script` leaves in the work tree, for the shapes
+    /// `commit` cannot spell: an executable bit, a symlink, a nested tree.
+    /// Runs with the work tree as its cwd.
+    pub fn commitShell(self: *Repo, branch: []const u8, script: []const u8) ![]const u8 {
+        const out = try run(self.alloc, try std.fmt.allocPrint(self.alloc,
+            \\set -e
+            \\cd {s}/src
+            \\git checkout -q -B {s}
+            \\{s}
+            \\git add -A && git commit -qm {s}
+            \\git rev-parse HEAD
+        , .{ self.root, branch, script, branch }));
+        defer self.alloc.free(out);
+
+        const oid = try self.alloc.dupe(u8, std.mem.trim(u8, out, " \t\r\n"));
+        errdefer self.alloc.free(oid);
+        try self.packed_oids.append(self.alloc, oid);
+        return oid;
+    }
+
+    /// Runs `script` in the work tree and takes what it printed as an oid, for
+    /// objects git's porcelain will not write: `mktree` refuses an entry name
+    /// with a slash in it, so a tree that escapes has to be built by hand.
+    /// The oid is owned by the Repo.
+    pub fn craft(self: *Repo, script: []const u8) ![]const u8 {
+        const out = try run(self.alloc, try std.fmt.allocPrint(self.alloc,
+            \\set -e
+            \\cd {s}/src
+            \\{s}
+        , .{ self.root, script }));
+        defer self.alloc.free(out);
+
+        const oid = try self.alloc.dupe(u8, std.mem.trim(u8, out, " \t\r\n"));
+        errdefer self.alloc.free(oid);
+        try self.packed_oids.append(self.alloc, oid);
+        return oid;
+    }
+
     /// Merges `other` into `branch` and returns the merge commit's oid (owned
     /// by the Repo). `--no-ff` so it has two parents even when the merge would
     /// fast-forward, which is the case a walk has to get right.
@@ -146,6 +184,18 @@ pub const Repo = struct {
         self.alloc.free(out);
     }
 
+    /// Writes a loose ref in the bare repo, and points `HEAD` at it.
+    pub fn head(self: *Repo, name: []const u8, oid: []const u8) !void {
+        const out = try run(self.alloc, try std.fmt.allocPrint(self.alloc,
+            \\set -e
+            \\p="{s}/bare/{s}"
+            \\mkdir -p "$(dirname "$p")"
+            \\printf '%s\n' '{s}' > "$p"
+            \\printf 'ref: %s\n' '{s}' > "{s}/bare/HEAD"
+        , .{ self.root, name, oid, name, self.root }));
+        self.alloc.free(out);
+    }
+
     /// Writes `refs/namespaces/<nid>/refs/rad/root` -> `commit_oid`, the
     /// identity COB's root. Real repos publish this per remote; the RID is the
     /// hash of the doc at that commit.
@@ -178,6 +228,41 @@ pub const Repo = struct {
             \\git -C {s}/bare pack-refs --all --prune
         , .{ self.root, self.root }));
         self.alloc.free(out);
+    }
+
+    /// Adds one more pack holding what `spec` names, keeping whatever the bare
+    /// repo already has. Two calls make the shape a repository has after a
+    /// couple of fetches: `git gc --auto` leaves a pack per fetch until there
+    /// are dozens of them.
+    pub fn packOnly(self: *Repo, spec: []const u8) ![]const u8 {
+        const out = try run(self.alloc, try std.fmt.allocPrint(self.alloc,
+            \\set -e
+            \\cd {s}
+            \\git init -q --bare bare
+            \\git -C src rev-list --objects {s} \
+            \\  | git -C src pack-objects "$PWD/bare/objects/pack/pack" >/dev/null 2>&1
+        , .{ self.root, spec }));
+        self.alloc.free(out);
+        return self.bare;
+    }
+
+    /// Writes what `spec` names into the bare repo as loose objects, which is
+    /// how every object starts out and how `rad init` leaves all of them.
+    /// `--literally`, so an object `craft` built by hand copies across as it
+    /// is rather than being validated a second time.
+    pub fn looseOnly(self: *Repo, spec: []const u8) ![]const u8 {
+        const out = try run(self.alloc, try std.fmt.allocPrint(self.alloc,
+            \\set -e
+            \\cd {s}
+            \\git init -q --bare bare
+            \\for o in $(git -C src rev-list --objects {s} | cut -d' ' -f1); do
+            \\  t=$(git -C src cat-file -t "$o")
+            \\  git -C src cat-file "$t" "$o" \
+            \\    | git -C bare hash-object -w -t "$t" --literally --stdin >/dev/null
+            \\done
+        , .{ self.root, spec }));
+        self.alloc.free(out);
+        return self.bare;
     }
 
     /// Packs everything accumulated so far into the bare repo. Call once, last.

@@ -9,9 +9,12 @@
 const std = @import("std");
 const noise = @import("../crypto/noise.zig");
 const signature = @import("../crypto/signature.zig");
+const pktline = @import("../git/pktline.zig");
 const storage = @import("../git/storage.zig");
+const rid = @import("../identity/rid.zig");
 const protocol = @import("protocol.zig");
 const announce = @import("announce.zig");
+const upload = @import("upload.zig");
 
 /// What a node needs to answer a peer.
 pub const Config = struct {
@@ -73,6 +76,9 @@ pub const SessionStats = struct {
     pings: usize = 0,
     subscribes: usize = 0,
     announcements: usize = 0,
+    /// Fetches served, and fetches we refused to serve.
+    fetches: usize = 0,
+    refused: usize = 0,
 };
 
 /// Drives one already-handshaked session to completion: sends the greeting,
@@ -91,26 +97,127 @@ pub fn serveOver(
     var scratch: [protocol.MAX_FRAME_PAYLOAD]u8 = undefined;
     var oids: [protocol.INVENTORY_LIMIT][20]u8 = undefined;
 
+    var held: Held = .{};
+    defer held.deinit(allocator);
+    // A refusal is told once per stream.
+    var refused: ?u64 = null;
+
     while (stats.frames < cfg.max_frames) : (stats.frames += 1) {
-        const msg = protocol.decodeFrameStreaming(r, &scratch, &oids) catch |e| switch (e) {
+        const frame = protocol.readRawFrame(r, &scratch) catch |e| switch (e) {
             error.EndOfStream => break,
             // A peer that sends us garbage is not worth staying connected to,
             // which is what heartwood does with "peer misbehaved".
             else => return e,
         };
-        switch (msg) {
-            .ping => |p| {
-                stats.pings += 1;
-                try pong(allocator, w, p.ponglen);
+        switch (frame) {
+            .gossip => |payload| {
+                const msg = protocol.decodeMessage(payload, &oids) catch continue;
+                switch (msg) {
+                    .ping => |p| {
+                        stats.pings += 1;
+                        try pong(allocator, w, p.ponglen);
+                    },
+                    .node_announced, .inventory_announced => stats.announcements += 1,
+                    .other => |t| {
+                        if (t == .subscribe) stats.subscribes += 1;
+                    },
+                    .pong => {},
+                }
             },
-            .node_announced, .inventory_announced => stats.announcements += 1,
-            .other => |t| {
-                if (t == .subscribe) stats.subscribes += 1;
+            // The whole fetch runs inside this arm: `upload` reads the frames
+            // that follow off the same socket.
+            .git => |g| {
+                if (refused) |id| if (id == g.stream.value) continue;
+                if (!try fetchFor(allocator, r, w, cfg, g, &held, &stats)) {
+                    refused = g.stream.value;
+                }
             },
-            .pong => {},
+            // `open` needs no answer: the stream exists once a frame names it.
+            .control, .unknown => {},
         }
     }
     return stats;
+}
+
+/// What storage holds, read once per session rather than per frame.
+const Held = struct {
+    ids: ?[]rid.RepoId = null,
+
+    fn of(self: *Held, gpa: std.mem.Allocator, store: *storage.Storage) ![]rid.RepoId {
+        if (self.ids) |ids| return ids;
+        self.ids = try store.inventory(gpa);
+        return self.ids.?;
+    }
+
+    fn deinit(self: *Held, gpa: std.mem.Allocator) void {
+        if (self.ids) |ids| gpa.free(ids);
+    }
+};
+
+/// Answers one inbound fetch, or refuses it with an ERR pkt-line rather than a
+/// dropped connection. False when it was refused.
+fn fetchFor(
+    allocator: std.mem.Allocator,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    cfg: Config,
+    frame: anytype,
+    held: *Held,
+    stats: *SessionStats,
+) !bool {
+    const repo = openRequested(allocator, cfg, held, frame.payload) catch |e| {
+        stats.refused += 1;
+        try refuse(allocator, w, frame.stream, @errorName(e));
+        return false;
+    };
+    defer repo.deinit();
+
+    stats.fetches += 1;
+    upload.serve(allocator, r, w, frame.stream, repo) catch |e| switch (e) {
+        // The peer hanging up mid-fetch ends the fetch, not the session.
+        error.EndOfStream => {},
+        else => return e,
+    };
+    return true;
+}
+
+/// The repository the intro line names, if it is one we announce. heartwood
+/// asks its policies the same question at the same point.
+/// Source: radicle-node worker.rs, `is_authorized`.
+fn openRequested(
+    allocator: std.mem.Allocator,
+    cfg: Config,
+    held: *Held,
+    intro: []const u8,
+) !*storage.Repository {
+    const store = cfg.store orelse return error.NoStorage;
+    const req = try protocol.parseGitUploadPackLine(intro);
+    if (!req.version_2) return error.ProtocolVersionUnsupported;
+
+    const id = try rid.RepoId.parse(req.rid);
+    for (try held.of(allocator, store)) |h| {
+        if (std.mem.eql(u8, &h.oid, &id.oid)) return store.repository(allocator, id);
+    }
+    return error.RepositoryNotFound;
+}
+
+/// Tells the peer why it gets nothing, in the one shape a git client reads as
+/// a refusal, and framed the way it would have read the advertisement.
+fn refuse(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    stream: protocol.StreamId,
+    message: []const u8,
+) !void {
+    var line: [128]u8 = undefined;
+    const text = std.fmt.bufPrint(&line, "ERR {s}\n", .{message}) catch return;
+
+    var buf: [160]u8 = undefined;
+    const pkt = try pktline.bufWrite(&buf, text);
+    const out = try protocol.encodeGitFrame(allocator, stream, pkt);
+    defer allocator.free(out);
+    try w.writeAll(out);
+    try w.flush();
 }
 
 /// Binds `port` and serves inbound connections one at a time, until
@@ -148,15 +255,16 @@ pub fn listen(
             const now_ms: u64 = @intCast(@divTrunc(std.Io.Clock.now(.real, io).nanoseconds, std.time.ns_per_ms));
             if (now_ms -| signed_at_ms < INVENTORY_REFRESH_MS) break :refresh;
 
+            // Before the attempt, so a root we cannot read is not rescanned
+            // per connection.
+            signed_at_ms = now_ms;
+
             // The frame we already hold is still true, so a failed rescan is
             // not a reason to drop the peer we just accepted.
             const inv = inventoryFrame(allocator, store, cfg.seed, now_ms) catch |e| {
                 handler.onRefreshFailed(e);
                 break :refresh;
             };
-            // Advanced whatever came back, so an empty root is not rescanned
-            // on every connection.
-            signed_at_ms = now_ms;
 
             if (owned) |frame| allocator.free(frame);
             owned = inv.frame;

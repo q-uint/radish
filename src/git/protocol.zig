@@ -180,7 +180,7 @@ pub fn fetchPack(
             },
             .data => |d| {
                 if (!in_packfile) {
-                    // Section header before the packfile ("packfile\n").
+                    // The section header before the pack: `packfile\n`.
                     if (std.mem.eql(u8, std.mem.trimEnd(u8, d, "\n"), "packfile")) in_packfile = true;
                     continue;
                 }

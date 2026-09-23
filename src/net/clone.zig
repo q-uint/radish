@@ -64,6 +64,13 @@ pub fn overSession(
 
     const report = try repo.verifyAll(allocator, allocator);
 
+    // A repository whose delegates publish no agreed branch has no canonical
+    // head, which is a state to clone and look at, not one to fail on.
+    repo.writeHead(allocator) catch |e| switch (e) {
+        error.BranchMissing, error.DelegatesDiverged, error.DocMissing => {},
+        else => return e,
+    };
+
     return .{ .refs = refs.refs.len, .pack_bytes = pack.items.len, .report = report };
 }
 

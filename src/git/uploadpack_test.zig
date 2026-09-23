@@ -139,7 +139,55 @@ test "ls-refs advertises every ref, or only those under a prefix a peer named" {
     try testing.expectEqualStrings(expected, body[0].data);
 }
 
-test "fetch sends a packfile git can index, and a have narrows it" {
+// A git client asks for HEAD on every clone and cannot check anything out
+// without it. A radicle fetcher never names it, and then it stays unsent.
+test "HEAD is advertised to a peer that asks for it, and to no other" {
+    var s = try fixture.scratch(alloc);
+    defer fixture.destroy(alloc, s);
+    const head = try s.repo.commit("main", "a.txt", "one\n");
+    try s.repo.namespaceRef(NID, "refs/heads/main", head);
+
+    var repo = try openFixture(s);
+    defer repo.deinit();
+    try s.repo.head("refs/heads/main", head);
+
+    const asked = try request(&.{
+        "command=ls-refs\n",
+        "\x01",
+        "symrefs\n",
+        "ref-prefix HEAD\n",
+        "",
+    });
+    defer alloc.free(asked);
+    var got = try serve(repo, asked);
+    defer got.deinit();
+
+    const expected = try std.fmt.allocPrint(
+        alloc,
+        "{s} HEAD symref-target:refs/heads/main\n",
+        .{head},
+    );
+    defer alloc.free(expected);
+    try testing.expectEqualStrings(expected, got.body()[0].data);
+
+    // What the radicle fetcher asks for, which HEAD is not part of.
+    const radicle = try request(&.{
+        "command=ls-refs\n",
+        "\x01",
+        "ref-prefix refs/namespaces\n",
+        "",
+    });
+    defer alloc.free(radicle);
+    var theirs = try serve(repo, radicle);
+    defer theirs.deinit();
+
+    for (theirs.body()) |line| {
+        if (line != .data) continue;
+        try testing.expect(std.mem.indexOf(u8, line.data, "HEAD") == null);
+    }
+}
+
+test "fetch sends a packfile git can index, and a `have` narrows it" {
     var s = try fixture.scratch(alloc);
     defer fixture.destroy(alloc, s);
     const base = try s.repo.commit("main", "a.txt", "one\n");
@@ -164,7 +212,7 @@ test "fetch sends a packfile git can index, and a have narrows it" {
     defer narrowed.deinit();
 
     // A peer that has the base already is not sent it again, which is the
-    // whole point of reading its have lines. Both packs still stand on their
+    // whole point of reading its `have` lines. Both packs still stand on their
     // own, which only real git can say.
     try testing.expect(narrowed.raw.len < full.raw.len);
     try testing.expect(try indexed(s, "full.pack", &full) > 0);

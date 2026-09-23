@@ -177,7 +177,7 @@ pub fn fetchProbeOver(
             else => return e,
         };
         switch (f) {
-            .git => |data| handler.onGit(data),
+            .git => |g| handler.onGit(g.payload),
             .control => |c| handler.onControl(c.ctrl, c.target),
             else => {},
         }
