@@ -8,6 +8,12 @@ Radicle 1.x runs over Noise/TCP. 2.0 moves to QUIC via
 implements 1.x in `src/net/` and is experimenting with 2.x in `src/quic/`;
 storage, identities, sigrefs and COBs are shared.
 
+The 1.x wire has two disclosed flaws, and radish inherits both by matching it:
+the Noise handshake encrypts nothing behind it, so packfiles cross plain TCP,
+and it never proves possession of the static key message 3 claims, so any node
+id can be asserted. Neither is fixable on the 1.x wire, which is why 2.0
+replaces the transport. See [Radicle's disclosure](https://radicle.dev/2026/09/23/disclosure-of-vulnerability-in-network-protocol).
+
 Radish is seeded on the radicle network as [`rad:z4VSyUhaBGUJQrFdS7nWULf1dJdos`](https://rad.0x51.dev/nodes/rad.0x51.dev/rad:z4VSyUhaBGUJQrFdS7nWULf1dJdos), so it can clone itself:
 
 ```

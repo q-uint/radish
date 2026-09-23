@@ -10,7 +10,9 @@
 //!     `ge_scalarmult(clamp(SHA512(seed)[0..32]), peer_point)` (radicle-crypto
 //!     SecretKey::ecdh).
 //!   - nonce counter is LITTLE-endian in the 12-byte ChaCha nonce.
-//!   - an empty payload encrypts to empty (no Poly1305 tag).
+//!   - an empty payload encrypts to empty (no Poly1305 tag). Every payload
+//!     here is empty but message 3's static key, so nothing authenticates the
+//!     transcript: this is the impersonation flaw disclosed 2026-09-23.
 //!   - the protocol name (39 bytes > 32) seeds `h` via SHA-256.
 //! Source: radicle-node/src/wire.rs (NOISE_XK), radicle-crypto/src/lib.rs
 //! (ecdh), cyphernet noise/src/{state,cipher,hkdf}.rs, cyphergraphy ed25519.rs.

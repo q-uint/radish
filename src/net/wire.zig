@@ -247,8 +247,9 @@ fn handshake(ini: *noise.Initiator, r: *std.Io.Reader, w: *std.Io.Writer) !void 
     try w.writeAll(msg[0..n3]);
     try w.flush();
 
-    // The handshake authenticates identity; radicle sends protocol frames
-    // unencrypted over the connection (confirmed on the wire).
+    // Dropped, because radicle sends protocol frames in cleartext behind the
+    // handshake. Nor does the handshake prove the peer holds the static key it
+    // sent; both were disclosed 2026-09-23 and are 2.x's to fix.
     _ = ini.split();
 }
 
