@@ -8,8 +8,16 @@ const std = @import("std");
 const gitpack = @import("gitpack");
 const odb = @import("odb.zig");
 const walk = @import("walk.zig");
+const safepath = @import("../safepath.zig");
 
-pub const Error = error{ NotACommit, NotATree, NotABlob, TreeTooDeep, UnsafeName } || walk.Error;
+pub const Error = error{
+    NotACommit,
+    NotATree,
+    NotABlob,
+    TreeTooDeep,
+    UnsafeName,
+    PathMissing,
+} || walk.Error;
 
 /// Deeper than any tree git writes, shallow enough that a pack naming itself
 /// ends rather than runs out of stack.
@@ -98,23 +106,75 @@ fn tree(
     }
 }
 
-/// Whether `name` is one path component and nothing else. A tree is written by
-/// whoever we fetched it from, and this runs before anything has verified it:
-/// a name carrying a separator or a `..` would write outside `dest`, and a
-/// `.git` would write into the repository checking it out.
+/// One safe component, and not `.git`: a tree is written by whoever we fetched
+/// it from, and a `.git` would write into the repository checking it out.
 ///
 /// Not checked, and gitoxide's `gix-validate` does: the spellings of `.git`
 /// that only some filesystems fold together, NTFS short names (`git~1`) and
 /// HFS+ ignorable code points.
-/// Source: git's `verify_path`, and the `hasDot`/`hasDotdot`/`hasDotgit`/
-/// `fullPathname` checks git-fsck documents.
 fn safeName(name: []const u8) bool {
-    if (name.len == 0) return false;
-    if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
     if (std.ascii.eqlIgnoreCase(name, ".git")) return false;
-    // Backslash included: it separates paths on Windows, and a tree written
-    // there is a tree we may be asked to check out here.
-    return std.mem.indexOfAny(u8, name, "/\\\x00") == null;
+    return safepath.component(name);
+}
+
+/// The blob at `path` under `oid`'s tree, read straight out of the object
+/// database. Caller owns the result.
+///
+/// The alternative is checking the commit out and opening the path, which
+/// resolves through whatever symlinks the tree contains: those targets are
+/// written by whoever served the repository, so the read would leave the tree
+/// and land anywhere in the caller's filesystem. A symlink component here is
+/// refused instead of followed.
+pub fn blobAt(
+    gpa: std.mem.Allocator,
+    o: *odb.Odb,
+    oid: gitpack.Oid,
+    path: []const u8,
+) ![]u8 {
+    const object = try o.read(gpa, oid);
+    defer object.deinit(gpa);
+    if (object.type != .commit) return error.NotACommit;
+
+    var current = try commitTree(o.format, object.data);
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |name| {
+        const entry = (try entryIn(gpa, o, current, name)) orelse return error.PathMissing;
+        const last = it.peek() == null;
+        switch (entry.kind) {
+            .directory => {
+                if (last) return error.NotABlob;
+                current = entry.oid;
+            },
+            .file => {
+                if (!last) return error.PathMissing;
+                return readBlob(gpa, o, entry.oid);
+            },
+            .symlink, .gitlink => return error.UnsafeName,
+        }
+    }
+    return error.PathMissing;
+}
+
+/// Only the fields that outlive the tree object: a `walk.TreeEntry`'s name
+/// borrows bytes this frees.
+const Found = struct { kind: walk.EntryKind, oid: gitpack.Oid };
+
+fn entryIn(
+    gpa: std.mem.Allocator,
+    o: *odb.Odb,
+    tree_oid: gitpack.Oid,
+    name: []const u8,
+) !?Found {
+    const object = try o.read(gpa, tree_oid);
+    defer object.deinit(gpa);
+    if (object.type != .tree) return error.NotATree;
+
+    var entries: walk.Tree = .{ .format = o.format, .data = object.data };
+    while (try entries.next()) |entry| {
+        if (!std.mem.eql(u8, entry.name, name)) continue;
+        return .{ .kind = entry.kind, .oid = entry.oid };
+    }
+    return null;
 }
 
 fn readBlob(gpa: std.mem.Allocator, o: *odb.Odb, oid: gitpack.Oid) ![]u8 {

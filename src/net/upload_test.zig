@@ -3,7 +3,7 @@
 //! The request bytes are the ones `fetch.zig` would put on the wire, so the
 //! two halves are tested against each other.
 const std = @import("std");
-const fixture = @import("../git/testfixture.zig");
+const fixture = @import("../testfixture.zig");
 const pktline = @import("../git/pktline.zig");
 const storage = @import("../git/storage.zig");
 const rid = @import("../identity/rid.zig");
@@ -29,7 +29,7 @@ fn holding(s: *fixture.Scratch) !Held {
     try s.repo.radId(tip);
     const bare = try s.repo.finish();
 
-    const id = try rid.RepoId.fromDoc(DOC);
+    const id = rid.RepoId.fromDoc(DOC);
     const name = try id.encodeBare(alloc);
     defer alloc.free(name);
 
@@ -163,6 +163,48 @@ test "a peer's fetch is answered on its own git stream" {
     try testing.expect(std.mem.indexOf(u8, got.git, "packfile\n") != null);
     try testing.expect(std.mem.indexOf(u8, got.git, "\x01PACK") != null);
     try testing.expect(std.mem.indexOf(u8, got.git, held.tip) != null);
+}
+
+// Holding a private repository must look exactly like not holding it. If the
+// two refusals differ in any byte, the difference confirms the repository
+// exists, which is the one thing its owner asked us not to say.
+test "a private repository is refused indistinguishably from an absent one" {
+    const s = try fixture.scratch(alloc);
+    defer fixture.destroy(alloc, s);
+
+    const nid = try fixture.nidForSeed(alloc, 9);
+    defer alloc.free(nid);
+    const private_doc = try fixture.identityDoc(alloc, nid, true);
+    defer alloc.free(private_doc);
+
+    const tip = try s.repo.commit("main", "embeds/radicle.json", private_doc);
+    try s.repo.radId(tip);
+    const bare = try s.repo.finish();
+
+    const held = rid.RepoId.fromDoc(private_doc);
+    const name = try held.encodeBare(alloc);
+    defer alloc.free(name);
+    const parent = std.fs.path.dirname(bare).?;
+    var dir = try std.Io.Dir.cwd().openDir(testing.io, parent, .{});
+    defer dir.close(testing.io);
+    try dir.rename(std.fs.path.basename(bare), dir, name, testing.io);
+
+    const private_frames = try requestFrames(held, &.{});
+    defer alloc.free(private_frames);
+    const private_answer = try answer(parent, private_frames);
+    defer private_answer.deinit();
+
+    // A RID of a repository this root has never held.
+    const absent = try rid.RepoId.parse("rad:z42hL2jL4XNk6K8oHQaSWfMgCL7ji");
+    const absent_frames = try requestFrames(absent, &.{});
+    defer alloc.free(absent_frames);
+    const absent_answer = try answer(parent, absent_frames);
+    defer absent_answer.deinit();
+
+    try testing.expectEqual(@as(usize, 0), private_answer.stats.fetches);
+    try testing.expectEqual(@as(usize, 1), private_answer.stats.refused);
+    try testing.expectEqualSlices(u8, absent_answer.git, private_answer.git);
+    try testing.expectEqual(absent_answer.stats, private_answer.stats);
 }
 
 // A repository we do not announce is not one a peer gets to name: the

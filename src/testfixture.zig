@@ -10,7 +10,9 @@
 //! scratch `src` repo and packed across into `bare`.
 const std = @import("std");
 const gitpack = @import("gitpack");
-const signature = @import("../crypto/signature.zig");
+const signature = @import("crypto/signature.zig");
+const node_id = @import("identity/node_id.zig");
+const rid = @import("identity/rid.zig");
 const testing = std.testing;
 
 pub const Error = error{ GitUnavailable, GitFailed };
@@ -167,7 +169,7 @@ pub const Repo = struct {
         const seed: [32]u8 = @splat(seed_byte);
         const key = try signature.SecretKey.fromSeed(seed);
         const sig = try key.sign(message.items);
-        const nid = try key.nodeId().encode(self.alloc);
+        const nid = try node_id.NodeId.fromPublicKey(key.publicKey()).encode(self.alloc);
         errdefer self.alloc.free(nid);
 
         try self.sigrefs(nid, message.items, &sig.bytes);
@@ -324,6 +326,45 @@ pub fn scratch(alloc: std.mem.Allocator) !*Scratch {
 pub fn destroy(alloc: std.mem.Allocator, s: *Scratch) void {
     s.deinit();
     alloc.destroy(s);
+}
+
+/// The node id for an all-`seed_byte` secret key. Caller frees.
+pub fn nidForSeed(alloc: std.mem.Allocator, seed_byte: u8) ![]u8 {
+    const seed: [32]u8 = @splat(seed_byte);
+    const key = try signature.SecretKey.fromSeed(seed);
+    return node_id.NodeId.fromPublicKey(key.publicKey()).encode(alloc);
+}
+
+/// An identity document delegating to `nid`. Caller frees.
+pub fn identityDoc(alloc: std.mem.Allocator, nid: []const u8, private: bool) ![]u8 {
+    return std.fmt.allocPrint(
+        alloc,
+        "{{\"delegates\":[\"did:key:{s}\"],\"payload\":{{\"xyz.radicle.project\":" ++
+            "{{\"defaultBranch\":\"main\",\"description\":\"\",\"name\":\"t\"}}}}," ++
+            "\"threshold\":1{s}}}",
+        .{ nid, if (private) ",\"visibility\":{\"type\":\"private\"}" else "" },
+    );
+}
+
+/// A repository holding `doc_bytes` as its identity, filed under its RID in
+/// `root`. Returns the RID name; caller frees.
+pub fn seedRepo(alloc: std.mem.Allocator, root: []const u8, doc_bytes: []const u8) ![]u8 {
+    const s = try scratch(alloc);
+    defer destroy(alloc, s);
+
+    _ = try s.repo.commit("main", "embeds/radicle.json", doc_bytes);
+    const bare = try s.repo.finish();
+
+    const want = rid.RepoId.fromDoc(doc_bytes);
+    const name = try want.encodeBare(alloc);
+    errdefer alloc.free(name);
+
+    var src = try std.Io.Dir.cwd().openDir(testing.io, std.fs.path.dirname(bare).?, .{});
+    defer src.close(testing.io);
+    var dst = try std.Io.Dir.cwd().openDir(testing.io, root, .{});
+    defer dst.close(testing.io);
+    try src.rename(std.fs.path.basename(bare), dst, name, testing.io);
+    return name;
 }
 
 /// Starts a fixture repo under `root` (typically a testing tmpDir realPath).

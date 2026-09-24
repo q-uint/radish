@@ -44,7 +44,11 @@ radish peers       <host>:<port>:<node-id>              nodes seen announcing th
   --frames <n>                                          gossip frames to observe (default 200)
 radish fetch-deps  <manifest> [dir]                     resolve `.rad` dependencies (default .rad-deps)
   --from <host>:<port>:<node-id>                        fetch from this node instead of locating a seed
-radish serve       <port> [sessions]                    answer inbound connections (one at a time)
+radish serve       <port> [sessions] [storage]          answer inbound connections (one at a time)
+                                                        <storage> is a root of <rid> repos to announce
+radish upload-pack <repo>                               serve one git v2 fetch on stdin/stdout,
+                                                        for `git clone --upload-pack`
+radish verify-pack <repo>                               check every pack against its own checksums
 radish quic ping   <host> <port>                        2.x: handshake, then a gossip ping/pong
 radish quic subscribe <host> <port> [messages]          2.x: listen to gossip (default 200)
 radish quic clone  <host> <port> <rid> <dir>            2.x: clone a repo into <dir> (bare)
@@ -83,7 +87,6 @@ zig build
 .radish = .{
     .rad = "z4VSyUhaBGUJQrFdS7nWULf1dJdos",
     .path = ".rad-deps/radish",
-    .rad_hash = "radtree-1-fa8889c5...",
 },
 ```
 
@@ -103,16 +106,15 @@ it to follow `defaultBranch`.
 
 ### Limitations
 
-- Zig requires `url` or `path`, so `.rad` cannot stand alone, and it will not
-  hash a path dependency. Hence the generated `.path` and `.rad_hash`, which
-  radish checks and Zig ignores. Native support needs a `rad` variant of Zig's
-  location union.
+- Zig requires `url` or `path`, so `.rad` cannot stand alone. Hence the
+  generated `.path`, which Zig reads and radish maintains. Native support needs
+  a `rad` variant of Zig's location union.
 - Discovery needs an entry point. The bootstrap seeds in `net/seeds.zig` are
   hardcoded.
 - Without `.rev`, delegates publishing different heads for `defaultBranch` fails
   rather than picking one.
-- No transitive dependencies, no lockfile. A matching `.rad_hash` skips the
-  network; anything else is re-cloned in full.
+- No transitive dependencies, no lockfile. A pinned `.rev` whose checkout is
+  already there skips the network; anything else is re-cloned in full.
 
 ## Radish is NOT a good network citizen
 

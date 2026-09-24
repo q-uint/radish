@@ -60,6 +60,10 @@ pub fn main(init: std.process.Init) !void {
         return uploadPack(init, args[2]);
     }
 
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "verify-pack")) {
+        return verifyPack(init, args[2]);
+    }
+
     // Radicle 2.x, which shares nothing with the commands above but storage.
     if (args.len >= 5 and std.mem.eql(u8, args[1], "quic")) {
         const port = std.fmt.parseInt(u16, args[4], 10) catch return usage();
@@ -157,6 +161,7 @@ fn usage() void {
         \\                                                          <storage> is a root of <rid> repos to announce
         \\  radish upload-pack <repo>                               serve one git v2 fetch on stdin/stdout,
         \\                                                          for `git clone --upload-pack`
+        \\  radish verify-pack <repo>                               check every pack against its own checksums
         \\
         \\radicle 2.x, over QUIC:
         \\  radish quic ping   <host> <port>                        handshake, then a gossip ping/pong
@@ -195,6 +200,11 @@ fn report(
     require_verified: bool,
 ) !void {
     std.debug.print("cloned {s}: {d} refs, {d} pack bytes -> {s}\n", .{ rid_str, result.refs, result.pack_bytes, dir });
+    if (result.damaged_packs > 0) {
+        std.debug.print("  DAMAGED: {d} pack index(es) unreadable, objects may be missing\n", .{
+            result.damaged_packs,
+        });
+    }
 
     for (result.report.verified) |remote| std.debug.print("  verified {s}\n", .{remote});
     for (result.report.failed) |f| std.debug.print("  UNVERIFIED {s}: {s}\n", .{ f.nid, @errorName(f.err) });
@@ -258,8 +268,8 @@ fn announce(init: std.process.Init, t: Target, alias: []const u8) !void {
 
     var seed: [32]u8 = undefined;
     try init.io.randomSecure(&seed);
-    const key = try radish.SecretKey.fromSeed(seed);
-    const our_nid = try key.nodeId().encode(arena);
+    const key = try radish.crypto.SecretKey.fromSeed(seed);
+    const our_nid = try radish.identity.NodeId.fromPublicKey(key.publicKey()).encode(arena);
     std.debug.print("announcing as {s} (alias {s})\n", .{ our_nid, alias });
 
     const zeroes = radish.net.wire.sendAnnouncement(init.io, arena, t.host, t.port, nid, key, alias) catch |e| {
@@ -289,7 +299,7 @@ const GossipPrinter = struct {
         switch (msg) {
             .node_announced => |n| {
                 self.nodes += 1;
-                const id = radish.NodeId.fromPublicKey(n.node).encode(self.arena) catch return;
+                const id = radish.identity.NodeId.fromPublicKey(n.node).encode(self.arena) catch return;
                 std.debug.print("node  {s}  alias={s} agent={s} ts={d} addrs={d}{s}\n", .{
                     id,
                     n.alias,
@@ -301,7 +311,7 @@ const GossipPrinter = struct {
             },
             .inventory_announced => |inv| {
                 self.inventories += 1;
-                const id = radish.NodeId.fromPublicKey(inv.node).encode(self.arena) catch return;
+                const id = radish.identity.NodeId.fromPublicKey(inv.node).encode(self.arena) catch return;
                 std.debug.print("inv   {s}  {d} repos{s}\n", .{
                     id,
                     inv.inventory.len,
@@ -309,7 +319,7 @@ const GossipPrinter = struct {
                 });
                 for (inv.inventory) |oid| {
                     self.rids += 1;
-                    const rid = radish.RepoId.fromOid(oid).encode(self.arena) catch continue;
+                    const rid = radish.identity.RepoId.fromOid(oid).encode(self.arena) catch continue;
                     std.debug.print("        {s}\n", .{rid});
                 }
             },
@@ -365,18 +375,13 @@ fn fetchDeps(init: std.process.Init, manifest_path: []const u8, from: ?[]const u
         else
             dest_name;
 
-        // Hash what is already on disk before touching it. Re-cloning first
-        // would overwrite a locally modified dependency and report the tree it
-        // just wrote, which checks nothing.
-        if (dep.rad_hash) |want| {
-            if (hashOf(init.io, arena, root)) |got| {
-                if (std.mem.eql(u8, want, got)) {
-                    std.debug.print("  rad_hash ok (cached)\n", .{});
-                    try edits.append(arena, .{ .dep = dep.name, .field = "path", .value = root });
-                    continue;
-                }
-                std.debug.print("  local tree does not match rad_hash, refetching\n", .{});
-            } else |_| {}
+        // A pinned rev names one commit, so a checkout already there is the
+        // one it names and the network has nothing to add. Without a pin the
+        // branch may have moved, so it is always fetched.
+        if (dep.rev != null and hasCheckout(init.io, root)) {
+            std.debug.print("  pinned rev already checked out\n", .{});
+            try edits.append(arena, .{ .dep = dep.name, .field = "path", .value = root });
+            continue;
         }
 
         // Clone into a bare repo beside the checkout, since the pack and refs
@@ -445,18 +450,7 @@ fn fetchDeps(init: std.process.Init, manifest_path: []const u8, from: ?[]const u
             if (has_build) "" else "  (no build.zig here)",
         });
 
-        const hash = try hashOf(init.io, arena, root);
-
-        if (dep.rad_hash) |want| {
-            if (!std.mem.eql(u8, want, hash)) {
-                std.debug.print("  rad_hash mismatch\n    want {s}\n    got  {s}\n", .{ want, hash });
-                return error.RadHashMismatch;
-            }
-            std.debug.print("  rad_hash ok\n", .{});
-        }
-
         try edits.append(arena, .{ .dep = dep.name, .field = "path", .value = root });
-        try edits.append(arena, .{ .dep = dep.name, .field = "rad_hash", .value = hash });
     }
 
     // Zig needs a location and has no `rad` variant, so `.rad` is the source of
@@ -522,7 +516,7 @@ fn quicDial(init: std.process.Init, host: []const u8, port: u16) !radish.quic.en
 
 /// The node id a set of options presents.
 fn quicNodeId(arena: std.mem.Allocator, opts: radish.quic.endpoint.Options) ![]u8 {
-    return radish.NodeId.fromPublicKey(opts.identity.public_key.toBytes()).encode(arena);
+    return radish.identity.NodeId.fromPublicKey(opts.identity.public_key.toBytes()).encode(arena);
 }
 
 /// A radicle 2.x ping: the QUIC handshake, then one gossip message each way.
@@ -545,7 +539,7 @@ fn quicPing(init: std.process.Init, host: []const u8, port: u16) !void {
 
     if (c.accepted()) |a| if (a.peer_key) |k| {
         std.debug.print("peer node id: {s}\n", .{
-            try radish.NodeId.fromPublicKey(k).encode(arena),
+            try radish.identity.NodeId.fromPublicKey(k).encode(arena),
         });
     };
     std.debug.print("pong: {d} zeroes\n", .{pong.zeroes});
@@ -744,7 +738,7 @@ fn quicProbe(init: std.process.Init, host: []const u8, port: u16, alpn: []const 
         }
         if (a.alpn_len > 0) std.debug.print("alpn: {s}\n", .{a.alpn()});
         if (a.peer_key) |k| std.debug.print("peer node id: {s}{s}\n", .{
-            try radish.NodeId.fromPublicKey(k).encode(arena),
+            try radish.identity.NodeId.fromPublicKey(k).encode(arena),
             if (a.peer_verified) "" else " (unverified)",
         });
     };
@@ -785,8 +779,8 @@ fn serve(init: std.process.Init, port: u16, sessions: usize, root: ?[]const u8) 
     // source on entropy failure instead of reporting it.
     var seed: [32]u8 = undefined;
     try init.io.randomSecure(&seed);
-    const key = try radish.SecretKey.fromSeed(seed);
-    const nid = try key.nodeId().encode(arena);
+    const key = try radish.crypto.SecretKey.fromSeed(seed);
+    const nid = try radish.identity.NodeId.fromPublicKey(key.publicKey()).encode(arena);
 
     var store: ?radish.git.storage.Storage = null;
     defer if (store) |*s| s.deinit();
@@ -813,6 +807,34 @@ fn serve(init: std.process.Init, port: u16, sessions: usize, root: ?[]const u8) 
     std.debug.print("\nserved {d} sessions\n", .{served});
 }
 
+/// Checks every pack in `repo` against the checksums it carries. Reads both
+/// files whole, which is why it is a command rather than part of opening a
+/// repository.
+fn verifyPack(init: std.process.Init, path: []const u8) !void {
+    var repo = radish.git.storage.Repository.open(init.io, init.gpa, path) catch |e| {
+        std.debug.print("cannot open {s}: {s}\n", .{ path, @errorName(e) });
+        return e;
+    };
+    defer repo.deinit();
+
+    var bad = repo.damaged_packs;
+    if (repo.damaged_packs > 0) {
+        std.debug.print("{d} pack index(es) would not parse and were skipped\n", .{repo.damaged_packs});
+    }
+
+    for (repo.odb.packs, 0..) |pack, i| {
+        if (pack.verify()) {
+            std.debug.print("  pack {d}: ok\n", .{i});
+        } else |e| {
+            bad += 1;
+            std.debug.print("  pack {d}: {s}\n", .{ i, @errorName(e) });
+        }
+    }
+
+    std.debug.print("{d} pack(s) checked, {d} bad\n", .{ repo.odb.packs.len, bad });
+    if (bad > 0) return error.PackDamaged;
+}
+
 /// Serves one git protocol v2 fetch over stdin/stdout, which is how real `git`
 /// runs an upload-pack: `git -c protocol.version=2 clone --upload-pack 'radish
 /// upload-pack' <repo> <dir>`. No transport intro line is read here, since the
@@ -824,6 +846,12 @@ fn uploadPack(init: std.process.Init, path: []const u8) !void {
         return e;
     };
     defer repo.deinit();
+    if (repo.damaged_packs > 0) {
+        std.debug.print("warning: {d} pack index(es) in {s} are unreadable\n", .{
+            repo.damaged_packs,
+            path,
+        });
+    }
 
     // Streaming: stdio is a pipe here, which has no position to seek to. The
     // write side holds one pkt-line, so a sideband line never splits a syscall.
@@ -860,7 +888,7 @@ fn cloneFrom(
 /// own, so the bootstrap list is tried in order until one answers.
 fn locate(init: std.process.Init, rid_str: []const u8, frames: usize) !Target {
     const arena = init.arena.allocator();
-    const want = try radish.RepoId.parse(rid_str);
+    const want = try radish.identity.RepoId.parse(rid_str);
 
     for (radish.net.seeds.BOOTSTRAP) |entry| {
         const boot = Target.parse(entry) orelse continue;
@@ -878,7 +906,7 @@ fn locate(init: std.process.Init, rid_str: []const u8, frames: usize) !Target {
             std.debug.print("  {s}: no seed announced it\n", .{boot.host});
             continue;
         };
-        const id = try radish.NodeId.fromPublicKey(found.node).encode(arena);
+        const id = try radish.identity.NodeId.fromPublicKey(found.node).encode(arena);
         const spec = try std.fmt.allocPrint(arena, "{s}:{s}", .{ found.addr, id });
         // An address that will not parse is this bootstrap node's answer being
         // unusable, not the end of the search.
@@ -893,10 +921,12 @@ fn locate(init: std.process.Init, rid_str: []const u8, frames: usize) !Target {
 }
 
 /// The tree hash of the directory at `path`.
-fn hashOf(io: std.Io, arena: std.mem.Allocator, path: []const u8) ![]u8 {
-    var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
-    defer dir.close(io);
-    return radish.pkg.treehash.hashDir(arena, io, dir);
+/// Whether `path` holds a checkout already. Only ever asked of a pinned rev,
+/// where a directory that is there is the one the pin names.
+fn hasCheckout(io: std.Io, path: []const u8) bool {
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch return false;
+    dir.close(io);
+    return true;
 }
 
 /// A dial target, `host:port:node-id`. All three are required: Noise_XK mixes
@@ -927,8 +957,8 @@ const Target = struct {
     }
 
     /// The parsed node id, which every command needs before dialing.
-    fn nodeId(self: Target) !radish.NodeId {
-        return radish.NodeId.parse(self.nid);
+    fn nodeId(self: Target) !radish.identity.NodeId {
+        return radish.identity.NodeId.parse(self.nid);
     }
 };
 
@@ -949,7 +979,7 @@ fn peers(init: std.process.Init, from: []const u8, frames: usize) !void {
     };
 
     for (collector.peers()) |p| {
-        const id = radish.NodeId.fromPublicKey(p.node).encode(arena) catch continue;
+        const id = radish.identity.NodeId.fromPublicKey(p.node).encode(arena) catch continue;
         std.debug.print("peer  {s}  alias={s}\n", .{ id, p.alias });
         for (p.addrs) |a| std.debug.print("        {s}\n", .{a.text});
     }
@@ -984,7 +1014,7 @@ fn seeds(init: std.process.Init, opts: SeedsOpts) !void {
 
     const target = Target.parse(from) orelse return usage();
     const nid = try target.nodeId();
-    const want = try radish.RepoId.parse(opts.rid);
+    const want = try radish.identity.RepoId.parse(opts.rid);
 
     var collector = radish.net.seeds.Collector.init(arena, want);
     defer collector.deinit();
@@ -996,7 +1026,7 @@ fn seeds(init: std.process.Init, opts: SeedsOpts) !void {
     };
 
     for (collector.seeds()) |node| {
-        const id = radish.NodeId.fromPublicKey(node).encode(arena) catch continue;
+        const id = radish.identity.NodeId.fromPublicKey(node).encode(arena) catch continue;
         std.debug.print("seed  {s}\n", .{id});
     }
     std.debug.print(

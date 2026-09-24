@@ -5,7 +5,7 @@
 //! `Endpoint` must be initialized where it will stay, never returned by value.
 const std = @import("std");
 
-const dial = @import("../net/dial.zig");
+const dial = @import("../dial.zig");
 const connection = @import("connection.zig");
 const packet = @import("packet.zig");
 const profile = @import("profile.zig");

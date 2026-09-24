@@ -13,9 +13,10 @@ const rid = @import("../identity/rid.zig");
 const sigrefs = @import("../identity/sigrefs.zig");
 const node_id = @import("../identity/node_id.zig");
 const signature = @import("../crypto/signature.zig");
-const git = @import("git.zig");
+const githash = @import("../githash.zig");
 const checkout = @import("checkout.zig");
 const odb = @import("odb.zig");
+const walk = @import("walk.zig");
 
 const DOC_PATH = "embeds/radicle.json";
 const ID_REF = "refs/rad/id";
@@ -27,7 +28,6 @@ const MAX_PACKED_REFS = 1 << 24;
 /// git has not collected holds dozens.
 const PACK_BUF = 4096;
 const MAX_SIGREFS = 1 << 22;
-const DID_KEY_PREFIX = "did:key:";
 
 pub const Error = error{
     IdRefMissing,
@@ -86,7 +86,7 @@ fn parseSigrefs(gpa: std.mem.Allocator, message: []const u8) ![]sigrefs.Ref {
     while (lines.next()) |line| {
         if (line.len == 0) continue;
         if (line.len < 42 or line[40] != ' ') return error.SigrefsMalformed;
-        var oid: git.Oid = undefined;
+        var oid: githash.Oid = undefined;
         _ = std.fmt.hexToBytes(&oid, line[0..40]) catch return error.SigrefsMalformed;
         try list.append(gpa, .{ .name = line[41..], .oid = oid });
     }
@@ -98,34 +98,10 @@ pub fn parseOid(hex: []const u8) !gitpack.Oid {
     return gitpack.Oid.parse(.sha1, hex);
 }
 
-/// A uniquely-named directory under the system temp dir, removed on `deinit`.
-/// `std.testing.tmpDir` is test-only (it asserts `is_test` and writes into
-/// .zig-cache), so checkouts on the normal path need this instead.
-const TmpDir = struct {
-    dir: std.Io.Dir,
-    parent: std.Io.Dir,
-    name: [24]u8,
-
-    fn create(io: std.Io) !TmpDir {
-        var random_bytes: [18]u8 = undefined;
-        io.random(&random_bytes);
-        var name: [24]u8 = undefined;
-        _ = std.base64.url_safe.Encoder.encode(&name, &random_bytes);
-
-        // Resolved at build time: reading the environment here would mean
-        // threading process.Init through every caller of Repository.open.
-        var parent = try std.Io.Dir.openDirAbsolute(io, build_options.tmp_dir, .{});
-        errdefer parent.close(io);
-        const dir = try parent.createDirPathOpen(io, &name, .{});
-        return .{ .dir = dir, .parent = parent, .name = name };
-    }
-
-    fn deinit(self: *TmpDir, io: std.Io) void {
-        self.dir.close(io);
-        self.parent.deleteTree(io, &self.name) catch {};
-        self.parent.close(io);
-    }
-};
+/// A radicle oid as the odb wants it. Radicle is sha1; git is not.
+fn packOid(oid: githash.Oid) gitpack.Oid {
+    return gitpack.Oid.fromBytes(.sha1, &oid);
+}
 
 /// Where `HEAD` points. `target` is null on a detached HEAD; caller owns it.
 pub const Head = struct {
@@ -136,6 +112,18 @@ pub const Head = struct {
         if (self.target) |t| gpa.free(t);
     }
 };
+
+/// Whether a walked entry is a ref file. A directory is walked into. Anything
+/// else is a repository we do not understand: a symlinked ref would escape
+/// both the signed-ref check and the advertisement, so it stops us rather than
+/// being skipped.
+fn isRefFile(entry: anytype) !bool {
+    return switch (entry.kind) {
+        .file => true,
+        .directory => false,
+        else => error.UnexpectedRefEntry,
+    };
+}
 
 /// A ref and what it points at, as ls-refs advertises the pair.
 pub const Ref = struct {
@@ -198,9 +186,18 @@ pub const Storage = struct {
             // whatever else it might be.
             const id = rid.RepoId.parse(entry.name) catch continue;
             if (!self.readable(entry.name)) continue;
+            if (!self.isPublic(gpa, id)) continue;
             try list.append(gpa, id);
         }
         return list.toOwnedSlice(gpa);
+    }
+
+    /// Whether `id` may be announced and served. Opens the repository, since
+    /// the answer is a property of its identity document.
+    fn isPublic(self: *Storage, gpa: std.mem.Allocator, id: rid.RepoId) bool {
+        const repo = self.repository(gpa, id) catch return false;
+        defer repo.deinit();
+        return repo.isPublic(gpa, id);
     }
 
     /// Whether `name` holds objects we could serve. A repository is its
@@ -280,8 +277,12 @@ pub const Repository = struct {
     /// Every pack the repository has. None is a repository whose objects are
     /// all still loose, which is what `rad init` leaves behind.
     packs: []OpenPack,
-    /// What `odb` reads through, pointing into `packs`.
+    /// What `odb` reads through, pointing into `packs`. Shorter than `packs`
+    /// when one of them is damaged.
     views: []odb.Pack,
+    /// Packs whose index would not parse, skipped rather than refused. Nonzero
+    /// means the repository is missing whatever only those packs held.
+    damaged_packs: usize = 0,
     /// The decompressor history a loose read borrows.
     window: []u8,
     /// Reads objects wherever they are, which gitpack will not do for us.
@@ -317,6 +318,7 @@ pub const Repository = struct {
     /// there: one per fetch until `git gc --auto` folds them together.
     fn openPacks(self: *Repository) !void {
         const gpa = self.allocator;
+        self.damaged_packs = 0;
         var opened: std.ArrayList(OpenPack) = .empty;
         errdefer {
             for (opened.items) |*p| p.close(self.io, gpa);
@@ -335,10 +337,14 @@ pub const Repository = struct {
                 if (!std.mem.endsWith(u8, entry.name, ".pack")) continue;
                 const base = entry.name[0 .. entry.name.len - ".pack".len];
 
-                // A pack whose index we cannot open is one we cannot look
-                // anything up in: git writes the index second, so this is a
-                // fetch still in flight rather than a repository to refuse.
-                const p = OpenPack.open(self.io, gpa, self.dir, base) catch continue;
+                // git writes the index after the pack, so a pack without one
+                // is a fetch still in flight rather than a repository to
+                // refuse. Anything else, running out of file descriptors most
+                // of all, would silently drop objects we hold.
+                const p = OpenPack.open(self.io, gpa, self.dir, base) catch |e| switch (e) {
+                    error.FileNotFound => continue,
+                    else => return e,
+                };
                 try opened.append(gpa, p);
             }
         } else |_| {}
@@ -349,9 +355,22 @@ pub const Repository = struct {
             gpa.free(self.packs);
         }
         self.views = try gpa.alloc(odb.Pack, self.packs.len);
-        for (self.packs, self.views) |*p, *v| {
-            v.* = .{ .pack = &p.pack_reader, .idx = &p.idx_reader };
+        errdefer gpa.free(self.views);
+
+        // An index that will not parse is damage, not a reason to refuse the
+        // repository: what the other packs and the loose objects hold still
+        // reads. Whatever only this pack held now reports missing, which every
+        // caller treats as a failure rather than as an answer. Counted so the
+        // skip is visible instead of silent.
+        var live: usize = 0;
+        for (self.packs) |*p| {
+            self.views[live] = odb.Pack.init(&p.pack_reader, &p.idx_reader) catch {
+                self.damaged_packs += 1;
+                continue;
+            };
+            live += 1;
         }
+        self.views = try gpa.realloc(self.views, live);
     }
 
     fn closePacks(self: *Repository) void {
@@ -372,20 +391,19 @@ pub const Repository = struct {
     /// Caller owns the returned `Parsed`.
     pub fn identityDoc(self: *Repository, allocator: std.mem.Allocator) !doc.Parsed {
         const root = try self.identityRootOid(allocator);
-        const bytes = self.readFileAt(allocator, allocator, root, DOC_PATH, MAX_DOC) catch
+        const bytes = self.readFileAt(allocator, root, DOC_PATH, MAX_DOC) catch
             return error.DocMissing;
         defer allocator.free(bytes);
         return doc.parse(allocator, bytes);
     }
 
-    /// Raw bytes of `refs/rad/id:embeds/radicle.json`, unverified. Use
-    /// `identityDoc` when the answer has to be trustworthy. gitpack exposes no
-    /// blob-by-path read, so we check the commit out to a temp dir and read the
-    /// file. Caller owns the returned bytes (freed via `gpa`); `scratch` backs
-    /// the checkout diagnostics.
-    pub fn readDocBytes(self: *Repository, gpa: std.mem.Allocator, scratch: std.mem.Allocator) ![]u8 {
+    /// Raw bytes of `refs/rad/id:embeds/radicle.json`, unverified. Nothing
+    /// signs that ref and a clone does not write it, so this answers only for
+    /// storage another tool wrote; use `identityDoc` when it has to be
+    /// trustworthy. Caller owns the bytes.
+    pub fn readDocBytes(self: *Repository, gpa: std.mem.Allocator) ![]u8 {
         const oid = try self.readRef(ID_REF, error.IdRefMissing);
-        return self.readFileAt(gpa, scratch, oid, DOC_PATH, MAX_DOC) catch error.DocMissing;
+        return self.readFileAt(gpa, oid, DOC_PATH, MAX_DOC) catch error.DocMissing;
     }
 
     /// Reads `refs/namespaces/<nid>/refs/rad/sigrefs` and returns the signed
@@ -402,18 +420,11 @@ pub const Repository = struct {
         const ref = try std.fmt.bufPrint(&path_buf, "refs/namespaces/{s}/refs/rad/sigrefs", .{nid});
         const oid = try self.readRef(ref, error.SigrefsMissing);
 
-        // rad writes sigrefs as a commit whose tree is {refs, signature}; both
-        // blobs are small, so a checkout costs two tiny files.
-        var tmp = try TmpDir.create(self.io);
-        defer tmp.deinit(self.io);
-        self.checkoutTo(scratch, tmp.dir, oid) catch return error.SigrefsMissing;
-
-        const message = tmp.dir.readFileAlloc(self.io, "refs", gpa, .limited(MAX_SIGREFS)) catch
+        // rad writes sigrefs as a commit whose tree is {refs, signature}.
+        const message = self.readFileAt(gpa, oid, "refs", MAX_SIGREFS) catch
             return error.SigrefsMissing;
         errdefer gpa.free(message);
-        // limited() errors when the limit is *reached*, so allow one extra byte
-        // and reject anything that is not exactly a 64-byte signature.
-        const raw = tmp.dir.readFileAlloc(self.io, "signature", scratch, .limited(65)) catch
+        const raw = self.readFileAt(scratch, oid, "signature", 64) catch
             return error.SigrefsMissing;
         defer scratch.free(raw);
         if (raw.len != 64) return error.SigrefsMalformed;
@@ -436,7 +447,7 @@ pub const Repository = struct {
     /// Source: heartwood storage/git.rs identity_root / identity_root_of.
     pub fn repoId(self: *Repository, scratch: std.mem.Allocator) !rid.RepoId {
         const root = try self.identityRootOid(scratch);
-        const bytes = self.readFileAt(scratch, scratch, root, DOC_PATH, MAX_DOC) catch
+        const bytes = self.readFileAt(scratch, root, DOC_PATH, MAX_DOC) catch
             return error.DocMissing;
         defer scratch.free(bytes);
         return rid.RepoId.fromDoc(bytes);
@@ -480,7 +491,7 @@ pub const Repository = struct {
         defer signed.deinit(scratch);
         for (signed.signed.refs.entries) |entry| {
             if (!std.mem.eql(u8, entry.name, ROOT_REF)) continue;
-            const signed_oid = gitpack.Oid.fromBytes(.sha1, &entry.oid);
+            const signed_oid = packOid(entry.oid);
             if (!std.mem.eql(u8, signed_oid.slice(), on_disk.slice())) return error.IdRootUnsigned;
             return on_disk;
         }
@@ -496,11 +507,11 @@ pub const Repository = struct {
     /// it can be trusted to say who was allowed to publish that root.
     pub fn checkRepoId(self: *Repository, scratch: std.mem.Allocator, want: rid.RepoId) !void {
         const root = try self.identityRootOid(scratch);
-        const bytes = self.readFileAt(scratch, scratch, root, DOC_PATH, MAX_DOC) catch
+        const bytes = self.readFileAt(scratch, root, DOC_PATH, MAX_DOC) catch
             return error.DocMissing;
         defer scratch.free(bytes);
 
-        const got = try rid.RepoId.fromDoc(bytes);
+        const got = rid.RepoId.fromDoc(bytes);
         if (!std.mem.eql(u8, &got.oid, &want.oid)) return error.RepoIdMismatch;
 
         var parsed = try doc.parse(scratch, bytes);
@@ -517,7 +528,7 @@ pub const Repository = struct {
         delegates: []const []const u8,
     ) !bool {
         for (delegates) |d| {
-            const bare = if (std.mem.startsWith(u8, d, DID_KEY_PREFIX)) d[DID_KEY_PREFIX.len..] else d;
+            const bare = doc.bareNid(d);
             const oid = self.signedRoot(scratch, bare) catch continue orelse continue;
             if (std.mem.eql(u8, oid.slice(), root.slice())) return true;
         }
@@ -531,7 +542,7 @@ pub const Repository = struct {
         var parsed = try self.identityDoc(scratch);
         defer parsed.deinit();
         for (parsed.doc.delegates) |d| {
-            const bare = if (std.mem.startsWith(u8, d, DID_KEY_PREFIX)) d[DID_KEY_PREFIX.len..] else d;
+            const bare = doc.bareNid(d);
             if (std.mem.eql(u8, bare, nid)) return true;
         }
         return false;
@@ -549,7 +560,7 @@ pub const Repository = struct {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         var found: ?gitpack.Oid = null;
         for (parsed.doc.delegates) |d| {
-            const bare = if (std.mem.startsWith(u8, d, DID_KEY_PREFIX)) d[DID_KEY_PREFIX.len..] else d;
+            const bare = doc.bareNid(d);
             const ref = try std.fmt.bufPrint(&buf, "refs/namespaces/{s}/refs/heads/{s}", .{
                 bare, parsed.doc.project.default_branch,
             });
@@ -577,27 +588,23 @@ pub const Repository = struct {
         var parsed = try self.identityDoc(scratch);
         defer parsed.deinit();
 
-        // An exact tip match needs no further argument.
+        // Every tip a delegate signed, then a real walk from them. Pack
+        // membership is not ancestry: the pack is whatever the seed sent, and
+        // a clone fetches every namespace, contributors included.
+        var tips: std.ArrayList(gitpack.Oid) = .empty;
+        defer tips.deinit(scratch);
         for (parsed.doc.delegates) |d| {
-            const bare = if (std.mem.startsWith(u8, d, DID_KEY_PREFIX)) d[DID_KEY_PREFIX.len..] else d;
-            var signed = self.verifyRemote(scratch, scratch, bare) catch continue;
+            var signed = self.verifyRemote(scratch, scratch, doc.bareNid(d)) catch continue;
             defer signed.deinit(scratch);
             for (signed.signed.refs.entries) |entry| {
-                const oid = gitpack.Oid.fromBytes(.sha1, &entry.oid);
-                if (std.mem.eql(u8, oid.slice(), want.slice())) return true;
+                try tips.append(scratch, packOid(entry.oid));
             }
         }
+        // No delegate published anything, so nothing is authorized. Not the
+        // same as `want` being absent, but the answer is the same.
+        if (tips.items.len == 0) return false;
 
-        // Otherwise it is an ancestor: present in a pack whose every tip a
-        // delegate signed. Confirm at least one delegate contributed tips,
-        // so an empty delegate set cannot vacuously authorize anything.
-        for (parsed.doc.delegates) |d| {
-            const bare = if (std.mem.startsWith(u8, d, DID_KEY_PREFIX)) d[DID_KEY_PREFIX.len..] else d;
-            var signed = self.verifyRemote(scratch, scratch, bare) catch continue;
-            defer signed.deinit(scratch);
-            if (signed.signed.refs.entries.len > 0) return true;
-        }
-        return false;
+        return walk.reachesCommit(scratch, &self.odb, tips.items, want);
     }
 
     /// Checks `commit` out into `dest`, which must already exist.
@@ -626,7 +633,7 @@ pub const Repository = struct {
         var signed = try self.readSigrefs(gpa, scratch, nid);
         errdefer signed.deinit(gpa);
         for (signed.signed.refs.entries) |ref| {
-            const oid = gitpack.Oid.fromBytes(.sha1, &ref.oid);
+            const oid = packOid(ref.oid);
             if (!try self.hasObject(oid)) return error.MissingObject;
         }
         try self.checkNamespaceRefs(scratch, nid, signed.signed.refs.entries);
@@ -653,7 +660,7 @@ pub const Repository = struct {
         var walker = try ns.walk(scratch);
         defer walker.deinit();
         while (try walker.next(self.io)) |entry| {
-            if (entry.kind != .file) continue;
+            if (!try isRefFile(entry)) continue;
             if (std.mem.eql(u8, entry.path, sigrefs.SIGREFS_BRANCH)) continue;
 
             var full_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -661,7 +668,7 @@ pub const Repository = struct {
             const on_disk = try self.readRef(full, error.SigrefsMalformed);
 
             const signed_oid = for (entries) |ref| {
-                if (std.mem.eql(u8, ref.name, entry.path)) break gitpack.Oid.fromBytes(.sha1, &ref.oid);
+                if (std.mem.eql(u8, ref.name, entry.path)) break packOid(ref.oid);
             } else return error.UnsignedRef;
             if (!std.mem.eql(u8, on_disk.slice(), signed_oid.slice())) return error.MismatchedRef;
         }
@@ -731,20 +738,55 @@ pub const Repository = struct {
         return self.odb.has(oid);
     }
 
-    /// Checks `commit` out to a temp dir and returns the bytes of `path`
-    /// within it. Caller owns the result (freed via `gpa`).
+    /// Whether this repository may be announced and served to anyone.
+    ///
+    /// The RID is the blob hash of the root identity document, so the odb
+    /// returns that document or nothing and no signature is needed. Remotes'
+    /// own `refs/rad/id` may then deny but never grant, so a liar costs us an
+    /// announcement rather than a leak. Unreadable counts as private, and an
+    /// amendment we cannot read leaves the repository announced.
+    pub fn isPublic(self: *Repository, scratch: std.mem.Allocator, id: rid.RepoId) bool {
+        const root = self.odb.read(scratch, packOid(id.oid)) catch
+            return false;
+        defer root.deinit(scratch);
+        if (root.type != .blob) return false;
+
+        var parsed = doc.parse(scratch, root.data) catch return false;
+        defer parsed.deinit();
+        if (!parsed.doc.visibility.isPublic()) return false;
+
+        const nids = self.remotes(scratch) catch return false;
+        defer {
+            for (nids) |n| scratch.free(n);
+            scratch.free(nids);
+        }
+
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        for (nids) |nid| {
+            const ref = std.fmt.bufPrint(&buf, "refs/namespaces/{s}/{s}", .{ nid, ID_REF }) catch
+                continue;
+            const head = self.readRef(ref, error.IdRefMissing) catch continue;
+            const bytes = checkout.blobAt(scratch, &self.odb, head, DOC_PATH) catch continue;
+            defer scratch.free(bytes);
+            var amended = doc.parse(scratch, bytes) catch continue;
+            defer amended.deinit();
+            if (!amended.doc.visibility.isPublic()) return false;
+        }
+        return true;
+    }
+
+    /// The bytes of `path` in `commit`'s tree. Caller owns the result.
     fn readFileAt(
         self: *Repository,
         gpa: std.mem.Allocator,
-        scratch: std.mem.Allocator,
         commit: gitpack.Oid,
         path: []const u8,
         max: usize,
     ) ![]u8 {
-        var tmp = try TmpDir.create(self.io);
-        defer tmp.deinit(self.io);
-        try self.checkoutTo(scratch, tmp.dir, commit);
-        return tmp.dir.readFileAlloc(self.io, path, gpa, .limited(max));
+        const bytes = try checkout.blobAt(gpa, &self.odb, commit, path);
+        errdefer gpa.free(bytes);
+        if (bytes.len > max) return error.FileTooLarge;
+        return bytes;
     }
 
     /// Writes the canonical branch and points `HEAD` at it, the pair `rad`
@@ -865,7 +907,7 @@ pub const Repository = struct {
         var walker = try root.walk(arena);
         defer walker.deinit();
         while (try walker.next(self.io)) |entry| {
-            if (entry.kind != .file) continue;
+            if (!try isRefFile(entry)) continue;
 
             // A name too long to spell is one we cannot advertise, and no
             // reason to stop advertising the rest.

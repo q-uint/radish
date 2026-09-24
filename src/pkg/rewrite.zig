@@ -183,7 +183,7 @@ test "two appended fields both land, keeping the surrounding indentation" {
     ;
     const out = try apply(testing.allocator, src, &.{
         .{ .dep = "radish", .field = "path", .value = "p" },
-        .{ .dep = "radish", .field = "rad_hash", .value = "h" },
+        .{ .dep = "radish", .field = "rev", .value = "h" },
     });
     defer testing.allocator.free(out);
 
@@ -193,7 +193,7 @@ test "two appended fields both land, keeping the surrounding indentation" {
         \\        .radish = .{
         \\            .rad = "z4VSy",
         \\            .path = "p",
-        \\            .rad_hash = "h",
+        \\            .rev = "h",
         \\        },
         \\    },
         \\}

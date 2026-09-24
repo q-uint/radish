@@ -5,7 +5,7 @@ const std = @import("std");
 const noise = @import("../crypto/noise.zig");
 const node_id = @import("../identity/node_id.zig");
 const protocol = @import("protocol.zig");
-const dial = @import("dial.zig");
+const dial = @import("../dial.zig");
 const announce = @import("announce.zig");
 const signature = @import("../crypto/signature.zig");
 

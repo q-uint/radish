@@ -4,7 +4,7 @@
 const std = @import("std");
 const gitpack = @import("gitpack");
 const storage = @import("storage.zig");
-const fixture = @import("testfixture.zig");
+const fixture = @import("../testfixture.zig");
 const rid = @import("../identity/rid.zig");
 const signature = @import("../crypto/signature.zig");
 
@@ -50,22 +50,32 @@ fn fakeRepo(dir: std.Io.Dir, name: []const u8, exts: []const []const u8) !void {
     }
 }
 
-// An inventory announcement is a promise to serve what it names, so it counts
-// directories we could read objects out of. Whether those objects are packed
-// is git's business and changes under us: `rad init` writes them all loose,
-// and `git gc` packs them later.
-test "inventory counts repositories we could serve, and nothing else" {
+// An inventory announcement is a promise to serve what it names, so a
+// directory only counts when we could read objects out of it AND a delegate
+// signed a document saying it is public. Whether those objects are packed is
+// git's business and changes under us: `rad init` writes them all loose, and
+// `git gc` packs them later.
+test "inventory counts only repositories we may serve" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = buf[0..try tmp.dir.realPath(testing.io, &buf)];
 
+    const nid = try fixture.nidForSeed(alloc, SEED_SORTS_FIRST);
+    defer alloc.free(nid);
+
+    const public_doc = try fixture.identityDoc(alloc, nid, false);
+    defer alloc.free(public_doc);
+    const public = try fixture.seedRepo(alloc, root, public_doc);
+    defer alloc.free(public);
+
+    const private_doc = try fixture.identityDoc(alloc, nid, true);
+    defer alloc.free(private_doc);
+    const private = try fixture.seedRepo(alloc, root, private_doc);
+    defer alloc.free(private);
+
+    // Named for a RID and holding objects, but no identity to vouch for it.
     try fakeRepo(tmp.dir, "z42hL2jL4XNk6K8oHQaSWfMgCL7ji", &.{ "pack", "idx" });
-    // Nothing packed, which is every repository `rad init` has just written.
-    try fakeRepo(tmp.dir, "z4VSyUhaBGUJQrFdS7nWULf1dJdos", &.{});
-    // A pack with no index, which is what an interrupted fetch leaves: that
-    // pack is unreadable, but whatever else the repository holds is not.
-    try fakeRepo(tmp.dir, "z3gqcJUoA1n9HaHKufZs5FCSGazv5", &.{"pack"});
     // Named for a RID, but holding no objects at all.
     try tmp.dir.createDirPath(testing.io, "z2VgCqRhCQAeSgqnbgXo5UqQQUVEu");
     // A repository, but its name is not a RID, so it is not ours to announce.
@@ -76,7 +86,75 @@ test "inventory counts repositories we could serve, and nothing else" {
 
     const ids = try store.inventory(alloc);
     defer alloc.free(ids);
-    try testing.expectEqual(@as(usize, 3), ids.len);
+    try testing.expectEqual(@as(usize, 1), ids.len);
+
+    const name = try ids[0].encodeBare(alloc);
+    defer alloc.free(name);
+    try testing.expectEqualStrings(public, name);
+    try testing.expect(!std.mem.eql(u8, private, name));
+}
+
+// The RID pins the root document, so visibility can only be taken away
+// afterwards, never granted: a remote's own `refs/rad/id` gets to deny.
+test "a remote's amended identity makes a public repository private" {
+    var s = try fixture.scratch(alloc);
+    defer fixture.destroy(alloc, s);
+
+    const nid = try fixture.nidForSeed(alloc, SEED_SORTS_FIRST);
+    defer alloc.free(nid);
+    const public_doc = try fixture.identityDoc(alloc, nid, false);
+    defer alloc.free(public_doc);
+    const private_doc = try fixture.identityDoc(alloc, nid, true);
+    defer alloc.free(private_doc);
+
+    _ = try s.repo.commit("main", "embeds/radicle.json", public_doc);
+    const amended = try s.repo.commit("main", "embeds/radicle.json", private_doc);
+    try s.repo.namespaceRef(nid, "refs/rad/id", amended);
+    const bare = try s.repo.finish();
+
+    var repo = try storage.Repository.open(testing.io, alloc, bare);
+    defer repo.deinit();
+
+    const id = rid.RepoId.fromDoc(public_doc);
+    try testing.expect(!repo.isPublic(alloc, id));
+}
+
+test "a public root with no contradicting remote is public" {
+    var s = try fixture.scratch(alloc);
+    defer fixture.destroy(alloc, s);
+
+    const nid = try fixture.nidForSeed(alloc, SEED_SORTS_FIRST);
+    defer alloc.free(nid);
+    const public_doc = try fixture.identityDoc(alloc, nid, false);
+    defer alloc.free(public_doc);
+
+    const root = try s.repo.commit("main", "embeds/radicle.json", public_doc);
+    try s.repo.namespaceRef(nid, "refs/rad/id", root);
+    const bare = try s.repo.finish();
+
+    var repo = try storage.Repository.open(testing.io, alloc, bare);
+    defer repo.deinit();
+
+    try testing.expect(repo.isPublic(alloc, rid.RepoId.fromDoc(public_doc)));
+}
+
+// The root document is fetched by content address, so a repository that does
+// not hold it cannot be established and is not ours to serve.
+test "a repository without its root document is not public" {
+    var s = try fixture.scratch(alloc);
+    defer fixture.destroy(alloc, s);
+
+    _ = try s.repo.commit("main", "a.txt", "one\n");
+    const bare = try s.repo.finish();
+
+    var repo = try storage.Repository.open(testing.io, alloc, bare);
+    defer repo.deinit();
+
+    const nid = try fixture.nidForSeed(alloc, SEED_SORTS_FIRST);
+    defer alloc.free(nid);
+    const absent = try fixture.identityDoc(alloc, nid, false);
+    defer alloc.free(absent);
+    try testing.expect(!repo.isPublic(alloc, rid.RepoId.fromDoc(absent)));
 }
 
 test "a repository opens by RID out of the storage root" {
@@ -88,7 +166,7 @@ test "a repository opens by RID out of the storage root" {
     const bare = try s.repo.finish();
 
     // Storage names a repository by its RID, so move the fixture under one.
-    const want = try rid.RepoId.fromDoc(doc_bytes);
+    const want = rid.RepoId.fromDoc(doc_bytes);
     const name = try want.encodeBare(alloc);
     defer alloc.free(name);
     try moveInto(bare, name);
@@ -152,7 +230,7 @@ test "reads a namespace's sigrefs, and the namespaces on disk" {
     defer fixture.destroy(alloc, s);
     try s.repo.sigrefs(REAL_SIGREFS_NID, REAL_SIGREFS, &REAL_SIGREFS_SIG);
     // The same genuine signature, filed under a namespace that did not sign it.
-    const foreign = try nidForSeed(SEED_SORTS_FIRST);
+    const foreign = try fixture.nidForSeed(alloc, SEED_SORTS_FIRST);
     defer alloc.free(foreign);
     try s.repo.sigrefs(foreign, REAL_SIGREFS, &REAL_SIGREFS_SIG);
     const bare = try s.repo.finish();
@@ -293,7 +371,7 @@ test "a verified remote need not be a delegate" {
     defer alloc.free(nid);
 
     // A delegate elsewhere signs the root, so the doc is readable.
-    const owner = try nidForSeed(SEED_SORTS_FIRST);
+    const owner = try fixture.nidForSeed(alloc, SEED_SORTS_FIRST);
     defer alloc.free(owner);
     const doc_bytes = try docDelegating(&.{owner});
     defer alloc.free(doc_bytes);
@@ -321,7 +399,7 @@ test "a verified remote need not be a delegate" {
 test "repoId follows the root, not an amended identity head, and checkRepoId agrees" {
     var s = try fixture.scratch(alloc);
     defer fixture.destroy(alloc, s);
-    const signer = try nidForSeed(SEED_SORTS_SECOND);
+    const signer = try fixture.nidForSeed(alloc, SEED_SORTS_SECOND);
     defer alloc.free(signer);
     const root_doc = try docDelegating(&.{signer});
     defer alloc.free(root_doc);
@@ -337,7 +415,7 @@ test "repoId follows the root, not an amended identity head, and checkRepoId agr
     defer repo.deinit();
 
     const got = try repo.repoId(alloc);
-    const want = try rid.RepoId.fromDoc(root_doc);
+    const want = rid.RepoId.fromDoc(root_doc);
     try testing.expectEqualSlices(u8, &want.oid, &got.oid);
 
     try repo.checkRepoId(alloc, want);
@@ -379,9 +457,9 @@ test "isDelegate ignores a peer-supplied refs/rad/id" {
     var s = try fixture.scratch(alloc);
     defer fixture.destroy(alloc, s);
 
-    const signer = try nidForSeed(SEED_SORTS_SECOND);
+    const signer = try fixture.nidForSeed(alloc, SEED_SORTS_SECOND);
     defer alloc.free(signer);
-    const attacker = try nidForSeed(SEED_SORTS_FIRST);
+    const attacker = try fixture.nidForSeed(alloc, SEED_SORTS_FIRST);
     defer alloc.free(attacker);
 
     const root_doc = try docDelegating(&.{signer});
@@ -418,7 +496,7 @@ test "an unsigned refs/rad/root rejects the repository" {
     var s = try fixture.scratch(alloc);
     defer fixture.destroy(alloc, s);
 
-    const honest_nid = try nidForSeed(SEED_SORTS_SECOND);
+    const honest_nid = try fixture.nidForSeed(alloc, SEED_SORTS_SECOND);
     defer alloc.free(honest_nid);
     const honest_doc = try docDelegating(&.{honest_nid});
     defer alloc.free(honest_doc);
@@ -428,7 +506,7 @@ test "an unsigned refs/rad/root rejects the repository" {
     defer alloc.free(honest);
     try s.repo.radRoot(honest, root);
 
-    const attacker = try nidForSeed(SEED_SORTS_FIRST);
+    const attacker = try fixture.nidForSeed(alloc, SEED_SORTS_FIRST);
     defer alloc.free(attacker);
     try s.repo.radRoot(attacker, root);
 
@@ -443,7 +521,7 @@ test "an unsigned refs/rad/root rejects the repository" {
     try testing.expectError(error.SigrefsMissing, repo.identityRootOid(alloc));
 
     // The RID the honest root hashes to would have matched, and does not help.
-    const want = try rid.RepoId.fromDoc(honest_doc);
+    const want = rid.RepoId.fromDoc(honest_doc);
     try testing.expectError(error.SigrefsMissing, repo.checkRepoId(alloc, want));
 }
 
@@ -468,7 +546,7 @@ test "checkRepoId rejects a signed root from a non-delegate remote" {
     var repo = try storage.Repository.open(testing.io, alloc, bare);
     defer repo.deinit();
 
-    const want = try rid.RepoId.fromDoc(doc_bytes);
+    const want = rid.RepoId.fromDoc(doc_bytes);
     try testing.expectError(error.IdRootUnauthorized, repo.checkRepoId(alloc, want));
 }
 
@@ -478,9 +556,9 @@ test "identityRoot rejects delegates that disagree on the root" {
     var s = try fixture.scratch(alloc);
     defer fixture.destroy(alloc, s);
 
-    const a_nid = try nidForSeed(SEED_SORTS_FIRST);
+    const a_nid = try fixture.nidForSeed(alloc, SEED_SORTS_FIRST);
     defer alloc.free(a_nid);
-    const b_nid = try nidForSeed(SEED_SORTS_SECOND);
+    const b_nid = try fixture.nidForSeed(alloc, SEED_SORTS_SECOND);
     defer alloc.free(b_nid);
     const doc_bytes = try docDelegating(&.{ a_nid, b_nid });
     defer alloc.free(doc_bytes);
@@ -511,7 +589,7 @@ test "canonicalHead reads defaultBranch, and the doc, from a delegate namespace"
     var s = try fixture.scratch(alloc);
     defer fixture.destroy(alloc, s);
 
-    const signer = try nidForSeed(SEED_SORTS_SECOND);
+    const signer = try fixture.nidForSeed(alloc, SEED_SORTS_SECOND);
     defer alloc.free(signer);
     const doc_bytes = try docDelegating(&.{signer});
     defer alloc.free(doc_bytes);
@@ -546,7 +624,7 @@ test "canonicalHead reads defaultBranch, and the doc, from a delegate namespace"
     const want = try gitpack.Oid.parse(.sha1, head);
     try testing.expectEqualSlices(u8, want.slice(), got.slice());
 
-    const doc = try repo.readDocBytes(alloc, alloc);
+    const doc = try repo.readDocBytes(alloc);
     defer alloc.free(doc);
     try testing.expectEqualStrings(doc_bytes, doc);
 }
@@ -557,7 +635,7 @@ test "writeHead leaves the branch and HEAD that git needs" {
     var s = try fixture.scratch(alloc);
     defer fixture.destroy(alloc, s);
 
-    const signer = try nidForSeed(SEED_SORTS_SECOND);
+    const signer = try fixture.nidForSeed(alloc, SEED_SORTS_SECOND);
     defer alloc.free(signer);
     const doc_bytes = try docDelegating(&.{signer});
     defer alloc.free(doc_bytes);
@@ -591,9 +669,9 @@ test "canonicalHead rejects delegates that disagree" {
     var s = try fixture.scratch(alloc);
     defer fixture.destroy(alloc, s);
 
-    const a_nid = try nidForSeed(SEED_SORTS_FIRST);
+    const a_nid = try fixture.nidForSeed(alloc, SEED_SORTS_FIRST);
     defer alloc.free(a_nid);
-    const b_nid = try nidForSeed(SEED_SORTS_SECOND);
+    const b_nid = try fixture.nidForSeed(alloc, SEED_SORTS_SECOND);
     defer alloc.free(b_nid);
     const doc_bytes = try docDelegating(&.{ a_nid, b_nid });
     defer alloc.free(doc_bytes);
@@ -632,7 +710,7 @@ test "revPublishedByDelegate accepts an ancestor of a signed tip" {
     var s = try fixture.scratch(alloc);
     defer fixture.destroy(alloc, s);
 
-    const signer = try nidForSeed(SEED_SORTS_SECOND);
+    const signer = try fixture.nidForSeed(alloc, SEED_SORTS_SECOND);
     defer alloc.free(signer);
     const doc_bytes = try docDelegating(&.{signer});
     defer alloc.free(doc_bytes);
@@ -662,11 +740,4 @@ test "revPublishedByDelegate accepts an ancestor of a signed tip" {
     // A commit that is not in the pack at all is not reachable from any tip.
     const absent = try gitpack.Oid.parse(.sha1, "0123456789abcdef0123456789abcdef01234567");
     try testing.expect(!try repo.revPublishedByDelegate(alloc, absent));
-}
-
-/// The node id for a fixture seed byte, matching what `signedRefs` derives.
-fn nidForSeed(seed_byte: u8) ![]u8 {
-    const seed: [32]u8 = @splat(seed_byte);
-    const key = try signature.SecretKey.fromSeed(seed);
-    return key.nodeId().encode(alloc);
 }

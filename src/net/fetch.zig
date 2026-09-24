@@ -10,7 +10,7 @@ const std = @import("std");
 const noise = @import("../crypto/noise.zig");
 const node_id = @import("../identity/node_id.zig");
 const protocol = @import("protocol.zig");
-const dial = @import("dial.zig");
+const dial = @import("../dial.zig");
 
 const GIT_STREAM = protocol.StreamId.git_out.nth(1); // id 12, matches real fetch
 

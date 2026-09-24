@@ -6,7 +6,7 @@ const gitpack = @import("gitpack");
 const pktline = @import("pktline.zig");
 const storage = @import("storage.zig");
 const uploadpack = @import("uploadpack.zig");
-const fixture = @import("testfixture.zig");
+const fixture = @import("../testfixture.zig");
 
 const testing = std.testing;
 const alloc = testing.allocator;

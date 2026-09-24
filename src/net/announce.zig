@@ -128,7 +128,7 @@ pub fn sign(
     const sig = try key.sign(msg_buf.items);
     return .{
         .type = @TypeOf(ann).message_type,
-        .node = key.nodeId(),
+        .node = node_id.NodeId.fromPublicKey(key.publicKey()),
         .sig = sig,
         .message = msg_buf.items,
     };

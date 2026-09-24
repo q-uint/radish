@@ -97,8 +97,6 @@ pub fn serveOver(
     var scratch: [protocol.MAX_FRAME_PAYLOAD]u8 = undefined;
     var oids: [protocol.INVENTORY_LIMIT][20]u8 = undefined;
 
-    var held: Held = .{};
-    defer held.deinit(allocator);
     // A refusal is told once per stream.
     var refused: ?u64 = null;
 
@@ -128,7 +126,7 @@ pub fn serveOver(
             // that follow off the same socket.
             .git => |g| {
                 if (refused) |id| if (id == g.stream.value) continue;
-                if (!try fetchFor(allocator, r, w, cfg, g, &held, &stats)) {
+                if (!try fetchFor(allocator, r, w, cfg, g, &stats)) {
                     refused = g.stream.value;
                 }
             },
@@ -139,21 +137,6 @@ pub fn serveOver(
     return stats;
 }
 
-/// What storage holds, read once per session rather than per frame.
-const Held = struct {
-    ids: ?[]rid.RepoId = null,
-
-    fn of(self: *Held, gpa: std.mem.Allocator, store: *storage.Storage) ![]rid.RepoId {
-        if (self.ids) |ids| return ids;
-        self.ids = try store.inventory(gpa);
-        return self.ids.?;
-    }
-
-    fn deinit(self: *Held, gpa: std.mem.Allocator) void {
-        if (self.ids) |ids| gpa.free(ids);
-    }
-};
-
 /// Answers one inbound fetch, or refuses it with an ERR pkt-line rather than a
 /// dropped connection. False when it was refused.
 fn fetchFor(
@@ -162,10 +145,9 @@ fn fetchFor(
     w: *std.Io.Writer,
     cfg: Config,
     frame: anytype,
-    held: *Held,
     stats: *SessionStats,
 ) !bool {
-    const repo = openRequested(allocator, cfg, held, frame.payload) catch |e| {
+    const repo = openRequested(allocator, cfg, frame.payload) catch |e| {
         stats.refused += 1;
         try refuse(allocator, w, frame.stream, @errorName(e));
         return false;
@@ -181,13 +163,13 @@ fn fetchFor(
     return true;
 }
 
-/// The repository the intro line names, if it is one we announce. heartwood
-/// asks its policies the same question at the same point.
+/// The repository the intro line names, if we may serve it. Asked of that one
+/// repository rather than of the inventory: a peer must not be able to make us
+/// scan and verify every repository we hold by sending one frame.
 /// Source: radicle-node worker.rs, `is_authorized`.
 fn openRequested(
     allocator: std.mem.Allocator,
     cfg: Config,
-    held: *Held,
     intro: []const u8,
 ) !*storage.Repository {
     const store = cfg.store orelse return error.NoStorage;
@@ -195,10 +177,10 @@ fn openRequested(
     if (!req.version_2) return error.ProtocolVersionUnsupported;
 
     const id = try rid.RepoId.parse(req.rid);
-    for (try held.of(allocator, store)) |h| {
-        if (std.mem.eql(u8, &h.oid, &id.oid)) return store.repository(allocator, id);
-    }
-    return error.RepositoryNotFound;
+    const repo = store.repository(allocator, id) catch return error.RepositoryNotFound;
+    errdefer repo.deinit();
+    if (!repo.isPublic(allocator, id)) return error.RepositoryNotFound;
+    return repo;
 }
 
 /// Tells the peer why it gets nothing, in the one shape a git client reads as
@@ -294,7 +276,7 @@ fn accept(
     const ephemeral = try noise.KeyPair.generateDeterministic(eph_seed);
     // noise.KeyPair carries the seed as its secret, matching how the initiator
     // builds one; the node id is the Ed25519 public key over that seed.
-    const static: noise.KeyPair = .{ .secret_key = cfg.seed, .public_key = key.nodeId().key };
+    const static: noise.KeyPair = .{ .secret_key = cfg.seed, .public_key = key.publicKey() };
     var res = noise.Responder.init(static, ephemeral);
 
     var wbuf: [4096]u8 = undefined;
@@ -432,83 +414,4 @@ test "counts a peer's subscribe" {
     const stats = try serveOver(testing.allocator, &r, &w, testConfig(), 1);
     try testing.expectEqual(@as(usize, 1), stats.subscribes);
     try testing.expectEqual(@as(usize, 1), stats.frames);
-}
-
-/// A directory `Storage` will count: named for a RID, holding both halves of
-/// a pack.
-fn fakeRepo(dir: std.Io.Dir, name: []const u8) !void {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    try dir.createDirPath(testing.io, try std.fmt.bufPrint(&buf, "{s}/objects/pack", .{name}));
-    for ([_][]const u8{ "pack", "idx" }) |ext| {
-        const path = try std.fmt.bufPrint(&buf, "{s}/objects/pack/pack-fixture.{s}", .{ name, ext });
-        (try dir.createFile(testing.io, path, .{})).close(testing.io);
-    }
-}
-
-// The greeting claims what we hold, and a peer can check the claim: the frame
-// verifies under our own key.
-test "the greeting carries a signed inventory of what storage holds" {
-    const gpa = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
-
-    var store = try storage.Storage.open(testing.io, gpa, root);
-    defer store.deinit();
-
-    // An empty root still signs to a frame; `listen` is what decides that one
-    // naming nothing is silence rather than a retraction.
-    const empty = try inventoryFrame(gpa, &store, testConfig().seed, 1);
-    defer gpa.free(empty.frame);
-    try testing.expectEqual(@as(usize, 0), empty.count);
-
-    try fakeRepo(tmp.dir, "z42hL2jL4XNk6K8oHQaSWfMgCL7ji");
-    const inv = try inventoryFrame(gpa, &store, testConfig().seed, 1);
-    defer gpa.free(inv.frame);
-    try testing.expectEqual(@as(usize, 1), inv.count);
-
-    var cfg = testConfig();
-    cfg.store = &store;
-    cfg.inventory = inv.frame;
-
-    var out: [8192]u8 = undefined;
-    var w = std.Io.Writer.fixed(&out);
-    var r = std.Io.Reader.fixed(&.{});
-    _ = try serveOver(gpa, &r, &w, cfg, 1);
-
-    var sent = std.Io.Reader.fixed(w.buffered());
-    var scratch: [protocol.MAX_FRAME_PAYLOAD]u8 = undefined;
-    var oids: [8][20]u8 = undefined;
-    _ = try protocol.decodeFrameStreaming(&sent, &scratch, &oids); // node announcement
-    const second = try protocol.decodeFrameStreaming(&sent, &scratch, &oids);
-    try testing.expectEqual(@as(usize, 1), second.inventory_announced.inventory.len);
-    try testing.expect(second.inventory_announced.verified());
-}
-
-// Peers keep the newest announcement and relay it, so an unchanged inventory
-// must sign to the identical frame, or every connection puts a new message on
-// the network for no change. Moving the clock is the refresh that keeps us
-// from expiring out of their tables, and that must produce different bytes.
-test "an unchanged inventory re-signs identically until its timestamp moves" {
-    const gpa = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
-
-    try fakeRepo(tmp.dir, "z42hL2jL4XNk6K8oHQaSWfMgCL7ji");
-
-    var store = try storage.Storage.open(testing.io, gpa, root);
-    defer store.deinit();
-
-    const a = (try inventoryFrame(gpa, &store, testConfig().seed, 1000)).frame;
-    defer gpa.free(a);
-    const b = (try inventoryFrame(gpa, &store, testConfig().seed, 1000)).frame;
-    defer gpa.free(b);
-    const later = (try inventoryFrame(gpa, &store, testConfig().seed, 2000)).frame;
-    defer gpa.free(later);
-
-    try testing.expectEqualSlices(u8, a, b);
-    try testing.expect(!std.mem.eql(u8, a, later));
 }

@@ -1,12 +1,12 @@
-//! Git object types and operations, pure Zig. A blob's object id is the SHA-1
-//! of "blob <len>\0" ++ content; hashing a doc yields its RID.
+//! Git's object id and the hash that produces one. A blob's oid is the SHA-1
+//! of "blob <len>\0" ++ content, so hashing an identity document yields its
+//! RID.
 const std = @import("std");
 
 pub const Oid = [20]u8;
-pub const Error = error{};
 
 /// Computes the git blob object id of `content`.
-pub fn hashBlob(content: []const u8) Error!Oid {
+pub fn blob(content: []const u8) Oid {
     var h = std.crypto.hash.Sha1.init(.{});
     var hdr: [32]u8 = undefined;
     h.update(std.fmt.bufPrint(&hdr, "blob {d}\x00", .{content.len}) catch unreachable);
@@ -17,7 +17,7 @@ pub fn hashBlob(content: []const u8) Error!Oid {
 const testing = std.testing;
 
 fn expectOid(comptime hex: []const u8, content: []const u8) !void {
-    const oid = try hashBlob(content);
+    const oid = blob(content);
     var buf: [40]u8 = undefined;
     _ = std.fmt.bufPrint(&buf, "{x}", .{oid}) catch unreachable;
     try testing.expectEqualStrings(hex, &buf);

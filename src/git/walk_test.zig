@@ -4,7 +4,7 @@ const std = @import("std");
 const gitpack = @import("gitpack");
 const storage = @import("storage.zig");
 const walk = @import("walk.zig");
-const fixture = @import("testfixture.zig");
+const fixture = @import("../testfixture.zig");
 
 const testing = std.testing;
 const alloc = testing.allocator;

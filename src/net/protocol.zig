@@ -272,11 +272,7 @@ pub const Address = struct {
 /// id, not the wrapper carrying it.
 /// Source: radicle-protocol service/message.rs Announcement::verify.
 fn signedBy(node: [32]u8, body: []const u8, sig: [64]u8) bool {
-    signature.verify(
-        node_id.NodeId.fromPublicKey(node),
-        body,
-        .{ .bytes = sig },
-    ) catch return false;
+    signature.verify(node, body, .{ .bytes = sig }) catch return false;
     return true;
 }
 
@@ -703,7 +699,7 @@ test "decode node announcement addresses, and reject an unknown kind" {
     defer body.deinit(testing.allocator);
     const bw = codec.Writer{ .out = &body, .allocator = testing.allocator };
     try bw.writeU16(@backingInt(MessageType.node_announcement));
-    try bw.bytes(&key.nodeId().key);
+    try bw.bytes(&key.publicKey());
     try bw.bytes(&sig.bytes);
     const signed_at = body.items.len;
     try bw.bytes(signed.items);

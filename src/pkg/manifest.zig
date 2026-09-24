@@ -20,9 +20,6 @@ pub const RadDep = struct {
     /// An exact commit to check out. Without it the identity document's
     /// `defaultBranch` is resolved, which moves as the repo is pushed to.
     rev: ?[]const u8,
-    /// Expected hash of the resolved tree. Radish checks this; Zig ignores it,
-    /// since it is not Zig's own `.hash` over its package format.
-    rad_hash: ?[]const u8,
     /// `host:port:node-id` to fetch from, skipping gossip discovery. Lets a
     /// project point at a seed it runs rather than burdening the public ones.
     node: ?[]const u8,
@@ -61,7 +58,6 @@ pub fn radDeps(gpa: std.mem.Allocator, source: [:0]const u8) ![]RadDep {
             .rid = rid,
             .subdir = try optionalString(gpa, ast, dep, "subdir"),
             .rev = try optionalString(gpa, ast, dep, "rev"),
-            .rad_hash = try optionalString(gpa, ast, dep, "rad_hash"),
             .node = try optionalString(gpa, ast, dep, "node"),
         });
     }
@@ -89,7 +85,6 @@ fn freeDep(gpa: std.mem.Allocator, d: RadDep) void {
     gpa.free(d.rid);
     if (d.subdir) |s| gpa.free(s);
     if (d.rev) |s| gpa.free(s);
-    if (d.rad_hash) |s| gpa.free(s);
     if (d.node) |s| gpa.free(s);
 }
 
@@ -108,7 +103,6 @@ test "reads rad dependencies with their pins, ignoring zig's own" {
         \\            .rad = "z4VSyUhaBGUJQrFdS7nWULf1dJdos",
         \\            .subdir = "packages/lib",
         \\            .rev = "b8bd413c6c3adaad672f8700ba84cf0d1d3785c1",
-        \\            .rad_hash = "sha256-0000",
         \\            .node = "rad.0x51.dev:8776:z6Mkhh3TfBZeGW4z4uufMp7caXoBf2wcpDWDrRsELqWqmT6Y",
         \\        },
         \\        .zg = .{
@@ -127,16 +121,14 @@ test "reads rad dependencies with their pins, ignoring zig's own" {
     // Naming only the repo leaves every pin unset.
     try testing.expectEqual(@as(?[]const u8, null), deps[0].subdir);
     try testing.expectEqual(@as(?[]const u8, null), deps[0].rev);
-    try testing.expectEqual(@as(?[]const u8, null), deps[0].rad_hash);
     try testing.expectEqual(@as(?[]const u8, null), deps[0].node);
 
     // subdir: the directory Zig treats as the package root, for a repo whose
-    // build.zig is not at the top level. rev and rad_hash: an exact tree, since
-    // a branch head moves as the repo is pushed to. node: the seed to fetch
+    // build.zig is not at the top level. rev: an exact commit, since a branch
+    // head moves as the repo is pushed to. node: the seed to fetch
     // from, so resolving does not fall on the public bootstrap nodes.
     try testing.expectEqualStrings("packages/lib", deps[1].subdir.?);
     try testing.expectEqualStrings("b8bd413c6c3adaad672f8700ba84cf0d1d3785c1", deps[1].rev.?);
-    try testing.expectEqualStrings("sha256-0000", deps[1].rad_hash.?);
     try testing.expectEqualStrings(
         "rad.0x51.dev:8776:z6Mkhh3TfBZeGW4z4uufMp7caXoBf2wcpDWDrRsELqWqmT6Y",
         deps[1].node.?,

@@ -7,13 +7,13 @@
 //! excluding the sigrefs branch itself and zero oids.
 //! Source: radicle/src/storage/refs.rs (Refs::canonical, SignedRefs).
 const std = @import("std");
-const git = @import("../git/git.zig");
+const githash = @import("../githash.zig");
 const node_id = @import("node_id.zig");
 const signature = @import("../crypto/signature.zig");
 
 pub const SIGREFS_BRANCH = "refs/rad/sigrefs";
 
-pub const Ref = struct { name: []const u8, oid: git.Oid };
+pub const Ref = struct { name: []const u8, oid: githash.Oid };
 
 pub const Refs = struct {
     entries: []const Ref,
@@ -48,7 +48,7 @@ pub const Refs = struct {
     pub fn sign(self: Refs, allocator: std.mem.Allocator, key: signature.SecretKey) !SignedRefs {
         const msg = try self.canonical(allocator);
         defer allocator.free(msg);
-        return .{ .refs = self, .id = key.nodeId(), .sig = try key.sign(msg) };
+        return .{ .refs = self, .id = node_id.NodeId.fromPublicKey(key.publicKey()), .sig = try key.sign(msg) };
     }
 };
 
@@ -61,18 +61,18 @@ pub const SignedRefs = struct {
     pub fn verify(self: SignedRefs, allocator: std.mem.Allocator) !void {
         const msg = try self.refs.canonical(allocator);
         defer allocator.free(msg);
-        try signature.verify(self.id, msg, self.sig);
+        try signature.verify(self.id.key, msg, self.sig);
     }
 };
 
-fn isZero(oid: git.Oid) bool {
+fn isZero(oid: githash.Oid) bool {
     return std.mem.allEqual(u8, &oid, 0);
 }
 
 const testing = std.testing;
 
-fn oidFromHex(comptime hex: *const [40]u8) git.Oid {
-    var oid: git.Oid = undefined;
+fn oidFromHex(comptime hex: *const [40]u8) githash.Oid {
+    var oid: githash.Oid = undefined;
     _ = std.fmt.hexToBytes(&oid, hex) catch unreachable;
     return oid;
 }

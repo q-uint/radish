@@ -62,38 +62,77 @@ pub const max_delta = 1 << 22;
 pub const Pack = struct {
     pack: *std.Io.File.Reader,
     idx: *std.Io.File.Reader,
+    /// fan_out[b] counts the oids whose first byte is at most b. Held rather
+    /// than re-read: it is 1 KiB, every lookup wants two of its entries, and
+    /// the alternative is four seeks per object per pack.
+    fanout: [256]u32,
+
+    /// Validates the index header and takes its fan-out table.
+    pub fn init(pack: *std.Io.File.Reader, idx: *std.Io.File.Reader) !Pack {
+        const r = &idx.interface;
+        try idx.seekTo(0);
+        if (!std.mem.eql(u8, try r.take(4), idx_magic)) return error.BadPackIndex;
+        if (try r.takeInt(u32, .big) != 2) return error.BadPackIndex;
+
+        var fanout: [256]u32 = undefined;
+        try idx.seekTo(fanout_off);
+        for (&fanout) |*slot| slot.* = try r.takeInt(u32, .big);
+        // Buckets count oids at most b, so they only ever grow.
+        for (fanout[1..], fanout[0 .. fanout.len - 1]) |hi, lo| {
+            if (hi < lo) return error.BadPackIndex;
+        }
+        return .{ .pack = pack, .idx = idx, .fanout = fanout };
+    }
+
+    /// Checks both files against the checksums they carry, and that the index
+    /// names this pack. Reads every byte of both, so it belongs behind an
+    /// explicit command rather than on the path that opens a repository.
+    /// Source: gitformat-pack (pack trailer, v2 index trailer).
+    pub fn verify(self: Pack) !void {
+        const pack_sum = try trailerOf(self.pack);
+        if (!std.mem.eql(u8, &pack_sum.carried, &pack_sum.computed)) return error.BadPack;
+
+        const idx_sum = try trailerOf(self.idx);
+        if (!std.mem.eql(u8, &idx_sum.carried, &idx_sum.computed)) return error.BadPackIndex;
+
+        // The 20 bytes before the index's own checksum are the pack's.
+        const size = try self.idx.getSize();
+        if (size < 40) return error.BadPackIndex;
+        try self.idx.seekTo(size - 40);
+        const names = try self.idx.interface.take(20);
+        if (!std.mem.eql(u8, names, &pack_sum.carried)) return error.BadPackIndex;
+    }
+
+    /// Whether `oid`'s first byte has any entries at all here. Answered from
+    /// the fan-out alone, so a pack that cannot hold it costs nothing.
+    pub fn mayHold(self: Pack, oid: gitpack.Oid) bool {
+        const key = oid.slice()[0];
+        const lo: u32 = if (key > 0) self.fanout[key - 1] else 0;
+        return self.fanout[key] != lo;
+    }
 
     /// Where `oid`'s entry starts, or null when this pack does not hold it.
     pub fn offsetOf(self: Pack, format: gitpack.Oid.Format, oid: gitpack.Oid) !?u64 {
-        const n = try self.count();
-        const i = (try self.indexOf(oid, n)) orelse return null;
-        return try self.offsetAt(format, i, n);
+        const i = (try self.indexOf(oid)) orelse return null;
+        return try self.offsetAt(format, i, self.count());
     }
 
     /// Objects in the pack, which is the last fan-out bucket: every entry has
     /// a first byte of 0xff or less.
-    fn count(self: Pack) !u32 {
-        const r = &self.idx.interface;
-        try self.idx.seekTo(0);
-        if (!std.mem.eql(u8, try r.take(4), idx_magic)) return error.BadPackIndex;
-        if (try r.takeInt(u32, .big) != 2) return error.BadPackIndex;
-        try self.idx.seekTo(fanout_off + 255 * 4);
-        return r.takeInt(u32, .big);
+    fn count(self: Pack) u32 {
+        return self.fanout[255];
     }
 
-    /// Binary search of the sorted oid table. fan_out[b] counts the oids whose
-    /// first byte is at most b, so the candidates sit in [fan_out[b-1], fan_out[b]).
-    fn indexOf(self: Pack, oid: gitpack.Oid, n: u32) !?u32 {
+    /// Binary search of the sorted oid table, bracketed by the fan-out: the
+    /// candidates sit in [fan_out[b-1], fan_out[b]).
+    fn indexOf(self: Pack, oid: gitpack.Oid) !?u32 {
         const r = &self.idx.interface;
         const key = oid.slice()[0];
-        var lo: u32 = 0;
-        if (key > 0) {
-            try self.idx.seekTo(fanout_off + (@as(u64, key) - 1) * 4);
-            lo = try r.takeInt(u32, .big);
-        }
-        try self.idx.seekTo(fanout_off + @as(u64, key) * 4);
-        var hi = try r.takeInt(u32, .big);
-        if (hi > n) return error.BadPackIndex;
+        var lo: u32 = if (key > 0) self.fanout[key - 1] else 0;
+        var hi = self.fanout[key];
+        // An empty bucket answers without touching the file at all, which is
+        // the common case for a pack that does not hold the object.
+        if (lo == hi) return null;
 
         const width = oid.slice().len;
         while (lo < hi) {
@@ -178,8 +217,40 @@ pub const Loose = struct {
     window: []u8,
 };
 
+const Trailer = struct { carried: [20]u8, computed: [20]u8 };
+
+/// The SHA-1 a file carries in its last 20 bytes, and the SHA-1 of everything
+/// before them. Both pack and index files end this way.
+fn trailerOf(file: *std.Io.File.Reader) !Trailer {
+    const size = try file.getSize();
+    if (size < 20) return error.BadPack;
+
+    var h = std.crypto.hash.Sha1.init(.{});
+    try file.seekTo(0);
+    var left = size - 20;
+    while (left > 0) {
+        const want: usize = @intCast(@min(left, 4096));
+        h.update(try file.interface.take(want));
+        left -= want;
+    }
+
+    try file.seekTo(size - 20);
+    return .{ .carried = (try file.interface.take(20))[0..20].*, .computed = h.finalResult() };
+}
+
+/// What lookups cost, so where the work goes is measured rather than guessed.
+pub const Stats = struct {
+    /// Packs whose fan-out bucket was not empty, so the index was searched.
+    pack_searches: usize = 0,
+    /// Attempts to open a loose object, hit or miss.
+    loose_opens: usize = 0,
+    /// Those attempts that found a file.
+    loose_hits: usize = 0,
+};
+
 pub const Odb = struct {
     format: gitpack.Oid.Format,
+    stats: Stats = .{},
     /// Every pack in the repository, searched in order. A repository whose
     /// objects have never been collected has none.
     packs: []const Pack,
@@ -211,7 +282,7 @@ pub const Odb = struct {
     pub fn has(self: *Odb, oid: gitpack.Oid) !bool {
         if (try self.locate(oid) != null) return true;
         const l = self.loose orelse return false;
-        var file = openLoose(l, oid) orelse return false;
+        var file = self.openLooseCounted(l, oid) orelse return false;
         file.close(l.io);
         return true;
     }
@@ -248,11 +319,22 @@ pub const Odb = struct {
     /// Where `oid`'s entry is, or null when no pack holds it.
     fn locate(self: *Odb, oid: gitpack.Oid) !?At {
         for (self.packs, 0..) |p, i| {
+            if (!p.mayHold(oid)) continue;
+            self.stats.pack_searches += 1;
             if (try p.offsetOf(self.format, oid)) |offset| {
                 return .{ .pack = i, .offset = offset };
             }
         }
         return null;
+    }
+
+    /// `openLoose`, counted. Every loose read goes through here so the cost of
+    /// consulting loose objects is measurable against the cost of the packs.
+    fn openLooseCounted(self: *Odb, l: Loose, oid: gitpack.Oid) ?std.Io.File {
+        self.stats.loose_opens += 1;
+        const file = openLoose(l, oid) orelse return null;
+        self.stats.loose_hits += 1;
+        return file;
     }
 
     fn readAt(self: *Odb, gpa: std.mem.Allocator, at: At, depth: usize) anyerror!Object {
@@ -288,7 +370,7 @@ pub const Odb = struct {
     /// Source: gitformat-loose.
     fn readLoose(self: *Odb, gpa: std.mem.Allocator, oid: gitpack.Oid) !?Object {
         const l = self.loose orelse return null;
-        var file = openLoose(l, oid) orelse return null;
+        var file = self.openLooseCounted(l, oid) orelse return null;
         defer file.close(l.io);
 
         var buf: [4096]u8 = undefined;
@@ -307,7 +389,7 @@ pub const Odb = struct {
     /// The type a loose object declares, without inflating past its header.
     fn looseType(self: *Odb, oid: gitpack.Oid) !?Type {
         const l = self.loose orelse return null;
-        var file = openLoose(l, oid) orelse return null;
+        var file = self.openLooseCounted(l, oid) orelse return null;
         defer file.close(l.io);
 
         var buf: [4096]u8 = undefined;

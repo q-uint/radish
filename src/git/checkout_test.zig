@@ -1,6 +1,6 @@
 //! Integration tests for `checkout.zig`, against trees real `git` wrote.
 const std = @import("std");
-const fixture = @import("testfixture.zig");
+const fixture = @import("../testfixture.zig");
 const storage = @import("storage.zig");
 
 const testing = std.testing;

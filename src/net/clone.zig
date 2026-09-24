@@ -10,12 +10,16 @@ const fetch = @import("fetch.zig");
 const node_id = @import("../identity/node_id.zig");
 const quic = @import("../quic/mod.zig");
 const repo_id = @import("../identity/rid.zig");
+const safepath = @import("../safepath.zig");
 const storage = @import("../git/storage.zig");
 const gitpack = @import("gitpack");
 
 pub const CloneResult = struct {
     refs: usize,
     pack_bytes: usize,
+    /// Packs the clone wrote whose index will not parse. Never nonzero for a
+    /// clone radish indexed itself, so it is a bug rather than a peer's doing.
+    damaged_packs: usize,
     /// Per-remote verification of what was just written. Remotes are trusted
     /// independently, so a failure here does not invalidate the clone. The
     /// caller decides what to do with an unverified remote.
@@ -71,7 +75,12 @@ pub fn overSession(
         else => return e,
     };
 
-    return .{ .refs = refs.refs.len, .pack_bytes = pack.items.len, .report = report };
+    return .{
+        .refs = refs.refs.len,
+        .pack_bytes = pack.items.len,
+        .damaged_packs = repo.damaged_packs,
+        .report = report,
+    };
 }
 
 /// Clones from a 1.x node: Noise over TCP, git bytes in radicle frames.
@@ -119,16 +128,15 @@ fn packName(pack: []const u8) !PackName {
 }
 
 /// Whether a name the peer advertised is safe to write as a path under the
-/// repo. The peer chooses these and they land on disk verbatim, so anything
-/// that is not a ref, or that could climb out of the repo, is refused.
+/// repo. The peer chooses these and they land on disk verbatim.
+///
+/// Namespaced only, which is both all we ask for and all `verifyAll` checks: a
+/// top-level ref would sit in the clone unverified and be advertised onwards
+/// from there. `refs/heads/<default>` and `HEAD` are derived by `writeHead`
+/// afterwards, never fetched.
 fn safeRefName(name: []const u8) bool {
-    if (!std.mem.startsWith(u8, name, "refs/")) return false;
-    var it = std.mem.splitScalar(u8, name, '/');
-    while (it.next()) |seg| {
-        if (seg.len == 0 or std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return false;
-        if (std.mem.indexOfAny(u8, seg, "\\\x00") != null) return false;
-    }
-    return true;
+    if (!std.mem.startsWith(u8, name, "refs/namespaces/")) return false;
+    return safepath.path(name);
 }
 
 /// Writes a bare repo at `into_path`: the packfile plus its index (built by
@@ -160,6 +168,13 @@ fn indexAndStore(io: std.Io, allocator: std.mem.Allocator, into_path: []const u8
     var idx_writer = idx_file.writer(io, &ibuf);
     try gitpack.indexPack(allocator, .sha1, &pack_reader, &idx_writer, .{ .checksums = true });
     try idx_writer.interface.flush();
+
+    // Both are named for their own contents, so any write to them is damage.
+    // git marks them read-only for the same reason; it stops an accident, not
+    // anything deliberate. Written first because indexing reads the pack back.
+    const read_only = std.Io.File.Permissions.default_file.setReadOnly(true);
+    try pack_file.setPermissions(io, read_only);
+    try idx_file.setPermissions(io, read_only);
 
     // Write each advertised ref as a loose file: refs/... = "<oid>\n".
     for (refs) |ref| {
@@ -200,15 +215,24 @@ test "pack is named after its sha1 trailer" {
 
 // ls-refs returns whatever the peer says it has, and those names become paths.
 test "a ref name that could escape the repo is refused" {
-    try testing.expect(safeRefName("refs/rad/id"));
     try testing.expect(safeRefName("refs/namespaces/z6Mk/refs/heads/main"));
+    try testing.expect(safeRefName("refs/namespaces/z6Mk/refs/rad/sigrefs"));
 
-    try testing.expect(!safeRefName("refs/rad/../../../../tmp/pwned"));
-    try testing.expect(!safeRefName("refs/./rad/id"));
-    try testing.expect(!safeRefName("refs//rad"));
-    try testing.expect(!safeRefName("refs/"));
+    try testing.expect(!safeRefName("refs/namespaces/../../../../tmp/pwned"));
+    try testing.expect(!safeRefName("refs/namespaces/./z6Mk"));
+    try testing.expect(!safeRefName("refs/namespaces//z6Mk"));
+    try testing.expect(!safeRefName("refs/namespaces/"));
     // Not a ref at all: config and HEAD decide what the repo means.
     try testing.expect(!safeRefName("config"));
     try testing.expect(!safeRefName("/etc/passwd"));
-    try testing.expect(!safeRefName("refs/rad\\..\\id"));
+    try testing.expect(!safeRefName("refs/namespaces/z6Mk\\..\\id"));
+}
+
+// Verification only covers `refs/namespaces/<nid>`, so a ref written anywhere
+// else would sit in the clone unverified and be advertised on from there.
+test "a ref outside refs/namespaces is refused, however well-formed" {
+    try testing.expect(!safeRefName("refs/rad/id"));
+    try testing.expect(!safeRefName("refs/rad/root"));
+    try testing.expect(!safeRefName("refs/heads/main"));
+    try testing.expect(!safeRefName("refs/tags/v1.0.0"));
 }

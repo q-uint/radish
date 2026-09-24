@@ -5,7 +5,7 @@
 //! base58btc (`z`); any other base decodes but is rejected.
 const std = @import("std");
 const base58 = @import("../crypto/base58.zig");
-const git = @import("../git/git.zig");
+const githash = @import("../githash.zig");
 
 const RAD_PREFIX = "rad:";
 const MULTIBASE_BTC = 'z';
@@ -18,15 +18,15 @@ pub const Error = error{
 } || base58.Error;
 
 pub const RepoId = struct {
-    oid: git.Oid,
+    oid: githash.Oid,
 
-    pub fn fromOid(oid: git.Oid) RepoId {
+    pub fn fromOid(oid: githash.Oid) RepoId {
         return .{ .oid = oid };
     }
 
     /// Derives the RID from the canonical identity-document bytes.
-    pub fn fromDoc(doc: []const u8) git.Error!RepoId {
-        return .{ .oid = try git.hashBlob(doc) };
+    pub fn fromDoc(doc: []const u8) RepoId {
+        return .{ .oid = githash.blob(doc) };
     }
 
     const max_encoded = base58.encodedLenMax(OID_LEN);
@@ -82,7 +82,7 @@ pub const RepoId = struct {
 const testing = std.testing;
 
 test "round trip" {
-    var oid: git.Oid = undefined;
+    var oid: githash.Oid = undefined;
     var prng = std.Random.DefaultPrng.init(0xc0ffee);
     prng.random().bytes(&oid);
 
@@ -121,7 +121,7 @@ test "parse rejects another multibase, or base58btc that decodes to the wrong le
 test "fromDoc matches git hash-object" {
     // `printf '%s' '{"payload":{},"delegates":[],"threshold":1}' | git hash-object --stdin`
     const doc = "{\"payload\":{},\"delegates\":[],\"threshold\":1}";
-    const rid = try RepoId.fromDoc(doc);
+    const rid = RepoId.fromDoc(doc);
     const expected_oid = [_]u8{
         0xcf, 0x48, 0x6b, 0xca, 0xca, 0x81, 0x3b, 0x85, 0x09, 0x53,
         0x10, 0xf7, 0x83, 0x85, 0xdd, 0x17, 0xa2, 0xa9, 0x30, 0xf1,

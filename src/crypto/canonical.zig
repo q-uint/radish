@@ -159,10 +159,10 @@ test "realistic doc with unicode payload hashes to the expected git oid" {
     try expectEncode(expected, doc);
 
     // printf '%s' <bytes> | git hash-object --stdin
-    const git = @import("../git/git.zig");
+    const githash = @import("../githash.zig");
     const bytes = try encode(testing.allocator, doc);
     defer testing.allocator.free(bytes);
-    const oid = try git.hashBlob(bytes);
+    const oid = githash.blob(bytes);
     var hex: [40]u8 = undefined;
     _ = std.fmt.bufPrint(&hex, "{x}", .{oid}) catch unreachable;
     try testing.expectEqualStrings("4aad12ef5b9691de8eb7c05e1f264a30838eb4ac", &hex);

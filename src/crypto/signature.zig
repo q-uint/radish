@@ -5,7 +5,6 @@
 //! Source: heartwood crates/radicle-crypto/src/lib.rs (Signature Display/FromStr).
 const std = @import("std");
 const base58 = @import("base58.zig");
-const node_id = @import("../identity/node_id.zig");
 
 const Ed = std.crypto.sign.Ed25519;
 const SIG_LEN = Ed.Signature.encoded_length; // 64
@@ -13,6 +12,10 @@ const SEED_LEN = Ed.KeyPair.seed_length; // 32
 const MULTIBASE_BTC = 'z';
 
 pub const Error = error{ InvalidMultibase, InvalidLength } || base58.Error;
+
+/// A raw Ed25519 public key. `identity.NodeId` is this plus the did:key
+/// spelling of it, which is why the name for a key lives up there and not here.
+pub const PublicKey = [Ed.PublicKey.encoded_length]u8;
 
 pub const Signature = struct {
     bytes: [SIG_LEN]u8,
@@ -52,8 +55,8 @@ pub const SecretKey = struct {
         return .{ .pair = try Ed.KeyPair.generateDeterministic(seed) };
     }
 
-    pub fn nodeId(self: SecretKey) node_id.NodeId {
-        return node_id.NodeId.fromPublicKey(self.pair.public_key.toBytes());
+    pub fn publicKey(self: SecretKey) PublicKey {
+        return self.pair.public_key.toBytes();
     }
 
     pub fn sign(self: SecretKey, msg: []const u8) !Signature {
@@ -62,9 +65,9 @@ pub const SecretKey = struct {
     }
 };
 
-/// Verifies `sig` over `msg` under the public key in `nid`.
-pub fn verify(nid: node_id.NodeId, msg: []const u8, sig: Signature) !void {
-    const pk = try Ed.PublicKey.fromBytes(nid.key);
+/// Verifies `sig` over `msg` under `key`.
+pub fn verify(key: PublicKey, msg: []const u8, sig: Signature) !void {
+    const pk = try Ed.PublicKey.fromBytes(key);
     const s = Ed.Signature.fromBytes(sig.bytes);
     try s.verify(msg, pk);
 }
@@ -92,8 +95,8 @@ test "sign matches RFC 8032 TEST 2, and verify accepts only that message" {
     const sk = try SecretKey.fromSeed(RFC_SEED);
     const sig = try sk.sign(&RFC_MSG);
     try testing.expectEqualSlices(u8, &RFC_SIG, &sig.bytes);
-    try verify(sk.nodeId(), &RFC_MSG, sig);
-    try testing.expectError(error.SignatureVerificationFailed, verify(sk.nodeId(), "wrong", sig));
+    try verify(sk.publicKey(), &RFC_MSG, sig);
+    try testing.expectError(error.SignatureVerificationFailed, verify(sk.publicKey(), "wrong", sig));
 }
 
 test "signature string round trips" {

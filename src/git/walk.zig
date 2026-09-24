@@ -169,6 +169,40 @@ pub fn missing(
     return out.toOwnedSlice(gpa);
 }
 
+/// Whether `want` is one of `tips` or lies behind one, following commits and
+/// tags only. Trees are enqueued but never expanded: a rev is a commit, and
+/// walking content would cost the whole repository to answer a graph question.
+///
+/// An oid we cannot read is skipped rather than fatal. One delegate's tips
+/// being incomplete is not an answer about the others'.
+pub fn reachesCommit(
+    gpa: std.mem.Allocator,
+    o: *odb.Odb,
+    tips: []const gitpack.Oid,
+    want: gitpack.Oid,
+) !bool {
+    var seen: Set = .empty;
+    defer seen.deinit(gpa);
+
+    var queue: std.ArrayList(gitpack.Oid) = .empty;
+    defer queue.deinit(gpa);
+    try queue.appendSlice(gpa, tips);
+
+    while (queue.pop()) |oid| {
+        if ((try seen.getOrPut(gpa, oid)).found_existing) continue;
+        if (std.mem.eql(u8, oid.slice(), want.slice())) return true;
+
+        const kind = o.typeOf(oid) catch continue;
+        if (kind != .commit and kind != .tag) continue;
+
+        const obj = o.read(gpa, oid) catch continue;
+        defer obj.deinit(gpa);
+        var links: Links = .{ .format = o.format, .kind = kind, .data = obj.data };
+        while (try links.next()) |next| try queue.append(gpa, next);
+    }
+    return false;
+}
+
 /// Marks everything behind `tips` as the peer's already. An oid we do not hold
 /// is skipped rather than fatal: a peer may name a `have` from a history we
 /// never stored, and all that costs us is a larger pack.

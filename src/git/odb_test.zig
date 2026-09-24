@@ -4,7 +4,7 @@ const std = @import("std");
 const gitpack = @import("gitpack");
 const odb = @import("odb.zig");
 const storage = @import("storage.zig");
-const fixture = @import("testfixture.zig");
+const fixture = @import("../testfixture.zig");
 
 const testing = std.testing;
 const alloc = testing.allocator;
@@ -134,6 +134,95 @@ test "objects are read across every pack and the loose ones" {
         defer obj.deinit(alloc);
         try testing.expectEqualSlices(u8, oid.slice(), oidOf(obj).slice());
     }
+}
+
+// Which source a lookup spends its work on. A packed object is found without
+// opening a loose file, and a loose one is opened exactly once. How many packs
+// get searched is not pinned: the fan-out gates them on the oid's first byte,
+// so it depends on the hashes git happened to produce.
+test "a packed read opens no loose file, and a loose read opens exactly one" {
+    const s = try fixture.scratch(alloc);
+    defer fixture.destroy(alloc, s);
+
+    const packed_commit = try s.repo.commit("main", "a.txt", "one\n");
+    const loose_commit = try s.repo.commit("main", "b.txt", "two\n");
+    const since = try std.fmt.allocPrint(alloc, "{s} ^{s}", .{ loose_commit, packed_commit });
+    defer alloc.free(since);
+
+    _ = try s.repo.packOnly(packed_commit);
+    const bare = try s.repo.looseOnly(since);
+
+    var repo = try storage.Repository.open(testing.io, alloc, bare);
+    defer repo.deinit();
+    try testing.expectEqual(@as(usize, 1), repo.packs.len);
+
+    {
+        const obj = try repo.odb.read(alloc, try storage.parseOid(loose_commit));
+        defer obj.deinit(alloc);
+    }
+    try testing.expectEqual(@as(usize, 1), repo.odb.stats.loose_opens);
+    try testing.expectEqual(@as(usize, 1), repo.odb.stats.loose_hits);
+    try testing.expect(repo.odb.stats.pack_searches <= repo.packs.len);
+
+    repo.odb.stats = .{};
+    {
+        const obj = try repo.odb.read(alloc, try storage.parseOid(packed_commit));
+        defer obj.deinit(alloc);
+    }
+    try testing.expectEqual(@as(usize, 1), repo.odb.stats.pack_searches);
+    try testing.expectEqual(@as(usize, 0), repo.odb.stats.loose_opens);
+}
+
+// A damaged index costs whatever only that pack held, not the repository: the
+// loose objects and any other pack still read, and the damage is counted so it
+// is visible rather than silent. `git` degrades the same way.
+test "a pack whose index will not parse is skipped and counted" {
+    const s = try fixture.scratch(alloc);
+    defer fixture.destroy(alloc, s);
+
+    const packed_commit = try s.repo.commit("main", "a.txt", "one\n");
+    const loose_commit = try s.repo.commit("main", "b.txt", "two\n");
+    const since = try std.fmt.allocPrint(alloc, "{s} ^{s}", .{ loose_commit, packed_commit });
+    defer alloc.free(since);
+
+    _ = try s.repo.packOnly(packed_commit);
+    const bare = try s.repo.looseOnly(since);
+
+    // Replace the index git just wrote with garbage, which is what a damaged
+    // one looks like to anything reading it. git writes packs read-only, so
+    // the old file goes before the new one lands.
+    {
+        var dir = try std.Io.Dir.cwd().openDir(testing.io, bare, .{});
+        defer dir.close(testing.io);
+        var pack_dir = try dir.openDir(testing.io, "objects/pack", .{ .iterate = true });
+        defer pack_dir.close(testing.io);
+
+        var name_buf: [std.fs.max_name_bytes]u8 = undefined;
+        var idx_name: ?[]const u8 = null;
+        var it = pack_dir.iterate();
+        while (try it.next(testing.io)) |entry| {
+            if (!std.mem.endsWith(u8, entry.name, ".idx")) continue;
+            @memcpy(name_buf[0..entry.name.len], entry.name);
+            idx_name = name_buf[0..entry.name.len];
+            break;
+        }
+
+        const name = idx_name orelse return error.NoIndexToDamage;
+        try pack_dir.deleteFile(testing.io, name);
+        try pack_dir.writeFile(testing.io, .{ .sub_path = name, .data = "XXXXXXXX" });
+    }
+
+    var repo = try storage.Repository.open(testing.io, alloc, bare);
+    defer repo.deinit();
+    try testing.expectEqual(@as(usize, 1), repo.damaged_packs);
+    try testing.expectEqual(@as(usize, 0), repo.odb.packs.len);
+
+    // What the broken pack held is gone.
+    try testing.expect(!try repo.hasObject(try storage.parseOid(packed_commit)));
+    // What it did not hold still reads.
+    const obj = try repo.odb.read(alloc, try storage.parseOid(loose_commit));
+    defer obj.deinit(alloc);
+    try testing.expectEqual(@as(odb.Type, .commit), obj.type);
 }
 
 test "an oid the repository does not hold is missing rather than wrong" {
