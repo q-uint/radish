@@ -9,6 +9,7 @@ pub const dial = @import("dial.zig");
 pub const crypto = @import("crypto/mod.zig");
 pub const identity = @import("identity/mod.zig");
 pub const quic = @import("quic/mod.zig");
+pub const iroh = @import("iroh/mod.zig");
 pub const git = @import("git/mod.zig");
 pub const net = @import("net/mod.zig");
 pub const pkg = @import("pkg/mod.zig");
@@ -22,6 +23,7 @@ test {
     _ = crypto;
     _ = identity;
     _ = quic;
+    _ = iroh;
     _ = git;
     _ = net;
     _ = pkg;
