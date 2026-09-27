@@ -47,6 +47,19 @@ pub const NodeId = struct {
         return nid;
     }
 
+    /// The same text `encode` produces, without an allocator: `max_encoded`
+    /// bounds the base58 of a payload this size, so the buffer always fits.
+    pub fn format(self: NodeId, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        var payload: [payload_len]u8 = undefined;
+        @memcpy(payload[0..2], &MULTICODEC_ED25519);
+        @memcpy(payload[2..], &self.key);
+
+        var buf: [max_encoded]u8 = undefined;
+        const b58 = base58.encodeBuf(&buf, &payload) catch unreachable;
+        try w.writeByte(MULTIBASE_BTC);
+        try w.writeAll(b58);
+    }
+
     /// Renders the NodeId as a `z6Mk...` string. Caller owns the result.
     pub fn encode(self: NodeId, allocator: std.mem.Allocator) base58.Error![]u8 {
         var payload: [MULTICODEC_ED25519.len + KEY_LEN]u8 = undefined;

@@ -5,6 +5,7 @@ const std = @import("std");
 const noise = @import("../crypto/noise.zig");
 const node_id = @import("../identity/node_id.zig");
 const protocol = @import("protocol.zig");
+const repo_id = @import("../identity/rid.zig");
 const dial = @import("../dial.zig");
 const announce = @import("announce.zig");
 const signature = @import("../crypto/signature.zig");
@@ -134,7 +135,7 @@ pub fn fetchProbe(
     host: []const u8,
     port: u16,
     nid: node_id.NodeId,
-    rid: []const u8,
+    rid: repo_id.RepoId,
     max_frames: usize,
     handler: anytype,
 ) !usize {
@@ -150,7 +151,7 @@ pub fn fetchProbeOver(
     allocator: std.mem.Allocator,
     r: *std.Io.Reader,
     w: *std.Io.Writer,
-    rid: []const u8,
+    rid: repo_id.RepoId,
     max_frames: usize,
     handler: anytype,
 ) !usize {
@@ -384,7 +385,8 @@ test "fetch-probe opens a git stream and sends the upload-pack intro" {
     var r = std.Io.Reader.fixed(&.{});
 
     var rec = Recorder{ .alloc = testing.allocator };
-    _ = try fetchProbeOver(testing.allocator, &r, &w, "rad:z4VSyUhaBGUJQrFdS7nWULf1dJdos", 10, &rec);
+    const id = try repo_id.RepoId.parse("rad:z4VSyUhaBGUJQrFdS7nWULf1dJdos");
+    _ = try fetchProbeOver(testing.allocator, &r, &w, id, 10, &rec);
 
     const git_stream = protocol.StreamId.git_out.nth(1);
     const open = try protocol.encodeControlFrame(testing.allocator, .open, git_stream);

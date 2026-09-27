@@ -1,189 +1,272 @@
 const std = @import("std");
 const radish = @import("radish");
 
+const cli = radish.args;
+const Arg = cli.Arg;
+const Flag = cli.Flag;
+
+const NodeId = radish.identity.NodeId;
+const RepoId = radish.identity.RepoId;
+
+/// Shared so a description is written once and reads the same everywhere.
+const host_help = "hostname or address of the node";
+const port_help = "TCP port, usually 8776";
+const node_id_help = "the node's z6Mk... identity";
+const rid_help = "repository id, rad:z...";
+const seed_help = "a seed, as host:port:node-id";
+const repo_help = "path to a bare repo: a dir of objects/ and refs/";
+const dir_help = "path for the bare repo, created if missing";
+const manifest_help = "path to a build.zig.zon";
+
+const Ping = struct {
+    pub const about = "dial a node, handshake, ping/pong";
+    host: Arg([]const u8, host_help),
+    port: Arg(u16, port_help),
+    node_id: Arg(NodeId, node_id_help),
+};
+
+const Announce = struct {
+    pub const about = "send a signed NodeAnnouncement";
+    host: Arg([]const u8, host_help),
+    port: Arg(u16, port_help),
+    node_id: Arg(NodeId, node_id_help),
+    alias: Arg([]const u8, "the name to announce ourselves under") = .{ .value = "radish" },
+};
+
+const Subscribe = struct {
+    pub const about = "listen to gossip: nodes and inventory";
+    host: Arg([]const u8, host_help),
+    port: Arg(u16, port_help),
+    node_id: Arg(NodeId, node_id_help),
+    flags: struct {
+        frames: Flag(usize, "gossip frames to observe") = .{ .value = 200 },
+    } = .{},
+};
+
+const FetchProbe = struct {
+    pub const about = "open a git stream, read the v2 advertisement";
+    host: Arg([]const u8, host_help),
+    port: Arg(u16, port_help),
+    node_id: Arg(NodeId, node_id_help),
+    rid: Arg(RepoId, rid_help),
+};
+
+const Clone = struct {
+    pub const about = "clone a repo into <dir> (bare)";
+    host: Arg([]const u8, host_help),
+    port: Arg(u16, port_help),
+    node_id: Arg(NodeId, node_id_help),
+    rid: Arg(RepoId, rid_help),
+    dir: Arg([]const u8, dir_help),
+    flags: struct {
+        require_verified: Flag(bool, "exit non-zero if any remote fails verification") = .{ .value = false },
+    } = .{},
+};
+
+const Seeds = struct {
+    pub const about = "who holds a repo; needs --from or --dir";
+    rid: Arg(RepoId, rid_help),
+    flags: struct {
+        dir: Flag(?[]const u8, "remotes in a local clone (no network)") = .{ .value = null },
+        from: Flag(?[]const u8, seed_help) = .{ .value = null },
+        frames: Flag(usize, "gossip frames to observe") = .{ .value = 200 },
+    } = .{},
+};
+
+const Peers = struct {
+    pub const about = "nodes seen announcing themselves";
+    from: Arg([]const u8, seed_help),
+    flags: struct {
+        frames: Flag(usize, "gossip frames to observe") = .{ .value = 200 },
+    } = .{},
+};
+
+const FetchDeps = struct {
+    pub const about = "resolve `.rad` deps in a build.zig.zon";
+    manifest: Arg([]const u8, manifest_help),
+    dir: Arg([]const u8, "where each dependency is checked out") = .{ .value = ".rad-deps" },
+    flags: struct {
+        from: Flag(?[]const u8, "fetch from this node instead of a seed") = .{ .value = null },
+    } = .{},
+};
+
+const Serve = struct {
+    pub const about = "answer inbound connections out of <storage>";
+    port: Arg(u16, port_help),
+    sessions: Arg(?usize, "stop after this many; unbounded by default") = .{ .value = null },
+    storage: Arg(?[]const u8, "a root of <rid> repositories to serve") = .{ .value = null },
+};
+
+const UploadPack = struct {
+    pub const about = "serve one git v2 fetch on stdin/stdout";
+    repo: Arg([]const u8, repo_help),
+};
+
+const VerifyPack = struct {
+    pub const about = "check every pack against its own checksums";
+    repo: Arg([]const u8, repo_help),
+};
+
+const QuicPing = struct {
+    pub const about = "handshake, then a gossip ping/pong";
+    host: Arg([]const u8, host_help),
+    port: Arg(u16, port_help),
+};
+
+const QuicSubscribe = struct {
+    pub const about = "listen to gossip";
+    host: Arg([]const u8, host_help),
+    port: Arg(u16, port_help),
+    flags: struct {
+        messages: Flag(usize, "gossip messages to observe") = .{ .value = 200 },
+    } = .{},
+};
+
+const QuicFetchProbe = struct {
+    pub const about = "open the git ALPN, list refs";
+    host: Arg([]const u8, host_help),
+    port: Arg(u16, port_help),
+    rid: Arg(RepoId, rid_help),
+};
+
+const QuicClone = struct {
+    pub const about = "clone a repo into <dir> (bare)";
+    host: Arg([]const u8, host_help),
+    port: Arg(u16, port_help),
+    rid: Arg(RepoId, rid_help),
+    dir: Arg([]const u8, dir_help),
+    flags: struct {
+        require_verified: Flag(bool, "exit non-zero if any remote fails verification") = .{ .value = false },
+        profile: Flag(bool, "print connection counters on exit") = .{ .value = false },
+    } = .{},
+};
+
+const QuicCapture = struct {
+    pub const about = "record datagrams as hex fixtures";
+    host: Arg([]const u8, host_help),
+    port: Arg(u16, port_help),
+    flags: struct {
+        messages: Flag(usize, "datagrams to record") = .{ .value = 10 },
+    } = .{},
+};
+
+const QuicProbe = struct {
+    pub const about = "send an Initial, read the reply";
+    host: Arg([]const u8, host_help),
+    port: Arg(u16, port_help),
+    alpn: Arg([]const u8, "only raw public keys are offered, so a public server closes") = .{ .value = "h3" },
+    sni: Arg(?[]const u8, "server name to send, if any") = .{ .value = null },
+};
+
+const commands = .{
+    .{ .name = "ping", .Args = Ping, .run = ping },
+    .{ .name = "announce", .Args = Announce, .run = announce },
+    .{ .name = "subscribe", .Args = Subscribe, .run = subscribe },
+    .{ .name = "fetch-probe", .Args = FetchProbe, .run = fetchProbe },
+    .{ .name = "clone", .Args = Clone, .run = clone },
+    .{ .name = "seeds", .Args = Seeds, .run = seeds },
+    .{ .name = "peers", .Args = Peers, .run = peers },
+    .{ .name = "fetch-deps", .Args = FetchDeps, .run = fetchDeps },
+    .{ .name = "serve", .Args = Serve, .run = serve },
+    .{ .name = "upload-pack", .Args = UploadPack, .run = uploadPack },
+    .{ .name = "verify-pack", .Args = VerifyPack, .run = verifyPack },
+};
+
+const quic_commands = .{
+    .{ .name = "ping", .Args = QuicPing, .run = quicPing },
+    .{ .name = "subscribe", .Args = QuicSubscribe, .run = quicSubscribe },
+    .{ .name = "fetch-probe", .Args = QuicFetchProbe, .run = quicFetchProbe },
+    .{ .name = "clone", .Args = QuicClone, .run = quicClone },
+    .{ .name = "capture", .Args = QuicCapture, .run = quicCapture },
+    .{ .name = "probe", .Args = QuicProbe, .run = quicProbe },
+};
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(arena);
-
-    if (args.len >= 5 and std.mem.eql(u8, args[1], "ping")) {
-        return ping(init, Target.from(args[2], args[3], args[4]) orelse return usage());
-    }
-
-    if (args.len >= 5 and std.mem.eql(u8, args[1], "announce")) {
-        const alias = if (args.len >= 6) args[5] else "radish";
-        return announce(init, Target.from(args[2], args[3], args[4]) orelse return usage(), alias);
-    }
-
-    if (args.len >= 5 and std.mem.eql(u8, args[1], "subscribe")) {
-        const max: usize = if (args.len >= 6) try std.fmt.parseInt(usize, args[5], 10) else 200;
-        return subscribe(init, Target.from(args[2], args[3], args[4]) orelse return usage(), max);
-    }
-
-    if (args.len >= 6 and std.mem.eql(u8, args[1], "fetch-probe")) {
-        return fetchProbe(init, Target.from(args[2], args[3], args[4]) orelse return usage(), args[5]);
-    }
-
-    if (args.len >= 3 and std.mem.eql(u8, args[1], "seeds")) {
-        var opts = SeedsOpts{ .rid = args[2] };
-        var i: usize = 3;
-        while (i < args.len) : (i += 1) {
-            const next = if (i + 1 < args.len) args[i + 1] else null;
-            if (std.mem.eql(u8, args[i], "--dir")) {
-                opts.dir = next orelse return usage();
-                i += 1;
-            } else if (std.mem.eql(u8, args[i], "--from")) {
-                // host:port:node-id, since Noise_XK cannot dial without all
-                // three: the node id is a handshake pre-message, not a lookup.
-                opts.from = next orelse return usage();
-                i += 1;
-            } else if (std.mem.eql(u8, args[i], "--frames")) {
-                opts.frames = std.fmt.parseInt(usize, next orelse return usage(), 10) catch return usage();
-                i += 1;
-            } else return usage();
-        }
-        if (opts.from == null and opts.dir == null) return usage();
-        return seeds(init, opts);
-    }
-
-    if (args.len >= 3 and std.mem.eql(u8, args[1], "serve")) {
-        const port = std.fmt.parseInt(u16, args[2], 10) catch return usage();
-        const sessions: usize = if (args.len >= 4)
-            std.fmt.parseInt(usize, args[3], 10) catch return usage()
-        else
-            std.math.maxInt(usize);
-        // Without a storage root we announce no inventory, which is the honest
-        // thing for a node with nothing to serve.
-        return serve(init, port, sessions, if (args.len >= 5) args[4] else null);
-    }
-
-    if (args.len >= 3 and std.mem.eql(u8, args[1], "upload-pack")) {
-        return uploadPack(init, args[2]);
-    }
-
-    if (args.len >= 3 and std.mem.eql(u8, args[1], "verify-pack")) {
-        return verifyPack(init, args[2]);
-    }
+    const argv = try init.minimal.args.toSlice(arena);
+    if (argv.len < 2 or wantsHelp(argv[1..2])) return usage();
 
     // Radicle 2.x, which shares nothing with the commands above but storage.
-    if (args.len >= 5 and std.mem.eql(u8, args[1], "quic")) {
-        const port = std.fmt.parseInt(u16, args[4], 10) catch return usage();
-        if (std.mem.eql(u8, args[2], "ping")) {
-            return quicPing(init, args[3], port);
-        }
-        if (std.mem.eql(u8, args[2], "fetch-probe") and args.len >= 6) {
-            return quicFetchProbe(init, args[3], port, args[5]);
-        }
-        if (std.mem.eql(u8, args[2], "clone") and args.len >= 7) {
-            var require = false;
-            var profile = false;
-            for (args[7..]) |a| {
-                if (std.mem.eql(u8, a, "--require-verified")) require = true;
-                if (std.mem.eql(u8, a, "--profile")) profile = true;
-            }
-            return quicClone(init, args[3], port, args[5], args[6], require, profile);
-        }
-        if (std.mem.eql(u8, args[2], "capture")) {
-            const max: usize = if (args.len >= 6)
-                std.fmt.parseInt(usize, args[5], 10) catch return usage()
-            else
-                10;
-            return quicCapture(init, args[3], port, max);
-        }
-        if (std.mem.eql(u8, args[2], "subscribe")) {
-            const max: usize = if (args.len >= 6)
-                std.fmt.parseInt(usize, args[5], 10) catch return usage()
-            else
-                200;
-            return quicSubscribe(init, args[3], port, max);
-        }
-        if (std.mem.eql(u8, args[2], "probe")) {
-            const alpn = if (args.len >= 6) args[5] else "h3";
-            const sni = if (args.len >= 7) args[6] else null;
-            return quicProbe(init, args[3], port, alpn, sni);
-        }
-        return usage();
+    if (std.mem.eql(u8, argv[1], "quic")) {
+        if (argv.len < 3) return usage();
+        return dispatch(quic_commands, "radish quic ", init, argv[2], argv[3..]);
     }
+    return dispatch(commands, "radish ", init, argv[1], argv[2..]);
+}
 
-    if (args.len >= 3 and std.mem.eql(u8, args[1], "peers")) {
-        var frames: usize = 200;
-        if (args.len >= 5 and std.mem.eql(u8, args[3], "--frames")) {
-            frames = std.fmt.parseInt(usize, args[4], 10) catch return usage();
+/// Runs the command `name` out of `table`, or prints the whole usage when
+/// nothing matches. A command that matches but will not parse prints its own
+/// line rather than every other command's.
+fn dispatch(
+    comptime table: anytype,
+    comptime prefix: []const u8,
+    init: std.process.Init,
+    name: []const u8,
+    rest: []const []const u8,
+) !void {
+    inline for (table) |c| {
+        if (std.mem.eql(u8, name, c.name)) {
+            if (wantsHelp(rest)) return printHelp(c.Args, prefix ++ c.name);
+
+            var diag: cli.Diagnostic = .{};
+            const parsed = cli.parse(c.Args, rest, &diag) catch |e| {
+                var buf: [256]u8 = undefined;
+                var w = std.Io.Writer.fixed(&buf);
+                diag.report(e, &w) catch {};
+                std.debug.print("{s}{s}: {s}\n", .{ prefix, c.name, w.buffered() });
+                printUsage(c.Args, prefix ++ c.name);
+                // A misspelled argument is the user's mistake, not a crash:
+                // returning the error would dump a stack trace over the help.
+                std.process.exit(2);
+            };
+            return c.run(init, parsed);
         }
-        return peers(init, args[2], frames);
     }
-
-    if (args.len >= 3 and std.mem.eql(u8, args[1], "fetch-deps")) {
-        var from: ?[]const u8 = null;
-        var dir: []const u8 = ".rad-deps";
-        var i: usize = 3;
-        while (i < args.len) : (i += 1) {
-            if (std.mem.eql(u8, args[i], "--from") and i + 1 < args.len) {
-                i += 1;
-                from = args[i];
-            } else dir = args[i];
-        }
-        return fetchDeps(init, args[2], from, dir);
-    }
-
-    if (args.len >= 7 and std.mem.eql(u8, args[1], "clone")) {
-        var require = false;
-        for (args[7..]) |a| {
-            if (std.mem.eql(u8, a, "--require-verified")) require = true;
-        }
-        const t = Target.from(args[2], args[3], args[4]) orelse return usage();
-        return clone(init, t, args[5], args[6], require);
-    }
-
     return usage();
 }
 
-fn usage() void {
-    std.debug.print(
-        \\radish - a radicle client
-        \\
-        \\usage:
-        \\  radish ping        <host> <port> <node-id>              dial a node, handshake, ping/pong
-        \\  radish announce    <host> <port> <node-id> [alias]      send a signed NodeAnnouncement
-        \\  radish subscribe   <host> <port> <node-id> [frames]     listen to gossip: nodes + inventory
-        \\  radish fetch-probe <host> <port> <node-id> <rid>        open a git stream, read the v2 advert
-        \\  radish clone       <host> <port> <node-id> <rid> <dir>  clone a repo into <dir> (bare)
-        \\    --require-verified                                    exit non-zero if any remote fails verification
-        \\  radish seeds       <rid>                                who holds a repo; needs --from or --dir
-        \\    --dir <path>                                          remotes in a local clone (no network)
-        \\    --from <host>:<port>:<node-id>                        seeds announcing it over gossip
-        \\    --frames <n>                                          gossip frames to observe (default 200)
-        \\  radish peers       <host>:<port>:<node-id>              nodes seen announcing themselves
-        \\    --frames <n>                                          gossip frames to observe (default 200)
-        \\  radish fetch-deps  <manifest> [dir]                     resolve `.rad` deps (default .rad-deps)
-        \\    --from <host>:<port>:<node-id>                        fetch from this node instead of
-        \\                                                          locating a seed over gossip
-        \\  radish serve       <port> [sessions] [storage]          answer inbound connections
-        \\                                                          <storage> is a root of <rid> repos to announce
-        \\  radish upload-pack <repo>                               serve one git v2 fetch on stdin/stdout,
-        \\                                                          for `git clone --upload-pack`
-        \\  radish verify-pack <repo>                               check every pack against its own checksums
-        \\
-        \\radicle 2.x, over QUIC:
-        \\  radish quic ping   <host> <port>                        handshake, then a gossip ping/pong
-        \\  radish quic subscribe <host> <port> [messages]          listen to gossip (default 200)
-        \\  radish quic fetch-probe <host> <port> <rid>             open the git ALPN, list refs
-        \\  radish quic clone  <host> <port> <rid> <dir>            clone a repo into <dir> (bare)
-        \\    --require-verified                                    exit non-zero if any remote fails verification
-        \\    --profile                                             print connection counters on exit
-        \\  radish quic capture <host> <port> [messages]            record datagrams as hex fixtures
-        \\  radish quic probe  <host> <port> [alpn] [sni]           send an Initial, read the reply
-        \\                                                          (default alpn h3). Only raw public
-        \\                                                          keys are offered, so a public
-        \\                                                          server closes on the certificate
-        \\
-    , .{});
+fn wantsHelp(argv: []const []const u8) bool {
+    for (argv) |a| {
+        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) return true;
+    }
+    return false;
 }
 
-fn clone(init: std.process.Init, t: Target, rid_str: []const u8, dir: []const u8, require_verified: bool) !void {
-    const arena = init.arena.allocator();
-    const nid = try t.nodeId();
+fn printUsage(comptime Args: type, comptime name: []const u8) void {
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    cli.usage(Args, name, &w) catch {};
+    std.debug.print("{s}", .{w.buffered()});
+}
 
-    std.debug.print("cloning {s} from {s} into {s}...\n", .{ rid_str, t.nid, dir });
+fn printHelp(comptime Args: type, comptime name: []const u8) void {
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    cli.help(Args, name, &w) catch {};
+    std.debug.print("{s}", .{w.buffered()});
+}
+
+fn usage() void {
+    std.debug.print("radish - a radicle client\n\nusage:\n", .{});
+    inline for (commands) |c| printUsage(c.Args, "radish " ++ c.name);
+    std.debug.print("\nradicle 2.x, over QUIC:\n", .{});
+    inline for (quic_commands) |c| printUsage(c.Args, "radish quic " ++ c.name);
+}
+
+/// The three arguments every 1.x command dials with.
+fn targetOf(a: anytype) Target {
+    return .{ .host = a.host.value, .port = a.port.value, .nid = a.node_id.value };
+}
+
+fn clone(init: std.process.Init, cmd: Clone) !void {
+    const t = targetOf(cmd);
+    const rid_str = cmd.rid.value;
+    const dir = cmd.dir.value;
+    const require_verified = cmd.flags.require_verified.value;
+    const arena = init.arena.allocator();
+    const nid = t.nid;
+
+    std.debug.print("cloning {s} from {f} into {s}...\n", .{ rid_str, t.nid, dir });
     var result = radish.net.clone.overNoise(init.io, arena, t.host, t.port, nid, rid_str, dir) catch |e| {
         std.debug.print("clone failed: {s}\n", .{@errorName(e)});
         return e;
@@ -195,7 +278,7 @@ fn clone(init: std.process.Init, t: Target, rid_str: []const u8, dir: []const u8
 /// What a clone came to, whichever transport carried it.
 fn report(
     result: radish.net.clone.CloneResult,
-    rid_str: []const u8,
+    rid_str: RepoId,
     dir: []const u8,
     require_verified: bool,
 ) !void {
@@ -235,12 +318,14 @@ const FetchProbePrinter = struct {
     }
 };
 
-fn fetchProbe(init: std.process.Init, t: Target, rid_str: []const u8) !void {
+fn fetchProbe(init: std.process.Init, cmd: FetchProbe) !void {
+    const t = targetOf(cmd);
+    const rid_str = cmd.rid.value;
     const arena = init.arena.allocator();
-    const nid = try t.nodeId();
+    const nid = t.nid;
 
     var printer = FetchProbePrinter{};
-    std.debug.print("fetch-probe {s} from {s}...\n", .{ rid_str, t.nid });
+    std.debug.print("fetch-probe {s} from {f}...\n", .{ rid_str, t.nid });
     const frames = radish.net.wire.fetchProbe(init.io, arena, t.host, t.port, nid, rid_str, 20, &printer) catch |e| {
         std.debug.print("fetch-probe failed: {s}\n", .{@errorName(e)});
         return e;
@@ -251,20 +336,23 @@ fn fetchProbe(init: std.process.Init, t: Target, rid_str: []const u8) !void {
     );
 }
 
-fn ping(init: std.process.Init, t: Target) !void {
+fn ping(init: std.process.Init, cmd: Ping) !void {
+    const t = targetOf(cmd);
     const arena = init.arena.allocator();
-    const nid = try t.nodeId();
+    const nid = t.nid;
 
     const zeroes = radish.net.wire.ping(init.io, arena, t.host, t.port, nid, 8) catch |e| {
         std.debug.print("ping failed: {s}\n", .{@errorName(e)});
         return e;
     };
-    std.debug.print("pong from {s} ({d} zero bytes)\n", .{ t.nid, zeroes });
+    std.debug.print("pong from {f} ({d} zero bytes)\n", .{ t.nid, zeroes });
 }
 
-fn announce(init: std.process.Init, t: Target, alias: []const u8) !void {
+fn announce(init: std.process.Init, cmd: Announce) !void {
+    const t = targetOf(cmd);
+    const alias = cmd.alias.value;
     const arena = init.arena.allocator();
-    const nid = try t.nodeId();
+    const nid = t.nid;
 
     var seed: [32]u8 = undefined;
     try init.io.randomSecure(&seed);
@@ -276,7 +364,7 @@ fn announce(init: std.process.Init, t: Target, alias: []const u8) !void {
         std.debug.print("announce failed: {s}\n", .{@errorName(e)});
         return e;
     };
-    std.debug.print("accepted: pong from {s} ({d} zero bytes)\n", .{ t.nid, zeroes });
+    std.debug.print("accepted: pong from {f} ({d} zero bytes)\n", .{ t.nid, zeroes });
 }
 
 const GossipPrinter = struct {
@@ -342,7 +430,10 @@ const GossipPrinter = struct {
 /// it really is the RID that was asked for, resolve the canonical branch, and
 /// check that commit out into `out_dir/<name>`. A POC; see the README for what
 /// it cannot do.
-fn fetchDeps(init: std.process.Init, manifest_path: []const u8, from: ?[]const u8, out_dir: []const u8) !void {
+fn fetchDeps(init: std.process.Init, cmd: FetchDeps) !void {
+    const manifest_path = cmd.manifest.value;
+    const from = cmd.flags.from.value;
+    const out_dir = cmd.dir.value;
     const arena = init.arena.allocator();
     // Only used when the caller named a node; otherwise each dependency is
     // located over gossip, since different repos may live on different seeds.
@@ -388,21 +479,25 @@ fn fetchDeps(init: std.process.Init, manifest_path: []const u8, from: ?[]const u
         // are what verification reads.
         const bare = try std.fmt.allocPrint(arena, "{s}/{s}.git", .{ out_dir, dep.name });
         std.Io.Dir.cwd().deleteTree(init.io, bare) catch {};
-        const rid_str = try std.fmt.allocPrint(arena, "rad:{s}", .{dep.rid});
+        // The manifest is text, so this is where a `.rad` entry is checked.
+        const rid = radish.identity.RepoId.parse(dep.rid) catch {
+            std.debug.print("  '{s}' is not a repository id\n", .{dep.rid});
+            return error.BadRid;
+        };
 
         // --from wins, then the manifest's `.node`, then discovery. A pinned
         // node that is down is a preference we cannot honour, not an error, so
         // it falls back rather than failing the build.
         var result = blk: {
             if (explicit orelse manifestNode(dep)) |pinned| {
-                if (cloneFrom(init, pinned, rid_str, bare)) |r| break :blk r else |e| {
+                if (cloneFrom(init, pinned, rid, bare)) |r| break :blk r else |e| {
                     if (explicit != null) return e;
                     std.debug.print("  {s} unreachable ({s}), locating a seed\n", .{ pinned.host, @errorName(e) });
                     std.Io.Dir.cwd().deleteTree(init.io, bare) catch {};
                 }
             }
-            const found = try locate(init, rid_str, 500);
-            break :blk cloneFrom(init, found, rid_str, bare) catch |e| {
+            const found = try locate(init, rid, 500);
+            break :blk cloneFrom(init, found, rid, bare) catch |e| {
                 std.debug.print("  clone failed: {s}\n", .{@errorName(e)});
                 return e;
             };
@@ -520,7 +615,9 @@ fn quicNodeId(arena: std.mem.Allocator, opts: radish.quic.endpoint.Options) ![]u
 }
 
 /// A radicle 2.x ping: the QUIC handshake, then one gossip message each way.
-fn quicPing(init: std.process.Init, host: []const u8, port: u16) !void {
+fn quicPing(init: std.process.Init, cmd: QuicPing) !void {
+    const host = cmd.host.value;
+    const port = cmd.port.value;
     const quic = radish.quic;
     const arena = init.arena.allocator();
     const opts = try quicDial(init, host, port);
@@ -547,7 +644,10 @@ fn quicPing(init: std.process.Init, host: []const u8, port: u16) !void {
 
 /// Subscribes to a 2.x node's gossip and prints what arrives, the counterpart
 /// of `radish subscribe`.
-fn quicSubscribe(init: std.process.Init, host: []const u8, port: u16, max: usize) !void {
+fn quicSubscribe(init: std.process.Init, cmd: QuicSubscribe) !void {
+    const host = cmd.host.value;
+    const port = cmd.port.value;
+    const max = cmd.flags.messages.value;
     const quic = radish.quic;
     const arena = init.arena.allocator();
     const opts = try quicDial(init, host, port);
@@ -585,7 +685,10 @@ fn quicSubscribe(init: std.process.Init, host: []const u8, port: u16, max: usize
 /// Records a gossip exchange: every datagram that arrives, as hex, one per
 /// line, for pasting into `quic/testdata.zig`. The key share and connection id
 /// are the fixed ones, so the recording replays.
-fn quicCapture(init: std.process.Init, host: []const u8, port: u16, max: usize) !void {
+fn quicCapture(init: std.process.Init, cmd: QuicCapture) !void {
+    const host = cmd.host.value;
+    const port = cmd.port.value;
+    const max = cmd.flags.messages.value;
     const quic = radish.quic;
     const arena = init.arena.allocator();
     const dcid = quic.testdata.hex(quic.testdata.fixed_dcid);
@@ -612,7 +715,10 @@ fn quicCapture(init: std.process.Init, host: []const u8, port: u16, max: usize) 
 
 /// Opens the git ALPN, sends the upload-pack intro, and lists the refs the
 /// node advertises: the 2.x counterpart of `radish fetch-probe`.
-fn quicFetchProbe(init: std.process.Init, host: []const u8, port: u16, rid: []const u8) !void {
+fn quicFetchProbe(init: std.process.Init, cmd: QuicFetchProbe) !void {
+    const host = cmd.host.value;
+    const port = cmd.port.value;
+    const rid = cmd.rid.value;
     const quic = radish.quic;
     const arena = init.arena.allocator();
     const opts = try quicDial(init, host, port);
@@ -650,15 +756,13 @@ fn quicFetchProbe(init: std.process.Init, host: []const u8, port: u16, rid: []co
 
 /// Clones over the git ALPN: the 2.x counterpart of `radish clone`, and the
 /// same storage and verification once the bytes are in.
-fn quicClone(
-    init: std.process.Init,
-    host: []const u8,
-    port: u16,
-    rid: []const u8,
-    dir: []const u8,
-    require_verified: bool,
-    show_profile: bool,
-) !void {
+fn quicClone(init: std.process.Init, cmd: QuicClone) !void {
+    const host = cmd.host.value;
+    const port = cmd.port.value;
+    const rid = cmd.rid.value;
+    const dir = cmd.dir.value;
+    const require_verified = cmd.flags.require_verified.value;
+    const show_profile = cmd.flags.profile.value;
     const quic = radish.quic;
     const arena = init.arena.allocator();
     const opts = try quicDial(init, host, port);
@@ -694,7 +798,11 @@ fn printProfile(init: std.process.Init, c: *radish.quic.endpoint.Endpoint, start
 /// One QUIC first flight against a live server. The x25519 key is fixed, so a
 /// recorded reply replays byte for byte; that also means the exchange has no
 /// forward secrecy, which is fine for a probe of public traffic.
-fn quicProbe(init: std.process.Init, host: []const u8, port: u16, alpn: []const u8, sni: ?[]const u8) !void {
+fn quicProbe(init: std.process.Init, cmd: QuicProbe) !void {
+    const host = cmd.host.value;
+    const port = cmd.port.value;
+    const alpn = cmd.alpn.value;
+    const sni = cmd.sni.value;
     const quic = radish.quic;
     const arena = init.arena.allocator();
     const dcid = quic.testdata.hex(quic.testdata.fixed_dcid);
@@ -772,7 +880,10 @@ fn quicProbe(init: std.process.Init, host: []const u8, port: u16, alpn: []const 
 /// Answers inbound connections. The identity is generated per run, so peers
 /// cannot find this node again across restarts; a stored key is the next piece
 /// of work.
-fn serve(init: std.process.Init, port: u16, sessions: usize, root: ?[]const u8) !void {
+fn serve(init: std.process.Init, cmd: Serve) !void {
+    const port = cmd.port.value;
+    const sessions = cmd.sessions.value orelse std.math.maxInt(usize);
+    const root = cmd.storage.value;
     const arena = init.arena.allocator();
 
     // randomSecure everywhere a key is derived: `random` degrades to a weaker
@@ -810,7 +921,8 @@ fn serve(init: std.process.Init, port: u16, sessions: usize, root: ?[]const u8) 
 /// Checks every pack in `repo` against the checksums it carries. Reads both
 /// files whole, which is why it is a command rather than part of opening a
 /// repository.
-fn verifyPack(init: std.process.Init, path: []const u8) !void {
+fn verifyPack(init: std.process.Init, cmd: VerifyPack) !void {
+    const path = cmd.repo.value;
     var repo = radish.git.storage.Repository.open(init.io, init.gpa, path) catch |e| {
         std.debug.print("cannot open {s}: {s}\n", .{ path, @errorName(e) });
         return e;
@@ -839,7 +951,8 @@ fn verifyPack(init: std.process.Init, path: []const u8) !void {
 /// runs an upload-pack: `git -c protocol.version=2 clone --upload-pack 'radish
 /// upload-pack' <repo> <dir>`. No transport intro line is read here, since the
 /// repository arrives on the command line the way `git upload-pack` takes it.
-fn uploadPack(init: std.process.Init, path: []const u8) !void {
+fn uploadPack(init: std.process.Init, cmd: UploadPack) !void {
+    const path = cmd.repo.value;
     const gpa = init.gpa;
     var repo = radish.git.storage.Repository.open(init.io, gpa, path) catch |e| {
         std.debug.print("cannot open {s}: {s}\n", .{ path, @errorName(e) });
@@ -875,24 +988,23 @@ fn manifestNode(dep: radish.pkg.manifest.RadDep) ?Target {
 fn cloneFrom(
     init: std.process.Init,
     t: Target,
-    rid_str: []const u8,
+    rid_str: RepoId,
     bare: []const u8,
 ) !radish.net.clone.CloneResult {
     const arena = init.arena.allocator();
-    const nid = try t.nodeId();
+    const nid = t.nid;
     return radish.net.clone.overNoise(init.io, arena, t.host, t.port, nid, rid_str, bare);
 }
 
 /// Asks a bootstrap node who seeds `rid`, and returns the first seed that both
 /// holds it and published an address. Discovery needs an entry point of its
 /// own, so the bootstrap list is tried in order until one answers.
-fn locate(init: std.process.Init, rid_str: []const u8, frames: usize) !Target {
+fn locate(init: std.process.Init, want: RepoId, frames: usize) !Target {
     const arena = init.arena.allocator();
-    const want = try radish.identity.RepoId.parse(rid_str);
 
     for (radish.net.seeds.BOOTSTRAP) |entry| {
         const boot = Target.parse(entry) orelse continue;
-        const boot_nid = boot.nodeId() catch continue;
+        const boot_nid = boot.nid;
 
         var locator = radish.net.seeds.Locator.init(arena, want);
         defer locator.deinit();
@@ -935,7 +1047,7 @@ fn hasCheckout(io: std.Io, path: []const u8) bool {
 const Target = struct {
     host: []const u8,
     port: u16,
-    nid: []const u8,
+    nid: radish.identity.NodeId,
 
     /// From the colon form, `host:port:node-id`.
     fn parse(spec: []const u8) ?Target {
@@ -943,31 +1055,23 @@ const Target = struct {
         const host = it.next() orelse return null;
         const port_str = it.next() orelse return null;
         const nid = it.next() orelse return null;
-        return from(host, port_str, nid);
-    }
-
-    /// From three positional arguments, as the older commands take them.
-    fn from(host: []const u8, port_str: []const u8, nid: []const u8) ?Target {
-        if (host.len == 0 or nid.len == 0) return null;
+        if (host.len == 0) return null;
         return .{
             .host = host,
             .port = std.fmt.parseInt(u16, port_str, 10) catch return null,
-            .nid = nid,
+            .nid = radish.identity.NodeId.parse(nid) catch return null,
         };
-    }
-
-    /// The parsed node id, which every command needs before dialing.
-    fn nodeId(self: Target) !radish.identity.NodeId {
-        return radish.identity.NodeId.parse(self.nid);
     }
 };
 
 /// Lists the nodes seen announcing themselves, with the addresses each
 /// advertises. Discovery is bounded by what `from` has stored and relays.
-fn peers(init: std.process.Init, from: []const u8, frames: usize) !void {
+fn peers(init: std.process.Init, cmd: Peers) !void {
+    const from = cmd.from.value;
+    const frames = cmd.flags.frames.value;
     const arena = init.arena.allocator();
     const target = Target.parse(from) orelse return usage();
-    const nid = try target.nodeId();
+    const nid = target.nid;
 
     var collector = radish.net.seeds.PeerCollector.init(arena);
     defer collector.deinit();
@@ -987,7 +1091,7 @@ fn peers(init: std.process.Init, from: []const u8, frames: usize) !void {
 }
 
 const SeedsOpts = struct {
-    rid: []const u8,
+    rid: RepoId,
     dir: ?[]const u8 = null,
     from: ?[]const u8 = null,
     frames: usize = 200,
@@ -997,7 +1101,21 @@ const SeedsOpts = struct {
 /// the other: `--dir` is whose refs we hold, `--from` is who advertises the
 /// repo right now. Gossip is a push stream with no "who seeds X" query, so its
 /// answer is a lower bound over the observed window, never a complete list.
-fn seeds(init: std.process.Init, opts: SeedsOpts) !void {
+fn seeds(init: std.process.Init, cmd: Seeds) !void {
+    // Neither source means nothing to look in, which the parser cannot catch:
+    // it checks one argument at a time, and this is a rule about two.
+    if (cmd.flags.dir.value == null and cmd.flags.from.value == null) {
+        std.debug.print("radish seeds: needs --dir or --from\n", .{});
+        printHelp(Seeds, "radish seeds");
+        std.process.exit(2);
+    }
+
+    const opts: SeedsOpts = .{
+        .rid = cmd.rid.value,
+        .dir = cmd.flags.dir.value,
+        .from = cmd.flags.from.value,
+        .frames = cmd.flags.frames.value,
+    };
     const arena = init.arena.allocator();
 
     if (opts.dir) |path| {
@@ -1013,8 +1131,8 @@ fn seeds(init: std.process.Init, opts: SeedsOpts) !void {
     if (opts.dir != null) std.debug.print("\n", .{});
 
     const target = Target.parse(from) orelse return usage();
-    const nid = try target.nodeId();
-    const want = try radish.identity.RepoId.parse(opts.rid);
+    const nid = target.nid;
+    const want = opts.rid;
 
     var collector = radish.net.seeds.Collector.init(arena, want);
     defer collector.deinit();
@@ -1035,12 +1153,14 @@ fn seeds(init: std.process.Init, opts: SeedsOpts) !void {
     );
 }
 
-fn subscribe(init: std.process.Init, t: Target, max: usize) !void {
+fn subscribe(init: std.process.Init, cmd: Subscribe) !void {
+    const t = targetOf(cmd);
+    const max = cmd.flags.frames.value;
     const arena = init.arena.allocator();
-    const nid = try t.nodeId();
+    const nid = t.nid;
 
     var printer = GossipPrinter{ .arena = arena };
-    std.debug.print("subscribing to {s} (up to {d} frames)...\n", .{ t.nid, max });
+    std.debug.print("subscribing to {f} (up to {d} frames)...\n", .{ t.nid, max });
     const frames = radish.net.wire.subscribe(init.io, t.host, t.port, nid, max, &printer) catch |e| {
         std.debug.print("subscribe failed: {s}\n", .{@errorName(e)});
         return e;

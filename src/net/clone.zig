@@ -38,7 +38,7 @@ pub fn overSession(
     io: std.Io,
     allocator: std.mem.Allocator,
     session: anytype,
-    rid: []const u8,
+    rid: repo_id.RepoId,
     into_path: []const u8,
 ) !CloneResult {
     const prefixes = [_][]const u8{ "refs/rad/", "refs/namespaces/" };
@@ -63,8 +63,7 @@ pub fn overSession(
     defer repo.deinit();
 
     // Hard failure, unlike verifyAll below: a wrong repo is never acceptable.
-    const want = try repo_id.RepoId.parse(rid);
-    try repo.checkRepoId(allocator, want);
+    try repo.checkRepoId(allocator, rid);
 
     const report = try repo.verifyAll(allocator, allocator);
 
@@ -90,7 +89,7 @@ pub fn overNoise(
     host: []const u8,
     port: u16,
     nid: node_id.NodeId,
-    rid: []const u8,
+    rid: repo_id.RepoId,
     into_path: []const u8,
 ) !CloneResult {
     const session = try fetch.Session.connect(io, allocator, host, port, nid, rid);
@@ -105,7 +104,7 @@ pub fn overQuic(
     allocator: std.mem.Allocator,
     ep: *quic.endpoint.Endpoint,
     opts: quic.endpoint.Options,
-    rid: []const u8,
+    rid: repo_id.RepoId,
     into_path: []const u8,
 ) !CloneResult {
     var session = try gitstream.Session.connect(io, allocator, ep, opts, rid);

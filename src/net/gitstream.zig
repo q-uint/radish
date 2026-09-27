@@ -9,6 +9,7 @@ const std = @import("std");
 
 const gossip = @import("gossip.zig");
 const protocol = @import("protocol.zig");
+const repo_id = @import("../identity/rid.zig");
 const quic = @import("../quic/mod.zig");
 
 /// Room for one request's pkt-lines before they go out together. A fetch names
@@ -22,7 +23,7 @@ pub const Session = struct {
     allocator: std.mem.Allocator,
     endpoint: *quic.endpoint.Endpoint,
     /// The repo being fetched, which the intro line names.
-    rid: []const u8,
+    rid: repo_id.RepoId,
     intro_sent: bool = false,
     /// Pending request bytes. A request is many small pkt-lines, and a packet
     /// per line stalls on the sender's window every `Sender.max_chunks` of
@@ -36,7 +37,7 @@ pub const Session = struct {
         allocator: std.mem.Allocator,
         ep: *quic.endpoint.Endpoint,
         opts: quic.endpoint.Options,
-        rid: []const u8,
+        rid: repo_id.RepoId,
     ) !Session {
         var with_alpn = opts;
         with_alpn.alpn = gossip.alpn_git;
@@ -135,7 +136,7 @@ const fakepeer = @import("../quic/fakepeer.zig");
 
 /// The RID `identity/rid.zig` round-trips. Nothing here sends it, but an
 /// invented one would still be a lie.
-const test_rid = "rad:z42hL2jL4XNk6K8oHQaSWfMgCL7ji";
+const test_rid = repo_id.RepoId.parse("rad:z42hL2jL4XNk6K8oHQaSWfMgCL7ji") catch unreachable;
 
 /// A session over `d`, with `pending` for the bytes it queues.
 fn testSession(d: *fakepeer.Dialed, pending: []u8) Session {

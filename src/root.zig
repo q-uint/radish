@@ -1,6 +1,7 @@
 //! radish - a radicle client and node.
 //!
 //! Ordered so a module comes after everything it depends on.
+pub const args = @import("args.zig");
 pub const codec = @import("codec.zig");
 pub const safepath = @import("safepath.zig");
 pub const githash = @import("githash.zig");
@@ -13,6 +14,7 @@ pub const net = @import("net/mod.zig");
 pub const pkg = @import("pkg/mod.zig");
 
 test {
+    _ = args;
     _ = codec;
     _ = safepath;
     _ = githash;

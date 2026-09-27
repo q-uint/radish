@@ -10,6 +10,7 @@ const std = @import("std");
 const noise = @import("../crypto/noise.zig");
 const node_id = @import("../identity/node_id.zig");
 const protocol = @import("protocol.zig");
+const repo_id = @import("../identity/rid.zig");
 const dial = @import("../dial.zig");
 
 const GIT_STREAM = protocol.StreamId.git_out.nth(1); // id 12, matches real fetch
@@ -27,7 +28,7 @@ pub const Session = struct {
     stream: std.Io.net.Stream,
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
-    rid: []const u8,
+    rid: repo_id.RepoId,
     intro_sent: bool = false,
     leftover: []const u8 = &.{},
     frame_buf: []u8,
@@ -44,7 +45,7 @@ pub const Session = struct {
         host: []const u8,
         port: u16,
         nid: node_id.NodeId,
-        rid: []const u8,
+        rid: repo_id.RepoId,
     ) !*Session {
         var seed: [32]u8 = undefined;
         try io.randomSecure(&seed);

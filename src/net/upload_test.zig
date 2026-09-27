@@ -51,9 +51,7 @@ fn requestFrames(id: rid.RepoId, parts: []const []const u8) ![]u8 {
     defer alloc.free(open);
     try out.appendSlice(alloc, open);
 
-    const name = try id.encodeBare(alloc);
-    defer alloc.free(name);
-    const intro = try protocol.gitUploadPackLine(alloc, name);
+    const intro = try protocol.gitUploadPackLine(alloc, id);
     defer alloc.free(intro);
     try appendGit(&out, intro);
 

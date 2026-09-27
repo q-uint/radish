@@ -3,7 +3,7 @@ const std = @import("std");
 
 const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-var decode_map: [256]i16 = blk: {
+const decode_map: [256]i16 = blk: {
     var m: [256]i16 = @splat(-1);
     for (ALPHABET, 0..) |c, i| m[c] = @intCast(i);
     break :blk m;

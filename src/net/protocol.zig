@@ -5,6 +5,7 @@
 const std = @import("std");
 const codec = @import("../codec.zig");
 const node_id = @import("../identity/node_id.zig");
+const repo_id = @import("../identity/rid.zig");
 const pktline = @import("../git/pktline.zig");
 const signature = @import("../crypto/signature.zig");
 
@@ -152,8 +153,9 @@ pub fn encodeGitFrame(allocator: std.mem.Allocator, stream: StreamId, data: []co
 /// 4-hex length prefix counting itself and the NULs. `rid` is the bare base58
 /// id (no `rad:`, no `.git`) - verified against a real radicle-node fetch.
 /// `version=2` is required or the responder rejects the request.
-pub fn gitUploadPackLine(allocator: std.mem.Allocator, rid: []const u8) ![]u8 {
-    const bare = if (std.mem.startsWith(u8, rid, "rad:")) rid["rad:".len..] else rid;
+pub fn gitUploadPackLine(allocator: std.mem.Allocator, id: repo_id.RepoId) ![]u8 {
+    const bare = try id.encodeBare(allocator);
+    defer allocator.free(bare);
     const payload = try std.fmt.allocPrint(allocator, "git-upload-pack /{s}\x00\x00version=2\x00", .{bare});
     defer allocator.free(payload);
     const total = payload.len + 4;
@@ -609,7 +611,8 @@ test "stream ids match the frame.rs table" {
 test "git-upload-pack pkt-line matches a captured radicle-node fetch" {
     // Captured off the wire from radicle-node 1.9.1: bare base58 id (no rad:,
     // no .git), empty host, then version=2.
-    const line = try gitUploadPackLine(testing.allocator, "rad:z3WukSjzicL8WaZHFALbBwb2r8W52");
+    const id = try repo_id.RepoId.parse("rad:z3WukSjzicL8WaZHFALbBwb2r8W52");
+    const line = try gitUploadPackLine(testing.allocator, id);
     defer testing.allocator.free(line);
     const expected = "003egit-upload-pack /z3WukSjzicL8WaZHFALbBwb2r8W52\x00\x00version=2\x00";
     try testing.expectEqualSlices(u8, expected, line);
