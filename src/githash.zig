@@ -17,10 +17,7 @@ pub fn blob(content: []const u8) Oid {
 const testing = std.testing;
 
 fn expectOid(comptime hex: []const u8, content: []const u8) !void {
-    const oid = blob(content);
-    var buf: [40]u8 = undefined;
-    _ = std.fmt.bufPrint(&buf, "{x}", .{oid}) catch unreachable;
-    try testing.expectEqualStrings(hex, &buf);
+    try testing.expectFmt(hex, "{x}", .{blob(content)});
 }
 
 test "blob oids match git hash-object" {

@@ -212,9 +212,7 @@ test "listRefs reads packed refs, and a loose ref wins over its packed value" {
     );
     try testing.expectEqualStrings("refs/rad/id", refs[1].name);
 
-    var moved: [40]u8 = undefined;
-    _ = try std.fmt.bufPrint(&moved, "{x}", .{refs[1].oid.slice()});
-    try testing.expectEqualStrings(second, &moved);
+    try testing.expectFmt(second, "{x}", .{refs[1].oid.slice()});
 }
 
 /// Renames the fixture's `bare` directory to `name` beside itself.
@@ -660,9 +658,7 @@ test "writeHead leaves the branch and HEAD that git needs" {
     defer got.deinit(alloc);
     try testing.expectEqualStrings("refs/heads/main", got.target.?);
 
-    var hex_oid: [40]u8 = undefined;
-    _ = try std.fmt.bufPrint(&hex_oid, "{x}", .{got.oid.slice()});
-    try testing.expectEqualStrings(head, &hex_oid);
+    try testing.expectFmt(head, "{x}", .{got.oid.slice()});
 }
 
 test "canonicalHead rejects delegates that disagree" {

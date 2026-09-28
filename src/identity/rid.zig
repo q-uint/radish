@@ -54,6 +54,16 @@ pub const RepoId = struct {
         return rid;
     }
 
+    /// The same text `encode` produces, without an allocator: `max_encoded`
+    /// bounds the base58 of an oid, so the buffer always fits.
+    pub fn format(self: RepoId, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        var buf: [max_encoded]u8 = undefined;
+        const b58 = base58.encodeBuf(&buf, &self.oid) catch unreachable;
+        try w.writeAll(RAD_PREFIX);
+        try w.writeByte(MULTIBASE_BTC);
+        try w.writeAll(b58);
+    }
+
     /// Renders the RID as `rad:z...`. Caller owns the result.
     pub fn encode(self: RepoId, allocator: std.mem.Allocator) base58.Error![]u8 {
         const bare = try self.encodeBare(allocator);

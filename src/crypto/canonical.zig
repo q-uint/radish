@@ -163,7 +163,5 @@ test "realistic doc with unicode payload hashes to the expected git oid" {
     const bytes = try encode(testing.allocator, doc);
     defer testing.allocator.free(bytes);
     const oid = githash.blob(bytes);
-    var hex: [40]u8 = undefined;
-    _ = std.fmt.bufPrint(&hex, "{x}", .{oid}) catch unreachable;
-    try testing.expectEqualStrings("4aad12ef5b9691de8eb7c05e1f264a30838eb4ac", &hex);
+    try testing.expectFmt("4aad12ef5b9691de8eb7c05e1f264a30838eb4ac", "{x}", .{oid});
 }

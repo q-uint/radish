@@ -265,9 +265,7 @@ test "encode matches heartwood canonical bytes, whose oid is the RID" {
 
     // printf '%s' <bytes> | git hash-object --stdin
     const repo = try HEARTWOOD_DOC.repoId(testing.allocator);
-    var hex: [40]u8 = undefined;
-    _ = std.fmt.bufPrint(&hex, "{x}", .{repo.oid}) catch unreachable;
-    try testing.expectEqualStrings("d96f425412c9f8ad5d9a9a05c9831d0728e2338d", &hex);
+    try testing.expectFmt("d96f425412c9f8ad5d9a9a05c9831d0728e2338d", "{x}", .{repo.oid});
 }
 
 const A = "did:key:z6MkA";

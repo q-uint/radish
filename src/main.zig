@@ -266,7 +266,7 @@ fn clone(init: std.process.Init, cmd: Clone) !void {
     const arena = init.arena.allocator();
     const nid = t.nid;
 
-    std.debug.print("cloning {s} from {f} into {s}...\n", .{ rid_str, t.nid, dir });
+    std.debug.print("cloning {f} from {f} into {s}...\n", .{ rid_str, t.nid, dir });
     var result = radish.net.clone.overNoise(init.io, arena, t.host, t.port, nid, rid_str, dir) catch |e| {
         std.debug.print("clone failed: {s}\n", .{@errorName(e)});
         return e;
@@ -282,7 +282,7 @@ fn report(
     dir: []const u8,
     require_verified: bool,
 ) !void {
-    std.debug.print("cloned {s}: {d} refs, {d} pack bytes -> {s}\n", .{ rid_str, result.refs, result.pack_bytes, dir });
+    std.debug.print("cloned {f}: {d} refs, {d} pack bytes -> {s}\n", .{ rid_str, result.refs, result.pack_bytes, dir });
     if (result.damaged_packs > 0) {
         std.debug.print("  DAMAGED: {d} pack index(es) unreadable, objects may be missing\n", .{
             result.damaged_packs,
@@ -325,7 +325,7 @@ fn fetchProbe(init: std.process.Init, cmd: FetchProbe) !void {
     const nid = t.nid;
 
     var printer = FetchProbePrinter{};
-    std.debug.print("fetch-probe {s} from {f}...\n", .{ rid_str, t.nid });
+    std.debug.print("fetch-probe {f} from {f}...\n", .{ rid_str, t.nid });
     const frames = radish.net.wire.fetchProbe(init.io, arena, t.host, t.port, nid, rid_str, 20, &printer) catch |e| {
         std.debug.print("fetch-probe failed: {s}\n", .{@errorName(e)});
         return e;
@@ -357,8 +357,8 @@ fn announce(init: std.process.Init, cmd: Announce) !void {
     var seed: [32]u8 = undefined;
     try init.io.randomSecure(&seed);
     const key = try radish.crypto.SecretKey.fromSeed(seed);
-    const our_nid = try radish.identity.NodeId.fromPublicKey(key.publicKey()).encode(arena);
-    std.debug.print("announcing as {s} (alias {s})\n", .{ our_nid, alias });
+    const our_nid = radish.identity.NodeId.fromPublicKey(key.publicKey());
+    std.debug.print("announcing as {f} (alias {s})\n", .{ our_nid, alias });
 
     const zeroes = radish.net.wire.sendAnnouncement(init.io, arena, t.host, t.port, nid, key, alias) catch |e| {
         std.debug.print("announce failed: {s}\n", .{@errorName(e)});
@@ -528,11 +528,9 @@ fn fetchDeps(init: std.process.Init, cmd: FetchDeps) !void {
         defer dest.close(init.io);
         try repo.checkoutTo(arena, dest, head);
 
-        var oid_hex: [40]u8 = undefined;
-        _ = std.fmt.bufPrint(&oid_hex, "{x}", .{head.slice()}) catch unreachable;
-        std.debug.print("  verified {d} remote(s), checked out {s}\n", .{
+        std.debug.print("  verified {d} remote(s), checked out {x}\n", .{
             result.report.verified.len,
-            oid_hex,
+            head.slice(),
         });
 
         const rel_build = if (dep.subdir) |s|
@@ -610,8 +608,8 @@ fn quicDial(init: std.process.Init, host: []const u8, port: u16) !radish.quic.en
 }
 
 /// The node id a set of options presents.
-fn quicNodeId(arena: std.mem.Allocator, opts: radish.quic.endpoint.Options) ![]u8 {
-    return radish.identity.NodeId.fromPublicKey(opts.identity.public_key.toBytes()).encode(arena);
+fn quicNodeId(opts: radish.quic.endpoint.Options) radish.identity.NodeId {
+    return radish.identity.NodeId.fromPublicKey(opts.identity.public_key.toBytes());
 }
 
 /// A radicle 2.x ping: the QUIC handshake, then one gossip message each way.
@@ -621,7 +619,7 @@ fn quicPing(init: std.process.Init, cmd: QuicPing) !void {
     const quic = radish.quic;
     const arena = init.arena.allocator();
     const opts = try quicDial(init, host, port);
-    std.debug.print("quic ping {s}:{d} as {s}\n", .{ host, port, try quicNodeId(arena, opts) });
+    std.debug.print("quic ping {s}:{d} as {f}\n", .{ host, port, quicNodeId(opts) });
 
     const c = try arena.create(quic.endpoint.Endpoint);
     defer c.close();
@@ -635,8 +633,8 @@ fn quicPing(init: std.process.Init, cmd: QuicPing) !void {
     };
 
     if (c.accepted()) |a| if (a.peer_key) |k| {
-        std.debug.print("peer node id: {s}\n", .{
-            try radish.identity.NodeId.fromPublicKey(k).encode(arena),
+        std.debug.print("peer node id: {f}\n", .{
+            radish.identity.NodeId.fromPublicKey(k),
         });
     };
     std.debug.print("pong: {d} zeroes\n", .{pong.zeroes});
@@ -651,7 +649,7 @@ fn quicSubscribe(init: std.process.Init, cmd: QuicSubscribe) !void {
     const quic = radish.quic;
     const arena = init.arena.allocator();
     const opts = try quicDial(init, host, port);
-    std.debug.print("quic subscribe {s}:{d} as {s}\n", .{ host, port, try quicNodeId(arena, opts) });
+    std.debug.print("quic subscribe {s}:{d} as {f}\n", .{ host, port, quicNodeId(opts) });
 
     var printer = GossipPrinter{ .arena = arena };
     const c = try arena.create(quic.endpoint.Endpoint);
@@ -722,7 +720,7 @@ fn quicFetchProbe(init: std.process.Init, cmd: QuicFetchProbe) !void {
     const quic = radish.quic;
     const arena = init.arena.allocator();
     const opts = try quicDial(init, host, port);
-    std.debug.print("quic fetch-probe {s}:{d} {s}\n", .{ host, port, rid });
+    std.debug.print("quic fetch-probe {s}:{d} {f}\n", .{ host, port, rid });
 
     const c = try arena.create(quic.endpoint.Endpoint);
     defer c.close();
@@ -766,7 +764,7 @@ fn quicClone(init: std.process.Init, cmd: QuicClone) !void {
     const quic = radish.quic;
     const arena = init.arena.allocator();
     const opts = try quicDial(init, host, port);
-    std.debug.print("quic clone {s} from {s}:{d} into {s}...\n", .{ rid, host, port, dir });
+    std.debug.print("quic clone {f} from {s}:{d} into {s}...\n", .{ rid, host, port, dir });
 
     const c = try arena.create(quic.endpoint.Endpoint);
     defer c.close();
@@ -815,11 +813,11 @@ fn quicProbe(init: std.process.Init, cmd: QuicProbe) !void {
     opts.random = quic.testdata.hex(quic.testdata.fixed_hello_random);
     opts.dcid = &dcid;
 
-    std.debug.print("quic probe {s}:{d} alpn={s} as {s}\n", .{
+    std.debug.print("quic probe {s}:{d} alpn={s} as {f}\n", .{
         host,
         port,
         alpn,
-        try quicNodeId(arena, opts),
+        quicNodeId(opts),
     });
 
     // Every buffer the connection reports from lives in here, so it stays put.
@@ -845,8 +843,8 @@ fn quicProbe(init: std.process.Init, cmd: QuicProbe) !void {
             std.debug.print("server handshake secret: {x}\n", .{h.server});
         }
         if (a.alpn_len > 0) std.debug.print("alpn: {s}\n", .{a.alpn()});
-        if (a.peer_key) |k| std.debug.print("peer node id: {s}{s}\n", .{
-            try radish.identity.NodeId.fromPublicKey(k).encode(arena),
+        if (a.peer_key) |k| std.debug.print("peer node id: {f}{s}\n", .{
+            radish.identity.NodeId.fromPublicKey(k),
             if (a.peer_verified) "" else " (unverified)",
         });
     };
@@ -891,7 +889,7 @@ fn serve(init: std.process.Init, cmd: Serve) !void {
     var seed: [32]u8 = undefined;
     try init.io.randomSecure(&seed);
     const key = try radish.crypto.SecretKey.fromSeed(seed);
-    const nid = try radish.identity.NodeId.fromPublicKey(key.publicKey()).encode(arena);
+    const nid = radish.identity.NodeId.fromPublicKey(key.publicKey());
 
     var store: ?radish.git.storage.Storage = null;
     defer if (store) |*s| s.deinit();
@@ -905,7 +903,7 @@ fn serve(init: std.process.Init, cmd: Serve) !void {
     }
 
     var printer = ServePrinter{};
-    std.debug.print("listening on 0.0.0.0:{d} as {s}\n", .{ port, nid });
+    std.debug.print("listening on 0.0.0.0:{d} as {f}\n", .{ port, nid });
     const cfg: radish.net.node.Config = .{
         .seed = seed,
         .alias = "radish",
@@ -1018,8 +1016,8 @@ fn locate(init: std.process.Init, want: RepoId, frames: usize) !Target {
             std.debug.print("  {s}: no seed announced it\n", .{boot.host});
             continue;
         };
-        const id = try radish.identity.NodeId.fromPublicKey(found.node).encode(arena);
-        const spec = try std.fmt.allocPrint(arena, "{s}:{s}", .{ found.addr, id });
+        const id = radish.identity.NodeId.fromPublicKey(found.node);
+        const spec = try std.fmt.allocPrint(arena, "{s}:{f}", .{ found.addr, id });
         // An address that will not parse is this bootstrap node's answer being
         // unusable, not the end of the search.
         const target = Target.parse(spec) orelse {
@@ -1083,8 +1081,8 @@ fn peers(init: std.process.Init, cmd: Peers) !void {
     };
 
     for (collector.peers()) |p| {
-        const id = radish.identity.NodeId.fromPublicKey(p.node).encode(arena) catch continue;
-        std.debug.print("peer  {s}  alias={s}\n", .{ id, p.alias });
+        const id = radish.identity.NodeId.fromPublicKey(p.node);
+        std.debug.print("peer  {f}  alias={s}\n", .{ id, p.alias });
         for (p.addrs) |a| std.debug.print("        {s}\n", .{a.text});
     }
     std.debug.print("\n{d} peers seen in {d} frames\n", .{ collector.peers().len, read });
@@ -1137,15 +1135,15 @@ fn seeds(init: std.process.Init, cmd: Seeds) !void {
     var collector = radish.net.seeds.Collector.init(arena, want);
     defer collector.deinit();
 
-    std.debug.print("watching {s} for seeds of {s} (up to {d} frames)...\n", .{ target.host, opts.rid, opts.frames });
+    std.debug.print("watching {s} for seeds of {f} (up to {d} frames)...\n", .{ target.host, opts.rid, opts.frames });
     const read = radish.net.wire.subscribe(init.io, target.host, target.port, nid, opts.frames, &collector) catch |e| {
         std.debug.print("subscribe failed: {s}\n", .{@errorName(e)});
         return e;
     };
 
     for (collector.seeds()) |node| {
-        const id = radish.identity.NodeId.fromPublicKey(node).encode(arena) catch continue;
-        std.debug.print("seed  {s}\n", .{id});
+        const id = radish.identity.NodeId.fromPublicKey(node);
+        std.debug.print("seed  {f}\n", .{id});
     }
     std.debug.print(
         "{d} seeds seen in {d} frames ({d} inventories)\n",
