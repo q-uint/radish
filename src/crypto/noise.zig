@@ -165,9 +165,9 @@ pub const Transport = struct {
 /// Noise_XK message sizes on the wire. A reader has to know these up front:
 /// the messages are not length-prefixed, so reading the wrong count blocks
 /// forever waiting for bytes the peer will never send.
-pub const MSG1_LEN = 32; // e, es: ephemeral key + empty payload
-pub const MSG2_LEN = 32; // e, ee: ephemeral key + empty payload
-pub const MSG3_LEN = 48; // s, se: static key (32) + tag (16) + empty payload
+pub const MSG1_LEN = Edwards25519.encoded_length; // e, es: ephemeral key, empty payload
+pub const MSG2_LEN = Edwards25519.encoded_length; // e, ee: ephemeral key, empty payload
+pub const MSG3_LEN = Edwards25519.encoded_length + TAGLEN; // s, se: static key, tag, empty payload
 
 /// An Ed25519 key pair for the Edwards25519 DH. `secret_key` is the 32-byte
 /// seed; `public_key` is the compressed Edwards point (the NID bytes).

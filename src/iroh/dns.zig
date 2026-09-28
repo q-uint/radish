@@ -16,6 +16,10 @@ pub const TYPE_TXT: u16 = 16;
 pub const CLASS_IN: u16 = 1;
 
 const header_len = 12;
+/// What follows a record's name: type, class, ttl, and the rdata length.
+const rr_fixed = 2 + 2 + 4 + 2;
+/// The most one TXT character-string holds, its length being a single byte.
+const max_string = 255;
 /// Header flags for a reply: QR set, everything else zero, which is what
 /// `simple_dns::Packet::new_reply` writes and so what iroh signs.
 const flags_reply: u16 = 0x8000;
@@ -60,13 +64,13 @@ pub const Reader = struct {
 
         const name = try readName(self.msg, self.pos, name_buf);
         var pos = name.next;
-        if (pos + 10 > self.msg.len) return error.Malformed;
+        if (pos + rr_fixed > self.msg.len) return error.Malformed;
 
         const kind = std.mem.readInt(u16, self.msg[pos..][0..2], .big);
         const class = std.mem.readInt(u16, self.msg[pos + 2 ..][0..2], .big);
         const ttl = std.mem.readInt(u32, self.msg[pos + 4 ..][0..4], .big);
         const rdlen = std.mem.readInt(u16, self.msg[pos + 8 ..][0..2], .big);
-        pos += 10;
+        pos += rr_fixed;
 
         if (pos + rdlen > self.msg.len) return error.Malformed;
         const rdata = self.msg[pos..][0..rdlen];
@@ -160,18 +164,18 @@ pub const Builder = struct {
     }
 
     pub fn addTxt(self: *Builder, name: []const u8, ttl: u32, value: []const u8) Error!void {
-        if (value.len > 255) return error.ValueTooLong;
+        if (value.len > max_string) return error.ValueTooLong;
         try self.writeName(name);
 
-        const fixed = 10 + 1 + value.len; // type, class, ttl, rdlen, then the string
+        const fixed = rr_fixed + 1 + value.len; // the record, then the string
         if (self.pos + fixed > self.buf.len) return error.NoSpaceLeft;
 
         std.mem.writeInt(u16, self.buf[self.pos..][0..2], TYPE_TXT, .big);
         std.mem.writeInt(u16, self.buf[self.pos + 2 ..][0..2], CLASS_IN, .big);
         std.mem.writeInt(u32, self.buf[self.pos + 4 ..][0..4], ttl, .big);
         std.mem.writeInt(u16, self.buf[self.pos + 8 ..][0..2], @intCast(1 + value.len), .big);
-        self.buf[self.pos + 10] = @intCast(value.len);
-        @memcpy(self.buf[self.pos + 11 ..][0..value.len], value);
+        self.buf[self.pos + rr_fixed] = @intCast(value.len);
+        @memcpy(self.buf[self.pos + rr_fixed + 1 ..][0..value.len], value);
         self.pos += fixed;
 
         self.answers += 1;
@@ -219,14 +223,22 @@ const testing = std.testing;
 
 test "round trip two records under one name" {
     const name = "_iroh.snd196153e58acupm43b7k4773a94brd3u415ne7nf1cowpe9exy";
+    const relay = "relay=https://euw1-1.relay.n0.iroh.link./";
+    const addr = "addr=192.0.2.1:4433";
+
     var buf: [512]u8 = undefined;
     var b = try Builder.init(&buf);
-    try b.addTxt(name, 30, "relay=https://euw1-1.relay.n0.iroh.link./");
-    try b.addTxt(name, 30, "addr=192.0.2.1:4433");
+    try b.addTxt(name, 30, relay);
+    try b.addTxt(name, 30, addr);
     const msg = b.finish();
 
-    // The second name costs two bytes, not the full 57.
-    try testing.expect(msg.len < header_len + 2 * (name.len + 2 + 10 + 41));
+    // A name written out costs a length byte per label and a root byte; the
+    // second record pays two bytes for a pointer to the first instead.
+    const written = name.len + 2;
+    try testing.expectEqual(
+        header_len + (written + rr_fixed + 1 + relay.len) + (2 + rr_fixed + 1 + addr.len),
+        msg.len,
+    );
 
     var r = try Reader.init(msg);
     var name_buf: [max_name]u8 = undefined;

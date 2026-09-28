@@ -532,9 +532,9 @@ test "RFC 8448 ClientHello bytes" {
     var expected: [196]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, testdata.rfc8448_client_hello_hex);
 
-    // 4 header + 2 version + 32 random + 1 session id + 8 suites + 2
-    // compression + 2 extension length.
-    const ext_offset = 51;
+    // header, version, random, session id, cipher suites, compression, and the
+    // extension length, in the order writeClientHello emits them.
+    const ext_offset = 4 + 2 + @sizeOf(Random) + 1 + 8 + 2 + 2;
 
     var out: [256]u8 = undefined;
     const got = try writeClientHello(&out, .{

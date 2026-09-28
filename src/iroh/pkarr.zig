@@ -25,8 +25,9 @@ pub const max_payload = max_signed - key_len;
 
 pub const Error = error{ TooShort, TooLarge, BadSignature, NoSpaceLeft } || dns.Error;
 
-/// The longest bencode prefix: "3:seqi" + 20 digits + "e1:v" + 4 digits + ":".
-const max_prefix = 35;
+/// The longest bencode prefix: a u64 of microseconds is at most 20 digits, and
+/// a packet length at most 4.
+const max_prefix = "3:seqi".len + 20 + "e1:v".len + 4 + ":".len;
 
 pub const SignedPacket = struct {
     key: signature.PublicKey,
