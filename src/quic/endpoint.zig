@@ -198,7 +198,7 @@ pub const Endpoint = struct {
             .addr = undefined,
             .conn = undefined,
         };
-        const kp = try std.crypto.dh.X25519.KeyPair.generateDeterministic(opts.secret);
+        const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(opts.secret);
 
         var datagram: [connection.max_initial_datagram]u8 = undefined;
         const initial = try connection.initialDatagram(&datagram, self.bufs.hello, .{

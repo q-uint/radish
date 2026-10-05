@@ -33,7 +33,7 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
-        zig = zig-overlay.packages.${system}.master;
+        zig = zig-overlay.packages.${system}."0.17.0";
         gitpackFlag = "-Dgitpack=${zig-src}/lib/compiler/Maker/Fetch/git.zig";
       in
       {

@@ -1702,8 +1702,7 @@ pub const Connection = struct {
             else => return error.HandshakeIncomplete,
         };
         if (self.amplificationBlocked()) return error.AmplificationLimited;
-        const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(self.secret) catch
-            return error.UnsupportedGroup;
+        const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(self.secret);
 
         // The extensions are part of the message, so its length covers them too.
         var ext: [max_server_hello]u8 = undefined;
@@ -2172,7 +2171,7 @@ test "walks a coalesced flight and reads a raw public key certificate" {
 
     var mine: [1500]u8 = undefined;
     var hello_buf: [max_client_hello]u8 = undefined;
-    const kp = try std.crypto.dh.X25519.KeyPair.generateDeterministic(secret);
+    const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(secret);
     const initial = try initialDatagram(&mine, &hello_buf, .{
         .dcid = &dcid,
         .scid = &dcid,
@@ -2434,7 +2433,7 @@ fn tellsHello(h: *Connection, scid: []const u8, raw: []const u8) Error!void {
 test "a server reads what a ClientHello offered, and refuses one without raw public keys" {
     const dcid = hex(testdata.other_dcid);
     const server_scid = hex("aabbccdd");
-    const kp = try std.crypto.dh.X25519.KeyPair.generateDeterministic(hex(testdata.fixed_x25519_secret));
+    const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(hex(testdata.fixed_x25519_secret));
 
     var out: [1500]u8 = undefined;
     var hello_buf: [max_client_hello]u8 = undefined;
@@ -2506,7 +2505,7 @@ test "a server reads what a ClientHello offered, and refuses one without raw pub
 test "a server's stream credit is the limit for the stream the client opened" {
     const dcid = hex(testdata.other_dcid);
     const server_scid = hex("aabbccdd");
-    const kp = try std.crypto.dh.X25519.KeyPair.generateDeterministic(hex(testdata.fixed_x25519_secret));
+    const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(hex(testdata.fixed_x25519_secret));
 
     // Asymmetric on purpose: `bidi_remote` is the limit on a stream the server
     // opens, and there is never one.
@@ -2567,7 +2566,7 @@ fn streamsBidi(extensions: []const u8) !u64 {
 test "a server refuses a ClientHello it has nothing in common with" {
     const dcid = hex(testdata.other_dcid);
     const server_scid = hex("aabbccdd");
-    const kp = try std.crypto.dh.X25519.KeyPair.generateDeterministic(hex(testdata.fixed_x25519_secret));
+    const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(hex(testdata.fixed_x25519_secret));
     var buf: [max_client_hello]u8 = undefined;
     var params: [max_transport_params]u8 = undefined;
 
@@ -2701,7 +2700,7 @@ fn testParams(buf: []u8, scid: ?[]const u8) ![]const u8 {
 test "a server sends no more than three times what has arrived" {
     const dcid = hex(testdata.other_dcid);
     const server_scid = hex("aabbccdd");
-    const kp = try std.crypto.dh.X25519.KeyPair.generateDeterministic(hex(testdata.fixed_x25519_secret));
+    const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(hex(testdata.fixed_x25519_secret));
     const server_key = try Ed25519.KeyPair.generateDeterministic(hex(testdata.fixed_peer_identity_seed));
 
     var out: [max_initial_datagram]u8 = undefined;
@@ -2769,7 +2768,7 @@ test "a client and our own server walk the handshake to 1-RTT" {
     const dcid = hex(testdata.other_dcid);
     const server_scid = hex("aabbccdd");
     const secret = hex(testdata.fixed_x25519_secret);
-    const kp = try std.crypto.dh.X25519.KeyPair.generateDeterministic(secret);
+    const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(secret);
     const client_key = try Ed25519.KeyPair.generateDeterministic(hex(testdata.fixed_identity_seed));
     const server_key = try Ed25519.KeyPair.generateDeterministic(hex(testdata.fixed_peer_identity_seed));
     const window = 4096;
@@ -2897,7 +2896,7 @@ test "a client and our own server walk the handshake to 1-RTT" {
 
 test "builds an Initial datagram we can open again" {
     const dcid = hex(testdata.other_dcid);
-    const kp = try std.crypto.dh.X25519.KeyPair.generateDeterministic(hex(testdata.fixed_x25519_secret));
+    const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(hex(testdata.fixed_x25519_secret));
     // The public key RFC 8448 pairs with that secret.
     try testing.expectEqualSlices(
         u8,
@@ -3207,7 +3206,7 @@ test "only a client expands a datagram holding nothing but an Initial ACK" {
     // Source: RFC 9000 s14.1.
     const dcid = hex(testdata.other_dcid);
     const server_scid = hex("aabbccdd");
-    const kp = try std.crypto.dh.X25519.KeyPair.generateDeterministic(hex(testdata.fixed_x25519_secret));
+    const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(hex(testdata.fixed_x25519_secret));
 
     var hello: [max_initial_datagram]u8 = undefined;
     var hello_buf: [max_client_hello]u8 = undefined;

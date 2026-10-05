@@ -3,8 +3,13 @@
 //! when no direct path works. The QUIC underneath is `quic/`.
 pub const dns = @import("dns.zig");
 pub const pkarr = @import("pkarr.zig");
+pub const addr = @import("addr.zig");
+pub const resolve = @import("resolve.zig");
+pub const testdata = @import("testdata.zig");
 
 test {
     _ = dns;
     _ = pkarr;
+    _ = addr;
+    _ = resolve;
 }

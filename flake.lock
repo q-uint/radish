@@ -184,11 +184,11 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1787780832,
-        "narHash": "sha256-IH960FPhnAjb90jNdLq3ub0v8Yd3mW3x67uRzarRKf0=",
+        "lastModified": 1788103148,
+        "narHash": "sha256-mWEbos9fsPgCleVKOCU8LhaG/RFLxCgCdDO9QtP2fnQ=",
         "ref": "refs/namespaces/z6MkkPvBfjP4bQmco5Dm7UGsX2ruDBieEHi8n9DVJWX5sTEz/refs/heads/ng",
-        "rev": "f1b5d27d1ec4ab3c7931535c1e6c99d89879620c",
-        "revCount": 3339,
+        "rev": "b53191d2ef69a4e7d08b862d0ba09627dd396b94",
+        "revCount": 3344,
         "type": "git",
         "url": "https://seed.radicle.dev/rad:z3gqcJUoA1n9HaHKufZs5FCSGazv5"
       },
@@ -215,11 +215,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1784697913,
-        "narHash": "sha256-DK+AmC9SQ9hmOFNIMu1l05gJtsmKyYsfJnuFtt1TnAU=",
+        "lastModified": 1787993548,
+        "narHash": "sha256-+IAEnmmx5YIhUWo0lp15jLLHchnXo5yKgWsi6C6Cf+0=",
         "owner": "oxalica",
         "repo": "rust-overlay",
-        "rev": "47759faaddf38fadaf172151ca9df8adae9c0b2e",
+        "rev": "996e9b0b019a4a9eb9e9a5641aefa06d801b5895",
         "type": "github"
       },
       "original": {
@@ -283,11 +283,11 @@
         "systems": "systems_3"
       },
       "locked": {
-        "lastModified": 1784854043,
-        "narHash": "sha256-sREhP9o/FnQ+QdzKFcOxsADtCQpzMhTYV36CPxNRoNQ=",
+        "lastModified": 1791162078,
+        "narHash": "sha256-F4qyqlJzKIVAuOQ+pT1XNBByLBdbpJnUQkpVTrb8ssA=",
         "owner": "mitchellh",
         "repo": "zig-overlay",
-        "rev": "5663c09de974e5a62f30e46dd6930d22ebdffa2e",
+        "rev": "c46e63e3a4e87d400ac512fdf7b8efbe951e348f",
         "type": "github"
       },
       "original": {

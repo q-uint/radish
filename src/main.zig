@@ -81,6 +81,21 @@ const Peers = struct {
     } = .{},
 };
 
+const Resolve = struct {
+    pub const about = "where a node id says it can be reached";
+    node_id: Arg(NodeId, node_id_help),
+    flags: struct {
+        relay: Flag(?[]const u8, "pkarr relay to ask, default radicle's two") =
+            .{ .value = null },
+        dns: Flag(bool, "ask DNS instead, whose answer is unsigned") =
+            .{ .value = false },
+        origin: Flag([]const u8, "domain the records hang under, with --dns") =
+            .{ .value = radish.iroh.resolve.n0_origin },
+        server: Flag(?[]const u8, "DNS server to ask, default /etc/resolv.conf") =
+            .{ .value = null },
+    } = .{},
+};
+
 const FetchDeps = struct {
     pub const about = "resolve `.rad` deps in a build.zig.zon";
     manifest: Arg([]const u8, manifest_help),
@@ -166,6 +181,7 @@ const commands = .{
     .{ .name = "clone", .Args = Clone, .run = clone },
     .{ .name = "seeds", .Args = Seeds, .run = seeds },
     .{ .name = "peers", .Args = Peers, .run = peers },
+    .{ .name = "resolve", .Args = Resolve, .run = resolve },
     .{ .name = "fetch-deps", .Args = FetchDeps, .run = fetchDeps },
     .{ .name = "serve", .Args = Serve, .run = serve },
     .{ .name = "upload-pack", .Args = UploadPack, .run = uploadPack },
@@ -1024,7 +1040,7 @@ fn locate(init: std.process.Init, want: RepoId, frames: usize) !Target {
             std.debug.print("  {s}: {s} is not a dial target\n", .{ boot.host, found.addr });
             continue;
         };
-        std.debug.print("  found {s} at {s} (via {s})\n", .{ id, found.addr, boot.host });
+        std.debug.print("  found {f} at {s} (via {s})\n", .{ id, found.addr, boot.host });
         return target;
     }
     return error.NoSeedFound;
@@ -1086,6 +1102,70 @@ fn peers(init: std.process.Init, cmd: Peers) !void {
         for (p.addrs) |a| std.debug.print("        {s}\n", .{a.text});
     }
     std.debug.print("\n{d} peers seen in {d} frames\n", .{ collector.peers().len, read });
+}
+
+/// Nothing published is an answer, not a crash, so it says one line and exits
+/// rather than unwinding into a stack trace. Anything else really did go
+/// wrong, and the trace is worth having.
+fn lookupFailed(id: NodeId, e: anyerror) anyerror {
+    if (e == error.NoRecord) {
+        std.debug.print("{f}\n  no record published\n", .{id});
+        std.process.exit(1);
+    }
+    std.debug.print("lookup failed: {s}\n", .{@errorName(e)});
+    return e;
+}
+
+/// Looks a node id up in the records its own key publishes. The signed route
+/// is the default. `--dns` asks a resolver instead, which is faster to answer
+/// and worth nothing without the signature, so what it returns is labelled.
+fn resolve(init: std.process.Init, cmd: Resolve) !void {
+    const iroh = radish.iroh;
+    const arena = init.arena.allocator();
+    const id = cmd.node_id.value;
+
+    // Both buffers hold what the result borrows, so they outlive the printing.
+    var record: [iroh.pkarr.max_payload]u8 = undefined;
+    var reply: [iroh.resolve.max_reply]u8 = undefined;
+
+    var result = blk: {
+        if (cmd.flags.dns.value) {
+            const server = if (cmd.flags.server.value) |s|
+                try std.Io.net.IpAddress.resolve(init.io, s, 53)
+            else
+                iroh.resolve.systemServer(init.io) catch |e| {
+                    std.debug.print("no nameserver: {s}\n", .{@errorName(e)});
+                    return e;
+                };
+            break :blk iroh.resolve.lookupUnsigned(init.io, arena, &reply, id, .{
+                .server = server,
+                .origin = cmd.flags.origin.value,
+            }) catch |e| return lookupFailed(id, e);
+        }
+        var one: [1][]const u8 = undefined;
+        var opts: iroh.resolve.Options = .{};
+        if (cmd.flags.relay.value) |r| {
+            one[0] = r;
+            opts.relays = &one;
+        }
+        break :blk iroh.resolve.lookup(init.io, arena, &record, id, opts) catch |e|
+            return lookupFailed(id, e);
+    };
+    defer result.deinit(arena);
+
+    std.debug.print("{f}\n", .{id});
+    switch (result.source) {
+        .signed => std.debug.print(
+            "  signed by the node's own key, verified here, published {d} us since the epoch\n",
+            .{result.timestamp.?},
+        ),
+        .dns => std.debug.print("  UNSIGNED: a resolver's word, not the key's\n", .{}),
+    }
+    for (result.addr.relays) |r| std.debug.print("  relay  {s}\n", .{r});
+    for (result.addr.addrs) |a| std.debug.print("  addr   {s}\n", .{a});
+    if (result.addr.user_data) |d| std.debug.print("  data   {s}\n", .{d});
+    // radish dials UDP directly and does not speak the iroh relay protocol.
+    if (result.addr.addrs.len == 0) std.debug.print("  not dialable: relay only\n", .{});
 }
 
 const SeedsOpts = struct {

@@ -2,7 +2,7 @@
 //! answers out of a message, and build one holding TXT records.
 //!
 //! A pkarr packet is a signed DNS reply, so this never sends or receives
-//! anything; it only encodes and decodes the bytes the signature covers.
+//! anything. It only encodes and decodes the bytes a signature covers.
 const std = @import("std");
 
 pub const Error = error{ Malformed, NoSpaceLeft, ValueTooLong };
@@ -12,23 +12,38 @@ pub const max_name = 255;
 /// One label between the dots.
 pub const max_label = 63;
 
-pub const TYPE_TXT: u16 = 16;
-pub const CLASS_IN: u16 = 1;
+/// Record types. Open, because a server may answer with anything and we only
+/// have to recognise what we asked for.
+pub const Type = enum(u16) {
+    txt = 16,
+    /// EDNS, which is a pseudo-record carried in the additional section.
+    opt = 41,
+    _,
+};
+
+/// Record classes. A pkarr packet and an iroh lookup are both internet class.
+/// The others (chaos, hesiod) exist and will never appear here.
+pub const Class = enum(u16) { in = 1, _ };
+
+/// Query flags: recursion desired, everything else clear.
+const flags_query: u16 = 0x0100;
+/// QR, and so the whole flags word of a reply, which is what
+/// `simple_dns::Packet::new_reply` writes and so what iroh signs.
+const flag_response: u16 = 0x8000;
+const flag_truncated: u16 = 0x0200;
+const rcode_mask: u16 = 0x000f;
 
 const header_len = 12;
 /// What follows a record's name: type, class, ttl, and the rdata length.
 const rr_fixed = 2 + 2 + 4 + 2;
 /// The most one TXT character-string holds, its length being a single byte.
 const max_string = 255;
-/// Header flags for a reply: QR set, everything else zero, which is what
-/// `simple_dns::Packet::new_reply` writes and so what iroh signs.
-const flags_reply: u16 = 0x8000;
 
 pub const Answer = struct {
     /// Points into the buffer handed to `next`, valid until the next call.
     name: []const u8,
-    kind: u16,
-    class: u16,
+    kind: Type,
+    class: Class,
     ttl: u32,
     /// Points into the message.
     rdata: []const u8,
@@ -40,9 +55,16 @@ pub const Reader = struct {
     msg: []const u8,
     pos: usize,
     left: u16,
+    /// The header, for a caller that asked a question and has to check the
+    /// answer belongs to it. A pkarr packet is a reply to nothing, so its
+    /// reader ignores both.
+    id: u16,
+    flags: u16,
 
     pub fn init(msg: []const u8) Error!Reader {
         if (msg.len < header_len) return error.Malformed;
+        const id = std.mem.readInt(u16, msg[0..2], .big);
+        const flags = std.mem.readInt(u16, msg[2..4], .big);
         const questions = std.mem.readInt(u16, msg[4..6], .big);
         const answers = std.mem.readInt(u16, msg[6..8], .big);
 
@@ -54,7 +76,21 @@ pub const Reader = struct {
             if (pos + 4 > msg.len) return error.Malformed;
             pos += 4;
         }
-        return .{ .msg = msg, .pos = pos, .left = answers };
+        return .{ .msg = msg, .pos = pos, .left = answers, .id = id, .flags = flags };
+    }
+
+    pub fn isResponse(self: Reader) bool {
+        return self.flags & flag_response != 0;
+    }
+
+    /// Set when the answer did not fit the datagram, so what arrived is a
+    /// prefix and the question has to go out again over TCP.
+    pub fn truncated(self: Reader) bool {
+        return self.flags & flag_truncated != 0;
+    }
+
+    pub fn rcode(self: Reader) u4 {
+        return @intCast(self.flags & rcode_mask);
     }
 
     /// The next answer, or null at the end. `name_buf` must hold `max_name`.
@@ -66,8 +102,8 @@ pub const Reader = struct {
         var pos = name.next;
         if (pos + rr_fixed > self.msg.len) return error.Malformed;
 
-        const kind = std.mem.readInt(u16, self.msg[pos..][0..2], .big);
-        const class = std.mem.readInt(u16, self.msg[pos + 2 ..][0..2], .big);
+        const kind: Type = @fromBackingInt(@intCast(std.mem.readInt(u16, self.msg[pos..][0..2], .big)));
+        const class: Class = @fromBackingInt(@intCast(std.mem.readInt(u16, self.msg[pos + 2 ..][0..2], .big)));
         const ttl = std.mem.readInt(u32, self.msg[pos + 4 ..][0..4], .big);
         const rdlen = std.mem.readInt(u16, self.msg[pos + 8 ..][0..2], .big);
         pos += rr_fixed;
@@ -159,7 +195,7 @@ pub const Builder = struct {
     pub fn init(buf: []u8) Error!Builder {
         if (buf.len < header_len) return error.NoSpaceLeft;
         @memset(buf[0..header_len], 0);
-        std.mem.writeInt(u16, buf[2..4], flags_reply, .big);
+        std.mem.writeInt(u16, buf[2..4], flag_response, .big);
         return .{ .buf = buf, .pos = header_len };
     }
 
@@ -170,8 +206,8 @@ pub const Builder = struct {
         const fixed = rr_fixed + 1 + value.len; // the record, then the string
         if (self.pos + fixed > self.buf.len) return error.NoSpaceLeft;
 
-        std.mem.writeInt(u16, self.buf[self.pos..][0..2], TYPE_TXT, .big);
-        std.mem.writeInt(u16, self.buf[self.pos + 2 ..][0..2], CLASS_IN, .big);
+        std.mem.writeInt(u16, self.buf[self.pos..][0..2], @backingInt(Type.txt), .big);
+        std.mem.writeInt(u16, self.buf[self.pos + 2 ..][0..2], @backingInt(Class.in), .big);
         std.mem.writeInt(u32, self.buf[self.pos + 4 ..][0..4], ttl, .big);
         std.mem.writeInt(u16, self.buf[self.pos + 8 ..][0..2], @intCast(1 + value.len), .big);
         self.buf[self.pos + rr_fixed] = @intCast(value.len);
@@ -198,19 +234,7 @@ pub const Builder = struct {
         }
 
         const off = self.pos;
-        if (name.len > max_name) return error.NoSpaceLeft;
-        var it = std.mem.splitScalar(u8, name, '.');
-        while (it.next()) |label| {
-            if (label.len == 0) continue; // a trailing dot is the root, written below
-            if (label.len > max_label) return error.Malformed;
-            if (self.pos + 1 + label.len > self.buf.len) return error.NoSpaceLeft;
-            self.buf[self.pos] = @intCast(label.len);
-            @memcpy(self.buf[self.pos + 1 ..][0..label.len], label);
-            self.pos += 1 + label.len;
-        }
-        if (self.pos + 1 > self.buf.len) return error.NoSpaceLeft;
-        self.buf[self.pos] = 0;
-        self.pos += 1;
+        self.pos = try writeLabels(self.buf, self.pos, name);
 
         // Only an offset a pointer can reach is worth remembering.
         if (self.first == null and off <= 0x3fff) {
@@ -218,6 +242,53 @@ pub const Builder = struct {
         }
     }
 };
+
+/// Writes `name` as length-prefixed labels ending in the root, returning where
+/// the message continues.
+fn writeLabels(buf: []u8, start: usize, name: []const u8) Error!usize {
+    if (name.len > max_name) return error.NoSpaceLeft;
+    var pos = start;
+    var it = std.mem.splitScalar(u8, name, '.');
+    while (it.next()) |label| {
+        if (label.len == 0) continue; // a trailing dot is the root, written below
+        if (label.len > max_label) return error.Malformed;
+        if (pos + 1 + label.len > buf.len) return error.NoSpaceLeft;
+        buf[pos] = @intCast(label.len);
+        @memcpy(buf[pos + 1 ..][0..label.len], label);
+        pos += 1 + label.len;
+    }
+    if (pos + 1 > buf.len) return error.NoSpaceLeft;
+    buf[pos] = 0;
+    return pos + 1;
+}
+
+/// Writes a question for `name`, with an OPT record asking for answers up to
+/// `udp_size`. Without that a reply over 512 bytes comes back truncated, and a
+/// pkarr record is allowed to be twice that.
+pub fn writeQuery(buf: []u8, id: u16, name: []const u8, kind: Type, udp_size: u16) Error![]u8 {
+    if (buf.len < header_len) return error.NoSpaceLeft;
+    @memset(buf[0..header_len], 0);
+    std.mem.writeInt(u16, buf[0..2], id, .big);
+    std.mem.writeInt(u16, buf[2..4], flags_query, .big);
+    std.mem.writeInt(u16, buf[4..6], 1, .big); // one question
+    std.mem.writeInt(u16, buf[10..12], 1, .big); // the OPT record
+
+    var pos = try writeLabels(buf, header_len, name);
+    if (pos + 4 > buf.len) return error.NoSpaceLeft;
+    std.mem.writeInt(u16, buf[pos..][0..2], @backingInt(kind), .big);
+    std.mem.writeInt(u16, buf[pos + 2 ..][0..2], @backingInt(Class.in), .big);
+    pos += 4;
+
+    // OPT (RFC 6891 s6.1.2): the name is the root, and the class field carries
+    // the buffer size rather than a class.
+    if (pos + 1 + rr_fixed > buf.len) return error.NoSpaceLeft;
+    buf[pos] = 0;
+    std.mem.writeInt(u16, buf[pos + 1 ..][0..2], @backingInt(Type.opt), .big);
+    std.mem.writeInt(u16, buf[pos + 3 ..][0..2], udp_size, .big);
+    std.mem.writeInt(u32, buf[pos + 5 ..][0..4], 0, .big); // no flags, EDNS 0
+    std.mem.writeInt(u16, buf[pos + 9 ..][0..2], 0, .big); // no options
+    return buf[0 .. pos + 1 + rr_fixed];
+}
 
 const testing = std.testing;
 
@@ -232,7 +303,7 @@ test "round trip two records under one name" {
     try b.addTxt(name, 30, addr);
     const msg = b.finish();
 
-    // A name written out costs a length byte per label and a root byte; the
+    // A name written out costs a length byte per label and a root byte, and the
     // second record pays two bytes for a pointer to the first instead.
     const written = name.len + 2;
     try testing.expectEqual(
@@ -245,8 +316,8 @@ test "round trip two records under one name" {
 
     const first = (try r.next(&name_buf)).?;
     try testing.expectEqualStrings(name, first.name);
-    try testing.expectEqual(TYPE_TXT, first.kind);
-    try testing.expectEqual(CLASS_IN, first.class);
+    try testing.expectEqual(Type.txt, first.kind);
+    try testing.expectEqual(Class.in, first.class);
     try testing.expectEqual(@as(u32, 30), first.ttl);
     var it = txtStrings(first.rdata);
     try testing.expectEqualStrings("relay=https://euw1-1.relay.n0.iroh.link./", (try it.next()).?);
@@ -313,6 +384,43 @@ test "truncated rdata rejected" {
     var r = try Reader.init(&msg);
     var name_buf: [max_name]u8 = undefined;
     try testing.expectError(error.Malformed, r.next(&name_buf));
+}
+
+test "a query asks for one name and advertises a buffer" {
+    var buf: [128]u8 = undefined;
+    const q = try writeQuery(&buf, 0xbeef, "_iroh.abc.example", .txt, 1232);
+
+    try testing.expectEqualSlices(u8, &.{
+        0xbe, 0xef, // id
+        0x01, 0x00, // recursion desired
+        0x00, 0x01, // one question
+        0x00, 0x00, 0x00, 0x00, // no answers, no authority
+        0x00, 0x01, // one additional: the OPT
+        5,    '_',
+        'i',  'r',
+        'o',  'h',
+        3,    'a',
+        'b',  'c',
+        7,    'e',
+        'x',  'a',
+        'm',  'p',
+        'l',  'e',
+        0,
+        0x00, 0x10, // TXT
+        0x00, 0x01, // IN
+        0, // OPT under the root name
+        0x00, 0x29, // type 41
+        0x04, 0xd0, // 1232, the advertised buffer
+        0x00, 0x00, 0x00, 0x00, // EDNS version 0, no flags
+        0x00, 0x00, // no options
+    }, q);
+
+    // The header it produces is one this reader agrees with.
+    const r = try Reader.init(q);
+    try testing.expectEqual(@as(u16, 0xbeef), r.id);
+    try testing.expect(!r.isResponse());
+    try testing.expect(!r.truncated());
+    try testing.expectEqual(@as(u4, 0), r.rcode());
 }
 
 test "value longer than a character-string rejected" {

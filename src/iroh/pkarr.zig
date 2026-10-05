@@ -68,7 +68,7 @@ fn verified(key: signature.PublicKey, payload: []const u8) Error!SignedPacket {
     const msg = signable(&buf, timestamp, packet);
     signature.verify(key, msg, sig) catch return error.BadSignature;
 
-    // Parsed for validity only; the answers are read on demand.
+    // Parsed for validity only, since the answers are read on demand.
     _ = dns.Reader.init(packet) catch return error.Malformed;
 
     return .{ .key = key, .sig = sig, .timestamp = timestamp, .packet = packet };
